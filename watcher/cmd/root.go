@@ -21,8 +21,8 @@ var jitoStart uint64
 var slotStart uint64
 var sandwichStart uint64
 var notToStdout bool
-var disableJitoTask1 bool
-var disableJitoTask2 bool
+var jitoFetchBundleOnly bool
+var jitoSyncInBundle bool
 
 func init() {
 
@@ -43,17 +43,17 @@ func init() {
 	)
 
 	jitoCmd.Flags().BoolVar(
-		&disableJitoTask1,
-		"disable-task1",
+		&jitoFetchBundleOnly,
+		"fetch-bundle-only",
 		false,
-		"Disable Jito Task1 (fetch bundles by slot)",
+		"Only fetch/sync Jito bundles by slot",
 	)
 
 	jitoCmd.Flags().BoolVar(
-		&disableJitoTask2,
-		"disable-task2",
+		&jitoSyncInBundle,
+		"sync-in-bundle",
 		false,
-		"Disable Jito Task2 (scan sandwich txs to mark inBundle)",
+		"Only sync sandwich inBundle marks",
 	)
 
 	slotCmd.Flags().Uint64VarP(

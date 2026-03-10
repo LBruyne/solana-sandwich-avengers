@@ -6,6 +6,7 @@ import (
 	"watcher/config"
 	"watcher/db"
 	"watcher/logger"
+	"watcher/utils"
 )
 
 func RunSlotLeaderCmd(startSlot uint64) error {
@@ -29,6 +30,7 @@ func RunSlotLeaderCmd(startSlot uint64) error {
 	// Use startSlot, lastSlot, currentSlot to determine the starting point:
 	// 1. if startSlot < lastSlotInDB, set startSlot = lastSlotInDB + 1
 	startSlot = max(startSlot, lastSlotInDB+1)
+	startSlot = utils.AlignSlotToStep(startSlot, config.PER_LEADER_SLOT)
 	if startSlot > currentSolanaSlot {
 		logger.SolLogger.Warn("Start slot is greater than current slot, nothing to do", "start", startSlot, "current", currentSolanaSlot)
 		return nil

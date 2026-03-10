@@ -53,19 +53,19 @@ const (
 	SOL_PROCESS_IN_BLOCK_SANDWICH_PARALLEL_NUM = 8 // number of parallel processing in-block sandwiches
 
 	JITO_MARK_IN_BUNDLE_SANDWICH_TX_INTERVAL = 10 * time.Second // interval to mark sandwich txs in bundle
+	JITO_MARK_IN_BUNDLE_SLOT_NUM             = 1000
+	JITO_MARK_IN_BUNDLE_PARALLEL_NUM         = 8
 
-	JITO_MARK_IN_BUNDLE_SLOT_NUM     = 1000
-	JITO_MARK_IN_BUNDLE_PARALLEL_NUM = 8
+	INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD    = uint(10) // relative threshold between front-run/back-run
+	CROSSBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD = uint(10)
+	SANDWICH_AMOUNT_SOL_TOLERANCE             = 0.1
 
-	INBLOCK_SANDWICH_AMOUNT_THRESHOLD    = uint(5) // relative threshold between front-run/back-run
-	CROSSBLOCK_SANDWICH_AMOUNT_THRESHOLD = uint(5)
-	SANDWICH_AMOUNT_SOL_TOLERANCE        = 0.1
+	SANDWICH_BACKRUN_MAX_GAP  = 500 // Max positional gap between consecutive multi-back-run txs from same attacker
+	SANDWICH_FRONTRUN_MAX_GAP = 500 // Max positional gap between consecutive multi-front-run txs from same attacker
 
-	SANDWICH_BACKRUN_MAX_GAP  = 100 // How long can two back-run txs be apart, 100 may be more suitable
-	SANDWICH_FRONTRUN_MAX_GAP = 100 // How long can two back-run txs be apart, 100 may be more suitable
+	AMM_POOL_CACHE_SIZE = 10000 // LRU capacity for known AMM pool addresses
 
-	CROSS_BLOCK_CACHE_SIZE                        = 32
-	CROSS_BLOCK_SANDWICH_MAX_SLOT_GAP             = 10
+	CROSS_BLOCK_CACHE_SIZE                        = 64
 	SOL_PROCESS_CROSS_BLOCK_SANDWICH_PARALLEL_NUM = 8
 	SOL_PROCESS_CROSS_BLOCK_BUCKETS_PARALLEL_NUM  = 8
 )

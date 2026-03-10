@@ -22,11 +22,14 @@ Schema: [db/create_tables/sandwiches.sql](db/create_tables/sandwiches.sql)
 
 Schema: [db/create_tables/sandwich_txs.sql](db/create_tables/sandwich_txs.sql)
 
-- **Primary key**: `(slot, timestamp)`
+- **Primary key**: `(sandwichTimestamp, sandwichId, timestamp, slot, position)`
 - **Purpose**: Stores per-transaction sandwich decomposition with direction labels.
 - **Key fields**:
-  - `type ∈ {frontRun, victim, backRun, transfer}`
+  - `sandwichTimestamp` (front-run anchor timestamp for sandwich-level ordering)
+  - `type ∈ {frontRun, victim, backRun, transfer, adverse}`
   - `fromToken`, `toToken`, `fromAmount`, `toAmount`
+  - `attackerPreBalanceB`, `attackerPostBalanceB`
+  - `poolPreBalanceB`, `poolPostBalanceB`
   - `fromTotalAmount`, `toTotalAmount`, `diffA`, `diffB`
   - `inBundle` (Jito bundle membership)
 

@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 START_SLOT = 370656000  # Start of epoch 858
 END_SLOT = 377135999  # End of epoch 872
-TX_TYPES = ["frontRun", "backRun", "victim", "transfer"]
+TX_TYPES = ["frontRun", "backRun", "victim", "transfer", "adverse"]
 ATTACKER_TX_TYPES = ["frontRun", "backRun", "transfer"]
 EPS_WIN = 1e-5
 

@@ -16,7 +16,7 @@ The export query de-duplicates `sandwiches` and `sandwich_txs` by `sandwichId`, 
 The feature pipeline in `analyze_sandwiches()` constructs sandwich-level records with the following dimensions:
 
 - **Transaction topology**
-  - `fr_count`, `br_count`, `victim_count`, `transfer_count`
+  - `fr_count`, `br_count`, `victim_count`, `transfer_count`, `adverse_count`
   - `consecutive` in-block ordering based on position continuity
 - **Distance metrics**
   - `inblock_distance` (position gap between last front-run and first back-run)

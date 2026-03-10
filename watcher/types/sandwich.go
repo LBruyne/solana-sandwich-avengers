@@ -18,13 +18,16 @@ type SandwichTxTokenInfo struct {
 	DiffB                float64  `ch:"diffB"`                // frontTx.ToTotal - backTx.FromTotal
 	AttackerPostBalanceB float64  `ch:"attackerPostBalanceB"` // Attacker's tokenB balance after tx
 	AttackerPreBalanceB  float64  `ch:"attackerPreBalanceB"`  // Attacker's tokenB balance before tx
+	PoolPreBalanceB      float64  `ch:"poolPreBalanceB"`      // Pool's tokenB balance before tx
+	PoolPostBalanceB     float64  `ch:"poolPostBalanceB"`     // Pool's tokenB balance after tx
 	OwnersOfB            []string `ch:"ownersOfB"`            // Possible attacker owners, i.e., owners of ATAs that hold tokenB in front-run and back-run
 }
 
 type SandwichTx struct {
-	SandwichID string `ch:"sandwichId"`
-	InBundle   bool   `ch:"inBundle"`
-	Type       string `ch:"type"` // frontRun, backRun, or victim
+	SandwichID        string    `ch:"sandwichId"`
+	SandwichTimestamp time.Time `ch:"sandwichTimestamp"`
+	InBundle          bool      `ch:"inBundle"`
+	Type              string    `ch:"type"` // frontRun, backRun, victim, transfer, or adverse
 	Transaction
 	SandwichTxTokenInfo
 }
@@ -58,6 +61,7 @@ type Sandwich struct {
 	FrontRun    []*SandwichTx `ch:"frontRunTx" json:"frontRunTx"`
 	BackRun     []*SandwichTx `ch:"backRunTx" json:"backRunTx"`
 	Victims     []*SandwichTx `ch:"victims" json:"victims"`
+	Adverse     []*SandwichTx `ch:"adverseTx" json:"adverseTx"`
 }
 
 // InBlockSandwich is a detected sandwich transaction, that front-run, victim(s) and back-run are all in the same block
@@ -81,6 +85,8 @@ func ppSandwichTxs(kind string, txs []*SandwichTx) {
 		PPTx(i+1, &stx.Transaction, true)
 		fmt.Printf("         from=%s amt=%.9f  to=%s amt=%.9f\n",
 			ti.FromToken, ti.FromAmount, ti.ToToken, ti.ToAmount)
+		fmt.Printf("         poolPostBalanceB=%.9f  poolPreBalanceB=%.9f\n",
+			ti.PoolPostBalanceB, ti.PoolPreBalanceB)
 
 		// Statistics
 		switch kind {
@@ -99,6 +105,8 @@ func ppSandwichTxs(kind string, txs []*SandwichTx) {
 				ti.AttackerPostBalanceB, ti.AttackerPreBalanceB, ti.OwnersOfB)
 		case "Victims":
 			// No extra info for victims
+		case "Adverse":
+			// No extra info for adverse txs
 		}
 	}
 }
@@ -117,6 +125,9 @@ func PPInBlockSandwich(i int, s *InBlockSandwich) {
 
 	ppSandwichTxs("FrontRun", s.FrontRun)
 	ppSandwichTxs("Victims", s.Victims)
+	if len(s.Adverse) > 0 {
+		ppSandwichTxs("Adverse", s.Adverse)
+	}
 	ppSandwichTxs("BackRun", s.BackRun)
 	fmt.Println()
 }
@@ -151,6 +162,7 @@ func summarizeCrossBlockSpan(s *CrossBlockSandwich) (minSlot, maxSlot uint64, mi
 
 	collect(s.FrontRun)
 	collect(s.Victims)
+	collect(s.Adverse)
 	collect(s.BackRun)
 	return
 }
@@ -177,6 +189,9 @@ func PPCrossBlockSandwich(i int, s *CrossBlockSandwich) {
 
 	ppSandwichTxs("FrontRun", s.FrontRun)
 	ppSandwichTxs("Victims", s.Victims)
+	if len(s.Adverse) > 0 {
+		ppSandwichTxs("Adverse", s.Adverse)
+	}
 	ppSandwichTxs("BackRun", s.BackRun)
 	fmt.Println()
 }

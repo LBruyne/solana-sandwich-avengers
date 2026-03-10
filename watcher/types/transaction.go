@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"watcher/utils"
@@ -28,7 +29,7 @@ type Transaction struct {
 	IsVote    bool
 
 	Signature   string   `json:"signature" ch:"signature"`     // The identifier of this transaction, which is the first signature in Signatures field. A 64 bytes Ed25519 signature, encoded as a base-58 string.
-	Signer      string   `json:"signer" ch:"signer"`           // The account address that signed the transaction and paid the fee
+	Signers     []string `json:"signers" ch:"signers"`         // All signers extracted from the transaction message. Used by all detection logic.
 	AccountKeys []string `json:"accountKeys" ch:"accountKeys"` // All accounts accessed in this transaction
 	Programs    []string `json:"programs" ch:"programs"`       // All programs invoked in this transaction
 
@@ -134,30 +135,45 @@ func (tx *Transaction) PostprocessForFindSandwich() {
 		}
 	}
 	tx.RelatedTokens = relatedTokens
-	// Collect potentially related pools (heuristic: any owner with only 1 income token and 1 expense token throughout this tx)
+	// Collect potentially related pools (any owner with exactly 1 income token and 1 expense token throughout this tx)
+	// Note: signer is also included as a pool-like participant to enable swap structure validation downstream.
+	// For signer, the SOL balance is adjusted by removing the transaction fee to isolate swap-related changes.
+	// Fee in SOL for signer adjustment
+	feeInSOL := float64(tx.Fee) / utils.SOL_UNIT
+
 	relatedPools := MapSet.NewSet[string]()
 	relatedPoolsInfo := make(map[string]PoolAmount)
 	for owner, tokenChanges := range tx.OwnerBalanceChanges {
-		if owner == tx.Signer {
-			continue // skip signer
-		}
-
 		income := 0
 		expense := 0
 		poolInfo := PoolAmount{}
 		for token, change := range tokenChanges {
-			if change.GetTotalAmount() < 0 {
+			amount := change.GetTotalAmount()
+
+			// For any signer's SOL balance, the RPC-reported delta includes the transaction fee.
+			// Add back the fee so that only the swap-related SOL change remains.
+			if utils.HasString(tx.Signers, owner) && token == utils.SOL {
+				amount += feeInSOL
+			}
+
+			// After fee adjustment, if the amount is negligibly small (< EPSILON), treat it as zero
+			// and skip it so it does not count as an income or expense leg.
+			if math.Abs(amount) < utils.EPSILON {
+				continue
+			}
+
+			if amount < 0 {
 				expense++
 				poolInfo.ExpenseToken = token
-				poolInfo.ExpenseAmt = change.GetTotalAmount()
-			} else if change.GetTotalAmount() > 0 {
+				poolInfo.ExpenseAmt = amount
+			} else {
 				income++
 				poolInfo.IncomeToken = token
-				poolInfo.IncomeAmt = change.GetTotalAmount()
+				poolInfo.IncomeAmt = amount
 			}
 		}
 
-		// A pool has exact 1 income token and 1 expense token
+		// A pool-like participant has exactly 1 income token and 1 expense token
 		if income == 1 && expense == 1 {
 			relatedPools.Add(owner)
 			relatedPoolsInfo[owner] = poolInfo
@@ -235,8 +251,12 @@ func PPTx(i int, tx *Transaction, details bool) {
 	if tx == nil {
 		return
 	}
-	fmt.Printf("  -- Tx[%d] slot=%d pos=%d fee=%d sig=%s signer=%s\n",
-		i, tx.Slot, tx.Position, tx.Fee, tx.Signature, shorten(tx.Signer, 8))
+	signerStr := ""
+	if len(tx.Signers) > 0 {
+		signerStr = shorten(tx.Signers[0], 8)
+	}
+	fmt.Printf("  -- Tx[%d] slot=%d pos=%d fee=%d sig=%s signer=%s signers=%d\n",
+		i, tx.Slot, tx.Position, tx.Fee, tx.Signature, signerStr, len(tx.Signers))
 	fmt.Printf("     flags: failed=%v vote=%v  programs=%d  accountKeys=%d\n",
 		tx.IsFailed, tx.IsVote, len(tx.Programs), len(tx.AccountKeys))
 
@@ -302,4 +322,37 @@ func shorten(s string, n int) string {
 		return s
 	}
 	return s[:n-3] + "..."
+}
+
+// GetOwnerPreBalance returns the pre-transaction balance of a specific token for a given owner.
+func (tx *Transaction) GetOwnerPreBalance(owner string, token string) float64 {
+	if tx.OwnerPreBalances == nil {
+		return 0
+	}
+	if tokenMap, ok := tx.OwnerPreBalances[owner]; ok {
+		return tokenMap[token]
+	}
+	return 0
+}
+
+// GetOwnerPostBalance returns the post-transaction balance of a specific token for a given owner.
+func (tx *Transaction) GetOwnerPostBalance(owner string, token string) float64 {
+	if tx.OwnerPostBalances == nil {
+		return 0
+	}
+	if tokenMap, ok := tx.OwnerPostBalances[owner]; ok {
+		return tokenMap[token]
+	}
+	return 0
+}
+
+// GetOwnerBalanceChange returns the total balance change of a specific token for a given owner.
+func (tx *Transaction) GetOwnerBalanceChange(owner string, token string) float64 {
+	if tx.OwnerBalanceChanges == nil {
+		return 0
+	}
+	if tokenMap, ok := tx.OwnerBalanceChanges[owner]; ok {
+		return tokenMap[token].TotalAmount
+	}
+	return 0
 }

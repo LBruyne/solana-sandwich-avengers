@@ -6,6 +6,7 @@ rich
 numpy
 pandas
 pyarrow
+dotenv
 boto3
 cloudscraper
 beautifulsoup4
@@ -14,3 +15,5 @@ openpyxl
 matplotlib
 seaborn
 ipykernel
+tabulate
+tqdm

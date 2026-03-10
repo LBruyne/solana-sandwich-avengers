@@ -107,7 +107,7 @@ go run main.go leader -s <start_slot>
 Then it analyzes the transactions to find Sandwich activities and stores them into the database.
 
 ```bash
-go run main.go sandwich-s <start_slot>
+go run main.go sandwich -s <start_slot>
 ```
 
 We focus on both InBlock Sandwich and CrossBlock Sandwich.

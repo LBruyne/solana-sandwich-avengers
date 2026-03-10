@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 	"watcher/config"
 	"watcher/logger"
@@ -120,75 +119,50 @@ func GetBlocks(startSlot, count uint64) types.Blocks {
 	}
 	endSlot := startSlot + count - 1
 
-	// Fetch blocks in parallel
 	parallel := config.SOL_FETCH_SLOT_DATA_PARALLEL_NUM
-	// For each slot, retry after failure
+	if parallel <= 0 {
+		parallel = 1
+	}
 	maxRetry := config.SOL_FETCH_SLOT_DATA_RETRYS
-	slotsQueue := make(chan uint64, int(count*2)) // Slots to fetch, 2x buffer to avoid blocking retries
-	blocksCh := make(chan *types.Block, count)    // Fetched Slots
-	retryCounter := make(map[uint64]int)          // Retry counter per slot
-	var retryMu sync.Mutex
-	var fetchedCount atomic.Int32
-	var lock sync.Mutex
-	var wg sync.WaitGroup
-	var closeQueueOnce sync.Once
-	closeQueue := func() { closeQueueOnce.Do(func() { close(slotsQueue) }) }
 
-	// Init slots to fetch
-	go func() {
-		for s := startSlot; s <= endSlot; s++ {
-			slotsQueue <- s
-		}
-	}()
+	slotsQueue := make(chan uint64, count)
+	blocksCh := make(chan *types.Block, count)
+	var wg sync.WaitGroup
+
+	for s := startSlot; s <= endSlot; s++ {
+		slotsQueue <- s
+	}
+	close(slotsQueue)
 
 	wg.Add(parallel)
 	for range parallel {
 		go func() {
 			defer wg.Done()
 			for slotId := range slotsQueue {
-				// Fetch block
-				block, err := GetBlock(slotId)
-				if err != nil {
+				var block *types.Block
+				var err error
+				for attempt := 0; attempt <= maxRetry; attempt++ {
+					block, err = GetBlock(slotId)
+					if err == nil {
+						if block != nil {
+							blocksCh <- block
+						}
+						break
+					}
+
 					errStr := err.Error()
 					if errStr == utils.SKIPPED_BLOCK || errStr == utils.CLEANED_BLOCK {
-						// Known non-retriable errors: count as fetched and move on
 						logger.SolLogger.Warn("getBlock skipped/cleaned, move on", "slot", slotId, "err", err)
-						if fetchedCount.Add(1) >= int32(count) {
-							closeQueue()
-						}
+						break
+					}
+
+					if attempt < maxRetry {
+						logger.SolLogger.Warn("retrying getBlock", "slot", slotId, "attempt", attempt+1, "err", err)
 						continue
 					}
 
-					retryMu.Lock()
-					retryCounter[slotId]++
-					tries := retryCounter[slotId]
-					retryMu.Unlock()
-
-					// Other errors: retry up to maxRetry times
-					if tries <= maxRetry {
-						logger.SolLogger.Warn("retrying getBlock", "slot", slotId, "attempt", tries, "err", err)
-						if fetchedCount.Load() < int32(count) {
-							slotsQueue <- slotId
-						}
-						continue
-					}
-
-					// Exhausted retries
 					logger.SolLogger.Warn("getBlock failed after retries, skip", "slot", slotId, "err", err)
-					if fetchedCount.Add(1) >= int32(count) {
-						closeQueue()
-					}
-					continue
 				}
-				blocksCh <- block
-
-				// Update progress
-				lock.Lock()
-				fetchedCount.Add(1)
-				if fetchedCount.Load() >= int32(count) {
-					closeQueue()
-				}
-				lock.Unlock()
 			}
 		}()
 	}
@@ -391,7 +365,7 @@ func parseTransactionFromBase64(txData map[string]any) (*types.Transaction, erro
 		Fee:                 feeLamport,
 		Signature:           signature,
 		AccountKeys:         accountKeys,
-		Signer:              signer[0], // first signer as main signer
+		Signers:             signer,
 		Programs:            programs,
 		OwnerBalanceChanges: ownerBalanceChanges,
 		OwnerPreBalances:    ownerPreBalances,
@@ -441,7 +415,7 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		return nil, nil, nil, nil, fmt.Errorf("invalid preTokenBalances")
 	}
 	// Read loaded addresses (writable + readonly)
-	loaded := meta["loadedAddresses"].(map[string]any)
+	loaded, _ := meta["loadedAddresses"].(map[string]any)
 	var wr, ro []any
 	if loaded != nil {
 		wr, _ = loaded["writable"].([]any)

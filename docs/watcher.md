@@ -21,12 +21,14 @@ The `Watcher` module performs real-time transaction ingestion and heuristic sand
 ### In-Block Detection (Core Rules)
 
 **Key heuristics** (configurable in [watcher/config/config.go](watcher/config/config.go)):
+
 - `INBLOCK_SANDWICH_AMOUNT_THRESHOLD = 5` (percent)
 - `SANDWICH_FRONTRUN_MAX_GAP = 100` (positions)
 - `SANDWICH_BACKRUN_MAX_GAP = 100` (positions)
 - `SANDWICH_AMOUNT_SOL_TOLERANCE = 0.1` (percent)
 
 **Algorithmic conditions**:
+
 1. **Pool/Token consistency**: front-run uses `(pool, A→B)` and back-run uses `(pool, B→A)`.
 2. **Signer coherence**: front-run and back-run sets must each have a single signer; multi-front and multi-back are allowed if signer is consistent and position gap is bounded.
 3. **Amount similarity**:
@@ -37,6 +39,7 @@ The `Watcher` module performs real-time transaction ingestion and heuristic sand
 5. **Signer mismatch resolution**: if front-run and back-run signers differ, the system checks:
    - **Owner overlap**: front-run owners of token `B` are a superset of back-run owners of token `B`, **or**
    - **Transfer bridge**: an intermediate transfer transaction moves token `B` from front-run owners to back-run owners with unique increase/decrease endpoints.
+6. **Adverse flow capture**: for each confirmed sandwich, additional in-between transactions on the same pool with direction `(B→A)` (same as back-run, opposite to front/victim) are recorded as `adverse` to support slippage/profit erosion analysis. Their signer must differ from both front-run and back-run signers.
 
 [Our Contribution] The transfer-bridge check explicitly links signer-disjoint front/back runs, mitigating false negatives caused by multi-account attacker workflows.
 
@@ -108,6 +111,6 @@ The `RunJitoCmd()` pipeline has two concurrent tasks:
 ## Outputs
 
 - `sandwiches`: sandwich-level metadata (profit, perfectness, signer/owner relations).
-- `sandwich_txs`: per-transaction breakdown with direction labels and `inBundle` flag.
+- `sandwich_txs`: per-transaction breakdown with direction labels (`frontRun`/`victim`/`backRun`/`transfer`/`adverse`), attacker and pool token-`B` pre/post balances, and `inBundle` flag.
 - `slot_txs`: slot-level counts for data coverage accounting.
 - `slot_bundles` and `jito_bundles`: bundle metadata for private-order-flow analysis.

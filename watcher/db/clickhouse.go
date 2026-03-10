@@ -147,6 +147,7 @@ func (d *ClickhouseDB) CreateTables() error {
 		`CREATE TABLE IF NOT EXISTS solwich.sandwich_txs
 		(
 			sandwichId String,
+			sandwichTimestamp DateTime,
 			type String,
 
 			slot UInt64,
@@ -154,7 +155,7 @@ func (d *ClickhouseDB) CreateTables() error {
 			timestamp DateTime,
 			fee UInt64,
 			signature String,
-			signer String,
+			signers Array(String),
 			inBundle Bool,
 			accountKeys Array(String),
 			programs Array(String),
@@ -171,10 +172,12 @@ func (d *ClickhouseDB) CreateTables() error {
 			diffB Float64,
 			attackerPreBalanceB Float64,  
 			attackerPostBalanceB Float64,
+			poolPreBalanceB Float64,
+			poolPostBalanceB Float64,
     		ownersOfB Array(String)
 		)
 		ENGINE = MergeTree
-		ORDER BY (slot, timestamp)
+		ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)
 		SETTINGS index_granularity = 8192`,
 	}
 

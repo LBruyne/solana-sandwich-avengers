@@ -27,6 +27,7 @@ type InBlockSandwichFinder struct {
 	lastFrontTxEntries   []PoolEntry
 	lastBackTxEntries    []PoolEntry
 	lastVictimEntries    []PoolEntry
+	lastAdverseEntries   []PoolEntry
 	lastTransferTxs      []*types.Transaction
 	perfect              bool
 	relativeAmtDiffB     float64
@@ -43,7 +44,7 @@ func (f *InBlockSandwichFinder) Find() {
 	f.Sandwiches = make([]*types.InBlockSandwich, 0)
 	f.confirmedSandwichTxIdx = make(map[int]bool)
 	// Build buckets for txs, keyed by (pool, fromToken, toToken)
-	f.buckets = buildTxBuckets(f.Txs, false)
+	f.buckets = filterAndBuildTxBuckets(f.Txs, false)
 
 	// For each bucket, scan its reverse bucket to find possible sandwiches
 	// For a pool in frontTx(s), A is incomeToken, B is expenseTokens; in backTx(s), B is incomeToken, A is expenseToken
@@ -71,24 +72,29 @@ func (f *InBlockSandwichFinder) Find() {
 			frontTxEntry := frontTxBucket[i]
 			// An attacker may use multiple frontTxs.
 			// Try to find other frontTx(s) accompanying this frontTx, if any
-			frontTxEntries := f.collectFrontTxs(frontTxEntry, frontTxBucket)
-			if len(frontTxEntries) == 0 {
+			candidateFrontTxEntries := f.collectFrontTxs(frontTxEntry, frontTxBucket)
+			if len(candidateFrontTxEntries) == 0 {
 				continue // No valid front-run tx found
 			}
 
-			// if f.Txs[frontTxEntries[0].TxIdx].Signature == "3ry7r5naR3cB2pPr4GG6XxjUgpjwvAfqQ1C6rG7WSJHe5cNUjbMc3bC3DbV24N8tsqtcB1J9Zqv7HsFNDwUS9j59" {
-			// 	fmt.Printf("Debug: found specific frontTx: %+v\n", frontTxEntries)
-			// }
+			// Try to find backTx(s) that form sandwich with current frontTx(s).
+			// Start from the seed entry alone and progressively expand to include
+			// more front-run candidates. This "small-to-large" strategy ensures
+			// independent sandwiches (e.g. F1-V1-B1-F2-V2-B2) are matched at
+			// the seed level first, preventing false grouping of unrelated fronts.
+			var frontTxEntries []PoolEntry
+			var backTxEntries []PoolEntry
+			for k := 1; k <= len(candidateFrontTxEntries); k++ {
+				frontTxEntries = candidateFrontTxEntries[:k]
+				backTxEntries = f.collectBackTxs(frontTxEntries, backTxBucket)
+				if len(backTxEntries) > 0 {
+					break
+				}
+			}
 
-			// Try to find backTx(s) in that may form sandwich with current frontTx(s)
-			backTxEntries := f.collectBackTxs(frontTxEntries, backTxBucket)
 			if len(backTxEntries) == 0 {
 				continue // No back-run candidate found
 			}
-
-			// if f.Txs[frontTxEntries[0].TxIdx].Signature == "6ZTDa1tbT22vsAcXoURNy58BzSiRv8oo6ewGxdA2M8WXUyr4swkGR54LfTiUz77EMwv7sLUT7KAgj5UM7ro8tWn" {
-			// 	fmt.Printf("Debug: found specific backTx: %+v\n", backTxEntries)
-			// }
 
 			// All conditions met, record the sandwich
 			// Every data structure is ready in f.last* fields
@@ -103,6 +109,7 @@ func (f *InBlockSandwichFinder) ResetSandwichState() {
 	f.lastFrontTxEntries = nil
 	f.lastBackTxEntries = nil
 	f.lastVictimEntries = nil
+	f.lastAdverseEntries = nil
 	f.lastTransferTxs = nil
 }
 
@@ -118,7 +125,7 @@ func (f *InBlockSandwichFinder) collectFrontTxs(frontTxEntry PoolEntry, frontTxB
 		return res // Skip failed or vote transactions
 	}
 
-	signer := frontTxEntry.Signer
+	signers := frontTxEntry.Signers
 	res = append(res, frontTxEntry)
 	lastPos := frontTxEntry.Position
 
@@ -136,8 +143,8 @@ func (f *InBlockSandwichFinder) collectFrontTxs(frontTxEntry PoolEntry, frontTxB
 		if (f.confirmedSandwichTxIdx != nil && f.confirmedSandwichTxIdx[entry.TxIdx]) || f.Txs[entry.TxIdx] == nil || f.Txs[entry.TxIdx].IsFailed || f.Txs[entry.TxIdx].IsVote {
 			continue
 		}
-		// Must have the same signer
-		if entry.Signer != signer {
+		// Must share at least one signer
+		if !utils.SignersOverlap(entry.Signers, signers) {
 			continue
 		}
 		// Valid front-run tx accompanying with the given frontTxEntry
@@ -169,7 +176,7 @@ func (f *InBlockSandwichFinder) collectBackTxs(frontTxEntries []PoolEntry, backT
 			continue
 		}
 
-		signer := startBackEntry.Signer
+		signers := startBackEntry.Signers
 		candidateBackTxEntries := []PoolEntry{startBackEntry}
 		lastPos := startBackEntry.Position
 
@@ -189,8 +196,8 @@ func (f *InBlockSandwichFinder) collectBackTxs(frontTxEntries []PoolEntry, backT
 				f.Txs[backEntry.TxIdx] == nil || f.Txs[backEntry.TxIdx].IsFailed || f.Txs[backEntry.TxIdx].IsVote {
 				continue
 			}
-			// Must have the same signer, if meet different signer
-			if backEntry.Signer != signer {
+			// Must share at least one signer
+			if !utils.SignersOverlap(backEntry.Signers, signers) {
 				continue
 			}
 			// Valid back-run tx accompanying with the given backEntry candidate
@@ -204,9 +211,13 @@ func (f *InBlockSandwichFinder) collectBackTxs(frontTxEntries []PoolEntry, backT
 
 		// Possible valid back-run tx accompanying with the given frontTxEntries
 		// Check if they form a sandwich: amount, victim txs, etc.
-		if f.Evaluate(frontTxEntries, candidateBackTxEntries) {
-			// Mark all these txs as confirmed sandwich txs
-			return candidateBackTxEntries
+		// Start from the seed back entry alone and progressively expand to
+		// include more back-run candidates (small-to-large). This prevents
+		// false grouping of backs from independent sandwiches.
+		for k := 1; k <= len(candidateBackTxEntries); k++ {
+			if f.Evaluate(frontTxEntries, candidateBackTxEntries[:k]) {
+				return candidateBackTxEntries[:k]
+			}
 		}
 	}
 	return make([]PoolEntry, 0)
@@ -226,31 +237,12 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 	if tokenB == "" || tokenB != backTxEntries[0].IncomeToken {
 		return false
 	}
-	// Signer
-	frontSigner := frontTxEntries[0].Signer
-	backSigner := backTxEntries[0].Signer
-
-	// Check pool condition
-	maxPoolsCnt := 1
-	if frontSigner != backSigner {
-		maxPoolsCnt += 1
-	}
-	for _, fe := range frontTxEntries {
-		ftx := f.Txs[fe.TxIdx]
-		if ftx.RelatedPools.Cardinality() > maxPoolsCnt {
-			return false // Front tx interacts with too many pools
-		}
-	}
-	for _, be := range backTxEntries {
-		btx := f.Txs[be.TxIdx]
-		if btx.RelatedPools.Cardinality() > maxPoolsCnt {
-			return false // Back tx interacts with too many pools
-		}
-	}
+	// Signer — union all signers across multi-front/multi-back entries
+	frontSigners := unionSigners(frontTxEntries)
+	backSigners := unionSigners(backTxEntries)
 
 	// Threshold is a percentage, e.g., 5 means 5%, allowed difference in total amount
 	threshold := f.AmountThreshold
-	// For a pool in frontTx(s), A is incomeToken, B is expenseTokens; in backTx(s), B is incomeToken, A is expenseToken
 	// Check the amount condition: B in front and back have valid and similar trading amounts (within threshold)
 	var frontAmtB float64
 	for _, fe := range frontTxEntries {
@@ -295,8 +287,11 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 		return false // No victim txs found
 	}
 
-	// If signers of frontTxs and backTxs are the same, it is confirmed right now
-	if frontSigner != backSigner {
+	// Collect adverse txs (same direction as back-run, i.e. B→A) between front and back
+	adverseEntries := f.collectAdverseEntries(frontTxEntries, backTxEntries)
+
+	// If signers of frontTxs and backTxs share at least one signer, it is confirmed right now
+	if !utils.SignersOverlap(frontSigners, backSigners) {
 		// Different signers, cannot be confirmed right now
 		// Check owner condition
 		ownersOfBInFrtTxs := MapSet.NewSet[string]()
@@ -372,6 +367,7 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 	f.lastFrontTxEntries = frontTxEntries
 	f.lastBackTxEntries = backTxEntries
 	f.lastVictimEntries = victimEntries
+	f.lastAdverseEntries = adverseEntries
 	f.perfect = perfect
 	f.relativeAmtDiffB = relativeAmtDiff
 	f.FrontToTotalAmount = frontAmtB
@@ -412,9 +408,9 @@ func (f *InBlockSandwichFinder) collectVictimEntries(frontTxEntries, backTxEntri
 		ExpenseToken: frontTxEntries[0].ExpenseToken,
 	}
 	frontTxBucket := f.buckets[frontKey]
-	// Victim must have different signer from front and back
-	frontSigner := frontTxEntries[0].Signer
-	backSigner := backTxEntries[0].Signer
+	// Victim must have different signers from front and back (union across all entries)
+	frontSigners := unionSigners(frontTxEntries)
+	backSigners := unionSigners(backTxEntries)
 
 	victims := make([]PoolEntry, 0)
 	for _, e := range frontTxBucket {
@@ -426,8 +422,8 @@ func (f *InBlockSandwichFinder) collectVictimEntries(frontTxEntries, backTxEntri
 		if e.Position <= frontEndPos || e.Position >= backBeginPos {
 			continue
 		}
-		// Must have different signer from front and back
-		if e.Signer == frontSigner || e.Signer == backSigner {
+		// Must not share any signer with front or back
+		if utils.SignersOverlap(e.Signers, frontSigners) || utils.SignersOverlap(e.Signers, backSigners) {
 			continue
 		}
 		// Maybe (useless) deadcode
@@ -495,6 +491,10 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 	for _, ve := range f.lastVictimEntries {
 		victimTxs = append(victimTxs, f.makeSandwichTx(sandwichId, ve, "victim"))
 	}
+	adverseTxs := make([]*types.SandwichTx, 0, len(f.lastAdverseEntries))
+	for _, ae := range f.lastAdverseEntries {
+		adverseTxs = append(adverseTxs, f.makeSandwichTx(sandwichId, ae, "adverse"))
+	}
 	// Append total and diff amount for last tx in frontTxs and backTxs
 	if len(frontTxs) > 0 {
 		lf := frontTxs[len(frontTxs)-1]
@@ -510,12 +510,10 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 		lb.SandwichTxTokenInfo.DiffB = f.FrontToTotalAmount - f.BackFromTotalAmount
 	}
 
-	// Signer
-	lastFrontTx := f.Txs[f.lastFrontTxEntries[len(f.lastFrontTxEntries)-1].TxIdx]
-	firstBackTx := f.Txs[f.lastBackTxEntries[0].TxIdx]
-	frontSigner := lastFrontTx.Signer
-	backSigner := firstBackTx.Signer
-	signerSame := (frontSigner == backSigner)
+	// Signer — compare using union of all front/back entry signers
+	allFrontSigners := unionSigners(f.lastFrontTxEntries)
+	allBackSigners := unionSigners(f.lastBackTxEntries)
+	signerSame := utils.SignersOverlap(allFrontSigners, allBackSigners)
 	// Owner
 	frontOwners := MapSet.NewSet[string]()
 	backOwners := MapSet.NewSet[string]()
@@ -567,6 +565,7 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 			FrontRun: frontTxs,
 			BackRun:  backTxs,
 			Victims:  victimTxs,
+			Adverse:  adverseTxs,
 		},
 		Slot:      slot,
 		Timestamp: timestamp,
@@ -599,9 +598,11 @@ func (f *InBlockSandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntr
 			OwnersOfB:            []string{},
 			AttackerPreBalanceB:  0.0,
 			AttackerPostBalanceB: 0.0,
+			PoolPreBalanceB:      orig.GetOwnerPreBalance(entry.PoolAddress, f.lastTokenB),
+			PoolPostBalanceB:     orig.GetOwnerPostBalance(entry.PoolAddress, f.lastTokenB),
 		},
 		InBundle: false, // default false
-		Type:     kind,  // "frontRun" / "backRun" / "victim"
+		Type:     kind,  // "frontRun" / "backRun" / "victim" / "adverse"
 	}
 	switch kind {
 	case "frontRun":
@@ -629,6 +630,49 @@ func (f *InBlockSandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntr
 	}
 
 	return stx
+}
+
+// collectAdverseEntries collects adverse transactions between front and back.
+// Adverse txs have the same pool and trading direction as back-run (B→A), i.e. they trade in the opposite direction of the victim.
+func (f *InBlockSandwichFinder) collectAdverseEntries(frontTxEntries, backTxEntries []PoolEntry) []PoolEntry {
+	if len(frontTxEntries) == 0 || len(backTxEntries) == 0 {
+		return make([]PoolEntry, 0)
+	}
+	// Adverse txs must be between front and back
+	frontEndPos := frontTxEntries[len(frontTxEntries)-1].Position
+	backBeginPos := backTxEntries[0].Position
+	if backBeginPos <= frontEndPos+1 {
+		return make([]PoolEntry, 0)
+	}
+	// Adverse has the same pool and direction as back-run (reverse of front)
+	backKey := PoolKey{
+		PoolAddress:  backTxEntries[0].PoolAddress,
+		IncomeToken:  backTxEntries[0].IncomeToken,
+		ExpenseToken: backTxEntries[0].ExpenseToken,
+	}
+	backTxBucket := f.buckets[backKey]
+	frontSigners := unionSigners(frontTxEntries)
+	backSigners := unionSigners(backTxEntries)
+
+	adverse := make([]PoolEntry, 0)
+	for _, e := range backTxBucket {
+		if f.Txs[e.TxIdx] == nil || f.Txs[e.TxIdx].IsFailed || f.Txs[e.TxIdx].IsVote {
+			continue
+		}
+		// Must be between front and back
+		if e.Position <= frontEndPos || e.Position >= backBeginPos {
+			continue
+		}
+		// Must not share any signer with front or back
+		if utils.SignersOverlap(e.Signers, frontSigners) || utils.SignersOverlap(e.Signers, backSigners) {
+			continue
+		}
+		if !(e.IncomeAmt > 0 && e.ExpenseAmt < 0) {
+			continue
+		}
+		adverse = append(adverse, e)
+	}
+	return adverse
 }
 
 // makeSandwichID makes a unique ID for a sandwich based on the front and back transaction signatures, deterministically generated from frontSig and backSig

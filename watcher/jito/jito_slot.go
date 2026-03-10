@@ -9,15 +9,18 @@ import (
 	"watcher/logger"
 	"watcher/sol"
 	"watcher/types"
+	"watcher/utils"
 
 	MapSet "github.com/deckarep/golang-set/v2"
 )
 
 // RunJitoCmd fetches Jito bundles by slot starting from startSlot, and stores them in the database. Also scan sandwichTxs to mark inBundle.
-func RunJitoCmd(startSlot uint64, runTask1 bool, runTask2 bool) error {
+func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) error {
 	// Initialize db
 	ch := db.NewClickhouse()
 	defer ch.Close()
+
+	startSlot = utils.AlignSlotToStep(startSlot, config.PER_LEADER_SLOT)
 
 	// Fetch current slot from Solana RPC
 	solanaSlot, err := sol.GetCurrentSlot()
@@ -31,7 +34,7 @@ func RunJitoCmd(startSlot uint64, runTask1 bool, runTask2 bool) error {
 	logger.JitoLogger.Info("Starting Jito bundle fetcher", "start_slot", startSlot, "current_remote_slot", solanaSlot)
 
 	// Task 1: fetch bundles by slot, from startSlot
-	if runTask1 {
+	if runFetchBundle {
 		go func(start uint64, solS uint64) {
 			s := start
 			for {
@@ -115,7 +118,7 @@ func RunJitoCmd(startSlot uint64, runTask1 bool, runTask2 bool) error {
 	}
 
 	// Task 2: scan sandwich txs to mark inBundle
-	if runTask2 {
+	if runSyncInBundle {
 		go func() {
 			for {
 				// Find the first (oldest) slot in sandwich_txs, that has already checked sandwich, but not yet checked inBundle and bundles have been fetched.

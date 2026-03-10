@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 START_SLOT = 370656000  # Start of epoch 858
 END_SLOT = 377135999  # End of epoch 872
-TX_TYPES = ["frontRun", "backRun", "victim", "transfer"]
+TX_TYPES = ["frontRun", "backRun", "victim", "transfer", "adverse"]
 ATTACKER_TX_TYPES = ["frontRun", "backRun", "transfer"]
 EPS_WIN = 1e-5
 
@@ -161,6 +161,8 @@ def query_sandwiches_with_txs_and_leader_to_parquet(
                     t.toAmount,
                     t.attackerPreBalanceB,
                     t.attackerPostBalanceB,
+                    t.poolPreBalanceB,
+                    t.poolPostBalanceB,
                     t.ownersOfB,
                     t.fromTotalAmount,
                     t.toTotalAmount,
@@ -306,6 +308,7 @@ def _analyze_one_chunk(
         fr_count = int(len(fr))
         br_count = int(len(br))
         transfer_count = int((txs["type"] == "transfer").sum())
+        adverse_count = int((txs["type"] == "adverse").sum())
         victim_count = int(len(victim))
 
         pos_unique = sorted(txs["position"].dropna().unique().tolist())
@@ -383,6 +386,7 @@ def _analyze_one_chunk(
                 "fr_count": fr_count,
                 "br_count": br_count,
                 "transfer_count": transfer_count,
+                "adverse_count": adverse_count,
                 "victim_count": victim_count,
                 "inblock_distance": inblock_distance,
                 "crossblock_gap_slots": crossblock_gap_slots,

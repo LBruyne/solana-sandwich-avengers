@@ -20,9 +20,35 @@ var jitoCmd = cobra.Command{
 			return
 		}
 
-		logger.JitoLogger.Info("Running cmd jito, starting Jito bundle monitoring and marking...")
+		runFetchBundle := true
+		runSyncInBundle := true
 
-		if err := jito.RunJitoCmd(jitoStart, !disableJitoTask1, !disableJitoTask2); err != nil {
+		if jitoFetchBundleOnly && jitoSyncInBundle {
+			logger.JitoLogger.Error("--fetch-bundle-only and --sync-in-bundle cannot be used together")
+			return
+		}
+
+		switch {
+		case jitoFetchBundleOnly:
+			runFetchBundle = true
+			runSyncInBundle = false
+		case jitoSyncInBundle:
+			runFetchBundle = false
+			runSyncInBundle = true
+		default:
+			// Default: run both tasks.
+			runFetchBundle = true
+			runSyncInBundle = true
+		}
+
+		logger.JitoLogger.Info(
+			"Running cmd jito",
+			"start_slot", jitoStart,
+			"run_fetch_bundle", runFetchBundle,
+			"run_sync_in_bundle", runSyncInBundle,
+		)
+
+		if err := jito.RunJitoCmd(jitoStart, runFetchBundle, runSyncInBundle); err != nil {
 			logger.JitoLogger.Error("Error running Jito command", "error", err)
 		}
 	},
