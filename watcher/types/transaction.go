@@ -49,6 +49,7 @@ type Transaction struct {
 	RelatedTokens       MapSet.Set[string]               `ch:"relatedTokens" json:"relatedTokens"`             // records all tokens involved in this transaction
 	RelatedPools        MapSet.Set[string]               `ch:"relatedPools" json:"relatedPools"`               // records all pools involved in this transaction
 	RelatedPoolsInfo    map[string]PoolAmount            // pool address -> {fromToken, fromAmt, toToken, toAmt}, record the token changes of each related pool
+	HasNativeSOLDelta   map[string]bool                  // owner -> true if owner had a native SOL (lamport) balance change before the SOL/WSOL merge. AMM pools typically have constant lamport balances while user wallets change.
 }
 
 type Transactions []*Transaction
@@ -61,6 +62,18 @@ func (tx *Transaction) PostprocessForFindSandwich() {
 	tx.RelatedPoolsInfo = make(map[string]PoolAmount)
 	if tx.IsFailed || tx.IsVote {
 		return // Skip failed or vote transactions
+	}
+
+	// Record which owners have native SOL (lamport) balance changes BEFORE the SOL/WSOL merge.
+	// AMM pool PDAs keep a constant lamport balance (rent-exempt); only their WSOL token accounts change.
+	// User wallets typically have lamport changes when paying for swaps.
+	tx.HasNativeSOLDelta = make(map[string]bool)
+	for owner, tokenChanges := range tx.OwnerBalanceChanges {
+		if solChange, ok := tokenChanges[utils.SOL]; ok {
+			if math.Abs(solChange.GetTotalAmount()) > utils.EPSILON {
+				tx.HasNativeSOLDelta[owner] = true
+			}
+		}
 	}
 
 	// Combine SOL and WSOL
@@ -138,7 +151,6 @@ func (tx *Transaction) PostprocessForFindSandwich() {
 	// Collect potentially related pools (any owner with exactly 1 income token and 1 expense token throughout this tx)
 	// Note: signer is also included as a pool-like participant to enable swap structure validation downstream.
 	// For signer, the SOL balance is adjusted by removing the transaction fee to isolate swap-related changes.
-	// Fee in SOL for signer adjustment
 	feeInSOL := float64(tx.Fee) / utils.SOL_UNIT
 
 	relatedPools := MapSet.NewSet[string]()
@@ -152,14 +164,18 @@ func (tx *Transaction) PostprocessForFindSandwich() {
 
 			// For any signer's SOL balance, the RPC-reported delta includes the transaction fee.
 			// Add back the fee so that only the swap-related SOL change remains.
+			// Then, if the fee-adjusted amount is negligibly small (< EPSILON), treat it
+			// as zero so it does not count as an income or expense leg.
+			// NOTE: We only apply the EPSILON threshold to signer SOL (where fee
+			// adjustment happens). For non-signer amounts (e.g., AMM pool SOL changes),
+			// even very small but real amounts (like 50K lamports) must be preserved —
+			// filtering them out would prevent the pool from being recognized in
+			// RelatedPools.
 			if utils.HasString(tx.Signers, owner) && token == utils.SOL {
 				amount += feeInSOL
-			}
-
-			// After fee adjustment, if the amount is negligibly small (< EPSILON), treat it as zero
-			// and skip it so it does not count as an income or expense leg.
-			if math.Abs(amount) < utils.EPSILON {
-				continue
+				if math.Abs(amount) < utils.EPSILON {
+					continue
+				}
 			}
 
 			if amount < 0 {
@@ -272,9 +288,9 @@ func PPTx(i int, tx *Transaction, details bool) {
 		fmt.Printf("     relatedPools (%d):\n", len(pools))
 		for _, p := range pools {
 			if pa, ok := tx.RelatedPoolsInfo[p]; ok {
-				dir := fmt.Sprintf("%s -> %s", pa.IncomeToken, pa.ExpenseToken)
-				fmt.Printf("       - %s  dir=%s  income=%.12f  expense=%.12f\n",
-					p, dir, pa.IncomeAmt, pa.ExpenseAmt)
+				dir := fmt.Sprintf("%s -> %s", pa.ExpenseToken, pa.IncomeToken)
+				fmt.Printf("       - %s  dir=%s  expense=%.12f  income=%.12f\n",
+					p, dir, pa.ExpenseAmt, pa.IncomeAmt)
 			} else {
 				fmt.Printf("       - %s\n", p)
 			}

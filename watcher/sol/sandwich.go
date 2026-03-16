@@ -50,7 +50,7 @@ func RunSandwichCmd(startSlot uint64) error {
 		}
 
 		numToFetch := config.SOL_FETCH_SLOT_DATA_SLOT_NUM
-		if currentSlot-startSlot < config.SOL_FETCH_SLOT_LEADER_LIMIT {
+		if currentSlot-startSlot < config.SOL_FETCH_SLOT_DATA_LATEST_GAP {
 			logger.SolLogger.Info("Not enough new slots, sleep and retry after "+config.SOL_FETCH_SLOT_DATA_LONG_INTERVAL.String(), "start", startSlot, "current", currentSlot)
 			time.Sleep(config.SOL_FETCH_SLOT_DATA_LONG_INTERVAL)
 			continue
@@ -463,6 +463,18 @@ func StoreSandwichesToDB(ch db.Database, inBlockSandwiches []*types.InBlockSandw
 
 		sandwichTxToInsert := make([]*types.SandwichTx, 0)
 		for _, s := range inBlockSandwiches {
+			for _, tx := range s.FrontRun {
+				tx.SandwichTimestamp = s.Timestamp
+			}
+			for _, tx := range s.Victims {
+				tx.SandwichTimestamp = s.Timestamp
+			}
+			for _, tx := range s.Adverse {
+				tx.SandwichTimestamp = s.Timestamp
+			}
+			for _, tx := range s.BackRun {
+				tx.SandwichTimestamp = s.Timestamp
+			}
 			sandwichTxToInsert = append(sandwichTxToInsert, s.FrontRun...)
 			sandwichTxToInsert = append(sandwichTxToInsert, s.Victims...)
 			sandwichTxToInsert = append(sandwichTxToInsert, s.Adverse...)
@@ -482,6 +494,18 @@ func StoreSandwichesToDB(ch db.Database, inBlockSandwiches []*types.InBlockSandw
 
 		sandwichTxToInsert := make([]*types.SandwichTx, 0)
 		for _, s := range crossBlockSandwiches {
+			for _, tx := range s.FrontRun {
+				tx.SandwichTimestamp = s.Timestamp
+			}
+			for _, tx := range s.Victims {
+				tx.SandwichTimestamp = s.Timestamp
+			}
+			for _, tx := range s.Adverse {
+				tx.SandwichTimestamp = s.Timestamp
+			}
+			for _, tx := range s.BackRun {
+				tx.SandwichTimestamp = s.Timestamp
+			}
 			sandwichTxToInsert = append(sandwichTxToInsert, s.FrontRun...)
 			sandwichTxToInsert = append(sandwichTxToInsert, s.Victims...)
 			sandwichTxToInsert = append(sandwichTxToInsert, s.Adverse...)

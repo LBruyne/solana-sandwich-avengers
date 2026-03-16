@@ -656,3 +656,70 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 // 	}
 // 	return out
 // }
+
+// GetMultipleAccountOwners queries the on-chain owner program for a batch of
+// addresses using the getMultipleAccounts RPC method. Returns a map from
+// address → owner program ID. Addresses that don't exist on-chain are omitted.
+// Maximum 100 addresses per call (Solana RPC limit).
+func GetMultipleAccountOwners(addresses []string) (map[string]string, error) {
+	if len(addresses) == 0 {
+		return nil, nil
+	}
+
+	const batchSize = 100
+	result := make(map[string]string, len(addresses))
+
+	for start := 0; start < len(addresses); start += batchSize {
+		end := start + batchSize
+		if end > len(addresses) {
+			end = len(addresses)
+		}
+		batch := addresses[start:end]
+
+		// Build params: [["addr1","addr2",...], {"commitment":"finalized","encoding":"base64"}]
+		addrList := make([]interface{}, len(batch))
+		for i, a := range batch {
+			addrList[i] = a
+		}
+		params := []interface{}{
+			addrList,
+			map[string]string{
+				"commitment": "finalized",
+				"encoding":   "base64",
+			},
+		}
+
+		raw, err := CallRpc("getMultipleAccounts", params)
+		if err != nil {
+			return result, fmt.Errorf("getMultipleAccounts failed: %w", err)
+		}
+		if raw == nil {
+			continue
+		}
+
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			return result, fmt.Errorf("unexpected getMultipleAccounts result type: %T", raw)
+		}
+		values, ok := obj["value"].([]any)
+		if !ok {
+			return result, fmt.Errorf("unexpected value type: %T", obj["value"])
+		}
+
+		for i, v := range values {
+			if v == nil {
+				continue // account does not exist
+			}
+			acct, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			owner, _ := acct["owner"].(string)
+			if owner != "" {
+				result[batch[i]] = owner
+			}
+		}
+	}
+
+	return result, nil
+}

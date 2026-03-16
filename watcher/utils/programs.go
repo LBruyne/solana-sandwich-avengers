@@ -29,6 +29,10 @@ func IsBuiltInPrograms(name string) bool {
 	return viper.IsSet("builtin." + strings.ToLower(name))
 }
 
-func IsLabeledPrograms(name string) bool {
-	return viper.IsSet("labeled." + strings.ToLower(name))
+func IsLabeledDexPrograms(name string) bool {
+	return viper.IsSet("labeled_dex." + strings.ToLower(name))
+}
+
+func IsLabeledDexPool(name string) bool {
+	return viper.IsSet("labeled_pools." + strings.ToLower(name))
 }

@@ -120,21 +120,23 @@ func (d *ClickhouseDB) CreateTables() error {
 
 			tokenA String,
 			tokenB String,
+
+			hasTransfer Bool,
+			signerSame Bool,
+			ownerSame Bool,
+			ataSame Bool,
 			consecutive Bool,
 
 			multiFrontRun Bool,
 			multiBackRun Bool,
 			multiVictim Bool,
-			frontConsecutive Bool,
-			backConsecutive Bool,
-			victimConsecutive Bool,
 			frontCount UInt16,
 			backCount UInt16,
 			victimCount UInt16,
-
-			signerSame Bool,
-			ownerSame Bool,
-			ataSame Bool,
+			adverseCount UInt16,
+			frontConsecutive Bool,
+			backConsecutive Bool,
+			victimConsecutive Bool,
 
 			perfect Bool,
 			relativeDiffB Float64,
@@ -164,17 +166,17 @@ func (d *ClickhouseDB) CreateTables() error {
 			toToken String,
 			fromAmount Float64,
 			toAmount Float64,
+			attackerPreBalanceB Float64,
+			attackerPostBalanceB Float64,
+			poolPreBalanceB Float64,
+			poolPostBalanceB Float64,
+			ownersOfB Array(String),
 
 			fromTotalAmount Float64,
 			toTotalAmount Float64,
 
 			diffA Float64,
-			diffB Float64,
-			attackerPreBalanceB Float64,  
-			attackerPostBalanceB Float64,
-			poolPreBalanceB Float64,
-			poolPostBalanceB Float64,
-    		ownersOfB Array(String)
+			diffB Float64
 		)
 		ENGINE = MergeTree
 		ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)

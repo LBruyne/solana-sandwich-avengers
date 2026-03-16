@@ -1,0 +1,10 @@
+clickhouse-connect
+pandas
+numpy
+pyarrow
+python-dotenv
+scipy
+tqdm
+ipykernel
+matplotlib
+seaborn

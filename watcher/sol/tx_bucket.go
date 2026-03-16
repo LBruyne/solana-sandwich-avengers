@@ -1,9 +1,11 @@
 package sol
 
 import (
-	"fmt"
+	"math"
 	"sort"
+	"time"
 	"watcher/config"
+	"watcher/logger"
 	"watcher/types"
 	"watcher/utils"
 
@@ -14,6 +16,11 @@ import (
 // Implemented as a bounded LRU set to prevent unbounded memory growth when
 // processing many ephemeral memecoin pools. Concurrent-safe via internal mutex.
 var knownAMMPools = NewAMMPoolLRU(config.AMM_POOL_CACHE_SIZE)
+
+// accountOwnerCache caches on-chain account owner lookups (address → owner program).
+// Used to determine whether an address is an AMM pool by checking if its owner
+// is a known DEX program. Reduces RPC calls across blocks.
+var accountOwnerCache = NewAccountOwnerLRU(config.ACCOUNT_OWNER_CACHE_SIZE)
 
 // unionSigners returns the union of all Signers sets from the given entries.
 // Used to build a comprehensive signer set for multi-front/multi-back comparisons.
@@ -41,6 +48,15 @@ type PoolEntry struct {
 	Position int
 	Signers  MapSet.Set[string] // Signers of the transaction, used for multi-signer detection
 
+	// SourceOwner is the owner whose balance change indicates it is the swap source
+	// for IncomeToken (from user side, typically decreasing IncomeToken).
+	SourceOwner string
+	// SinkOwner is the single sink owner for ExpenseToken. If it differs from
+	// SourceOwner, the tx likely contains an inline transfer after swap.
+	SinkOwner string
+	// HasInlineTransfer is true when SourceOwner and SinkOwner differ.
+	HasInlineTransfer bool
+
 	// Related pool and token info
 	PoolAddress  string
 	IncomeToken  string
@@ -51,51 +67,67 @@ type PoolEntry struct {
 
 // filterAndBuildTxBuckets processes a list of transactions, filters for swap-like transactions, identifies the AMM pool involved, and groups them into buckets by (pool address, income token, expense token).
 func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKey][]PoolEntry {
+	// Pre-fetch: collect candidate pool addresses and batch-query their owners.
+	prefetchPoolOwners(txs)
+
 	buckets := make(map[PoolKey][]PoolEntry)
 	for idx, tx := range txs {
 		if tx == nil || tx.IsFailed || tx.IsVote {
 			continue
 		}
-		// A swap transaction must have exactly 2 pool-like participants (AMM pool + user)
-		if tx.RelatedPools.Cardinality() != 2 {
+		if tx.RelatedPools.Cardinality() == 0 {
 			continue
 		}
 
-		// Get the two pools and validate they form a swap (same tokens, opposite directions)
+		// Identify the unique AMM pool among all pool-like participants.
 		pools := tx.RelatedPools.ToSlice()
-		pool0, pool1 := pools[0], pools[1]
-		amt0 := tx.RelatedPoolsInfo[pool0]
-		amt1 := tx.RelatedPoolsInfo[pool1]
+		ammCandidates := make([]string, 0, 1)
+		ammAmountByPool := make(map[string]types.PoolAmount)
+		for _, pool := range pools {
+			amt, ok := tx.RelatedPoolsInfo[pool]
+			if !ok {
+				continue
+			}
+			if !identifyAMMPool(tx, pool, amt) {
+				continue
+			}
+			ammCandidates = append(ammCandidates, pool)
+			ammAmountByPool[pool] = amt
+			if len(ammCandidates) > 1 {
+				break
+			}
+		}
 
-		if amt0.IncomeToken == "" || amt0.ExpenseToken == "" || amt1.IncomeToken == "" || amt1.ExpenseToken == "" {
+		// Require exactly one AMM candidate; otherwise this tx is ambiguous.
+		if len(ammCandidates) != 1 {
 			continue
 		}
-		// The two pools must have the same tokens in opposite directions to form a swap
-		if !(amt0.IncomeToken == amt1.ExpenseToken && amt0.ExpenseToken == amt1.IncomeToken) {
-			continue
-		}
-
-		// Determine which pool is the AMM and which is the user
-		ammPool, ammAmt := identifyAMMPool(tx, pool0, amt0, pool1, amt1)
-		fmt.Printf("Tx %d: Identified AMM pool %s with income %.2f %s and expense %.2f %s\n", idx, ammPool, ammAmt.IncomeAmt, ammAmt.IncomeToken, ammAmt.ExpenseAmt, ammAmt.ExpenseToken)
-
+		ammPool := ammCandidates[0]
+		ammAmt := ammAmountByPool[ammPool]
 		// Validate AMM pool amounts
 		if !(ammAmt.IncomeAmt > 0 && ammAmt.ExpenseAmt < 0) {
 			continue
 		}
+		knownAMMPools.Add(ammPool)
+
+		// Find source/sink owners by matching token balance changes against AMM amounts. Assume at most one source and one sink owner per transaction, which holds for most cases except some complex multi-hop swaps.
+		sourceOwner, sinkOwner, hasInlineTransfer := inferSwapSourceAndSinkOwner(tx, ammPool, ammAmt)
 
 		// Create bucket entry from AMM pool's perspective
 		key := PoolKey{PoolAddress: ammPool, IncomeToken: ammAmt.IncomeToken, ExpenseToken: ammAmt.ExpenseToken}
 		entry := PoolEntry{
-			TxIdx:        idx,
-			Slot:         tx.Slot,
-			Position:     tx.Position,
-			Signers:      MapSet.NewSet(tx.Signers...),
-			PoolAddress:  ammPool,
-			IncomeToken:  ammAmt.IncomeToken,
-			ExpenseToken: ammAmt.ExpenseToken,
-			IncomeAmt:    ammAmt.IncomeAmt,
-			ExpenseAmt:   ammAmt.ExpenseAmt,
+			TxIdx:             idx,
+			Slot:              tx.Slot,
+			Position:          tx.Position,
+			Signers:           MapSet.NewSet(tx.Signers...),
+			SourceOwner:       sourceOwner,
+			SinkOwner:         sinkOwner,
+			HasInlineTransfer: hasInlineTransfer,
+			PoolAddress:       ammPool,
+			IncomeToken:       ammAmt.IncomeToken,
+			ExpenseToken:      ammAmt.ExpenseToken,
+			IncomeAmt:         ammAmt.IncomeAmt,
+			ExpenseAmt:        ammAmt.ExpenseAmt,
 		}
 		buckets[key] = append(buckets[key], entry)
 	}
@@ -122,103 +154,247 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 	return buckets
 }
 
-func isEntriesConsecutive(es []PoolEntry, crossBlock bool) bool {
-	if len(es) <= 1 {
+// identifyAMMPool determines whether a single pool-like participant is an AMM pool.
+// It uses a layered approach: explicit labeled pools → signer exclusion →
+// caches/owner labels → liquidity heuristics.
+func identifyAMMPool(tx *types.Transaction, pool string, amt types.PoolAmount) bool {
+	if tx == nil || pool == "" {
+		return false
+	}
+	if amt.IncomeToken == "" || amt.ExpenseToken == "" || amt.IncomeToken == amt.ExpenseToken {
+		return false
+	}
+	if !(amt.IncomeAmt > 0 && amt.ExpenseAmt < 0) {
+		return false
+	}
+
+	// Some AMM-related accounts (e.g. vault authorities) are explicitly labeled
+	// and should be accepted directly.
+	if utils.IsLabeledDexPool(pool) {
+		knownAMMPools.Add(pool)
 		return true
 	}
 
-	if crossBlock {
-		for i := 1; i < len(es); i++ {
-			if es[i].Slot != es[i-1].Slot {
-				return false
-			}
-			if es[i].Position != es[i-1].Position+1 {
-				return false
-			}
+	// A signer-owned participant is typically user side, not AMM pool.
+	if utils.HasString(tx.Signers, pool) {
+		return false
+	}
+
+	// AMM pool must have both income and expense token pre- and post-transaction
+	preIn := tx.GetOwnerPreBalance(pool, amt.IncomeToken)
+	preOut := tx.GetOwnerPreBalance(pool, amt.ExpenseToken)
+	postIn := tx.GetOwnerPostBalance(pool, amt.IncomeToken)
+	postOut := tx.GetOwnerPostBalance(pool, amt.ExpenseToken)
+	hasBothPre := preIn > 0 && preOut > 0
+	hasBothPost := postIn > 0 && postOut > 0
+	if !(hasBothPre && hasBothPost) {
+		return false
+	}
+
+	// Check known AMM pool cache and account owner cache (DEX program)
+	if knownAMMPools.Contains(pool) {
+		return true
+	}
+
+	if isAMM, cached := isAMMByOwner(pool); cached {
+		if isAMM {
+			knownAMMPools.Add(pool)
 		}
+		return isAMM
+	}
+
+	return false
+}
+
+// inferSwapSourceAndSinkOwner infers the user-side source/sink owners against the
+// AMM pool amounts.
+//
+// Priority 1: find a single owner (not the AMM pool) whose IncomeToken decreases
+// by ~expectedSource AND whose ExpenseToken increases by ~expectedSink in the same
+// transaction. This is the normal swap case — source == sink, no inline transfer.
+//
+// Priority 2 (fallback): find source and sink owners independently. When they
+// differ, the transaction contains an inline transfer from source to sink.
+func inferSwapSourceAndSinkOwner(tx *types.Transaction, ammPool string, ammAmt types.PoolAmount) (string, string, bool) {
+	if tx == nil {
+		return "", "", false
+	}
+
+	expectedSource := ammAmt.IncomeAmt // user spends IncomeToken
+	expectedSink := -ammAmt.ExpenseAmt // user receives ExpenseToken
+	if expectedSource <= 0 || expectedSink <= 0 {
+		return "", "", false
+	}
+
+	// Priority 1: unified owner — both legs belong to the same wallet.
+	if unified := pickUnifiedSwapOwner(tx, ammPool, ammAmt.IncomeToken, ammAmt.ExpenseToken, expectedSource, expectedSink, config.SANDWICH_OWNER_MATCH_TOLERANCE); unified != "" {
+		return unified, unified, false
+	}
+
+	// Priority 2: source and sink may be different owners (inline transfer).
+	source := pickClosestOwnerByTokenDelta(tx, ammPool, ammAmt.IncomeToken, -expectedSource, config.SANDWICH_OWNER_MATCH_TOLERANCE)
+	sink := pickClosestOwnerByTokenDelta(tx, ammPool, ammAmt.ExpenseToken, expectedSink, config.SANDWICH_OWNER_MATCH_TOLERANCE)
+
+	hasInlineTransfer := source != "" && sink != "" && source != sink
+	return source, sink, hasInlineTransfer
+}
+
+// pickUnifiedSwapOwner returns the single owner (excluding ammPool) that has both:
+//   - a decrease in incomeToken whose absolute value is within tolerance of expectedSource
+//   - an increase in expenseToken within tolerance of expectedSink
+//
+// Among all qualifying owners the one with the lowest combined relative difference
+// score (sourceDiff + sinkDiff) is returned. Returns "" when no such owner exists.
+func pickUnifiedSwapOwner(tx *types.Transaction, ammPool, incomeToken, expenseToken string, expectedSource, expectedSink float64, tolerance float64) string {
+	if tx == nil || incomeToken == "" || expenseToken == "" || expectedSource <= 0 || expectedSink <= 0 {
+		return ""
+	}
+
+	bestOwner := ""
+	bestScore := math.MaxFloat64
+
+	for owner, tokenChanges := range tx.OwnerBalanceChanges {
+		if owner == ammPool {
+			continue
+		}
+
+		sourceDelta := tokenChanges[incomeToken].TotalAmount
+		sinkDelta := tokenChanges[expenseToken].TotalAmount
+
+		// Must be spending incomeToken and receiving expenseToken.
+		if sourceDelta >= 0 || sinkDelta <= 0 {
+			continue
+		}
+
+		sourceDiff := getRelativeDiff(math.Abs(sourceDelta), expectedSource)
+		sinkDiff := getRelativeDiff(sinkDelta, expectedSink)
+		if sourceDiff < 0 || sourceDiff > tolerance || sinkDiff < 0 || sinkDiff > tolerance {
+			continue
+		}
+
+		if score := sourceDiff + sinkDiff; score < bestScore {
+			bestScore = score
+			bestOwner = owner
+		}
+	}
+
+	return bestOwner
+}
+
+func pickClosestOwnerByTokenDelta(tx *types.Transaction, excludedOwner string, token string, expectedDelta float64, tolerance float64) string {
+	if tx == nil || token == "" || expectedDelta == 0 {
+		return ""
+	}
+
+	expectedAbs := math.Abs(expectedDelta)
+	bestOwner := ""
+	bestDiff := math.MaxFloat64
+
+	for owner, tokenChanges := range tx.OwnerBalanceChanges {
+		if owner == excludedOwner {
+			continue
+		}
+		ataAmounts, ok := tokenChanges[token]
+		if !ok {
+			continue
+		}
+
+		observedDelta := ataAmounts.TotalAmount
+		if expectedDelta > 0 && observedDelta <= 0 {
+			continue
+		}
+		if expectedDelta < 0 && observedDelta >= 0 {
+			continue
+		}
+
+		observedAbs := math.Abs(observedDelta)
+		relDiff := getRelativeDiff(observedAbs, expectedAbs)
+		if relDiff < 0 || relDiff > tolerance {
+			continue
+		}
+
+		if relDiff < bestDiff {
+			bestDiff = relDiff
+			bestOwner = owner
+		}
+	}
+
+	return bestOwner
+}
+
+func getRelativeDiff(a, b float64) float64 {
+	if a <= 0 || b <= 0 {
+		return -1.0
+	}
+	return math.Abs(a-b) / math.Max(a, b)
+}
+
+// prefetchPoolOwners collects all candidate pool addresses from the transactions
+// that might need owner-based AMM identification, filters out those already in
+// the accountOwnerCache or knownAMMPools, and batch-queries the rest via
+// getMultipleAccounts. Results are stored in accountOwnerCache for use by
+// identifyAMMPool.
+func prefetchPoolOwners(txs types.Transactions) {
+	needed := make(map[string]struct{})
+	for _, tx := range txs {
+		if tx == nil || tx.IsFailed || tx.IsVote {
+			continue
+		}
+		if tx.RelatedPools.Cardinality() == 0 {
+			continue
+		}
+		pools := tx.RelatedPools.ToSlice()
+		for _, p := range pools {
+			if utils.IsLabeledDexPool(p) {
+				knownAMMPools.Add(p)
+				continue
+			}
+
+			// Skip if already in AMM pool cache or owner cache
+			if knownAMMPools.Contains(p) {
+				continue
+			}
+			if _, cached := accountOwnerCache.Get(p); cached {
+				continue
+			}
+			needed[p] = struct{}{}
+		}
+	}
+
+	if len(needed) == 0 {
+		return
+	}
+
+	addrs := make([]string, 0, len(needed))
+	for a := range needed {
+		addrs = append(addrs, a)
+	}
+
+	queryStart := time.Now()
+	owners, err := GetMultipleAccountOwners(addrs)
+	queryCost := time.Since(queryStart)
+	if err == nil {
+		logger.SolLogger.Info("Fetch owners for possible AMM pools: getMultipleAccounts finished", "count", len(addrs), "duration", queryCost.String())
 	} else {
-		for i := 1; i < len(es); i++ {
-			if es[i].Position != es[i-1].Position+1 {
-				return false
-			}
+		logger.SolLogger.Warn("Fetch owners for possible AMM pools: getMultipleAccounts failed", "count", len(addrs), "duration", queryCost.String(), "err", err)
+	}
+
+	for addr, owner := range owners {
+		accountOwnerCache.Put(addr, owner)
+		// If owner is a known DEX program, also add to knownAMMPools
+		if utils.IsLabeledDexPrograms(owner) {
+			knownAMMPools.Add(addr)
 		}
 	}
-	return true
 }
 
-// identifyAMMPool determines which of the two pools is the AMM pool (liquidity pool).
-// It uses a layered approach: cache → signer → pre/post-balance heuristics.
-func identifyAMMPool(tx *types.Transaction, pool0 string, amt0 types.PoolAmount, pool1 string, amt1 types.PoolAmount) (string, types.PoolAmount) {
-	result, resultAmt := identifyAMMPoolInner(tx, pool0, amt0, pool1, amt1)
-	// Cache the identified AMM pool for future lookups
-	knownAMMPools.Add(result)
-	return result, resultAmt
-}
-
-func identifyAMMPoolInner(tx *types.Transaction, pool0 string, amt0 types.PoolAmount, pool1 string, amt1 types.PoolAmount) (string, types.PoolAmount) {
-	// Rule 1: If one pool matches a transaction signer, it's the user; the other is the AMM pool.
-	isPool0Signer := utils.HasString(tx.Signers, pool0)
-	isPool1Signer := utils.HasString(tx.Signers, pool1)
-	if isPool0Signer && !isPool1Signer {
-		return pool1, amt1
+// isAMMByOwner checks the accountOwnerCache to determine if an address is an
+// AMM pool (its on-chain owner is a known DEX program).
+// Returns: (isAMM bool, cached bool).
+func isAMMByOwner(addr string) (bool, bool) {
+	owner, cached := accountOwnerCache.Get(addr)
+	if !cached {
+		return false, false
 	}
-	if isPool1Signer && !isPool0Signer {
-		return pool0, amt0
-	}
-
-	// Neither or both are signers (rare case, e.g., PDA executing swap).
-	// Use layered fallback heuristics.
-	tokenA, tokenB := amt0.IncomeToken, amt0.ExpenseToken
-	preA0 := tx.GetOwnerPreBalance(pool0, tokenA)
-	preB0 := tx.GetOwnerPreBalance(pool0, tokenB)
-	preA1 := tx.GetOwnerPreBalance(pool1, tokenA)
-	preB1 := tx.GetOwnerPreBalance(pool1, tokenB)
-
-	// Fallback 1a: Check if only one pool holds both tokens before the swap.
-	pool0HasBothPre := preA0 > 0 && preB0 > 0
-	pool1HasBothPre := preA1 > 0 && preB1 > 0
-	if pool0HasBothPre && !pool1HasBothPre {
-		return pool0, amt0
-	}
-	if pool1HasBothPre && !pool0HasBothPre {
-		return pool1, amt1
-	}
-
-	// Fallback 1b: Check post-balance — an AMM pool always retains both tokens after a swap.
-	postA0 := tx.GetOwnerPostBalance(pool0, tokenA)
-	postB0 := tx.GetOwnerPostBalance(pool0, tokenB)
-	postA1 := tx.GetOwnerPostBalance(pool1, tokenA)
-	postB1 := tx.GetOwnerPostBalance(pool1, tokenB)
-	pool0HasBothPost := postA0 > 0 && postB0 > 0
-	pool1HasBothPost := postA1 > 0 && postB1 > 0
-	if pool0HasBothPost && !pool1HasBothPost {
-		return pool0, amt0
-	}
-	if pool1HasBothPost && !pool0HasBothPost {
-		return pool1, amt1
-	}
-
-	// Fallback 2: Check the known AMM pool cache.
-	known0 := knownAMMPools.Contains(pool0)
-	known1 := knownAMMPools.Contains(pool1)
-	if known0 && !known1 {
-		return pool0, amt0
-	}
-	if known1 && !known0 {
-		return pool1, amt1
-	}
-
-	// Fallback 3: Both hold both tokens (or neither does).
-	// Compare total pre-balance — the AMM pool holds significantly more liquidity.
-	total0 := preA0 + preB0
-	total1 := preA1 + preB1
-	if total0 > total1 {
-		return pool0, amt0
-	}
-	if total1 > total0 {
-		return pool1, amt1
-	}
-
-	// Final fallback: cannot distinguish, default to pool0.
-	return pool0, amt0
+	return utils.IsLabeledDexPrograms(owner), true
 }

@@ -28,7 +28,8 @@ type InBlockSandwichFinder struct {
 	lastBackTxEntries    []PoolEntry
 	lastVictimEntries    []PoolEntry
 	lastAdverseEntries   []PoolEntry
-	lastTransferTxs      []*types.Transaction
+	lastFrontTransfers   []*TransferEvidence
+	lastBackTransfers    []*TransferEvidence
 	perfect              bool
 	relativeAmtDiffB     float64
 	profitA              float64
@@ -110,7 +111,8 @@ func (f *InBlockSandwichFinder) ResetSandwichState() {
 	f.lastBackTxEntries = nil
 	f.lastVictimEntries = nil
 	f.lastAdverseEntries = nil
-	f.lastTransferTxs = nil
+	f.lastFrontTransfers = nil
+	f.lastBackTransfers = nil
 }
 
 // / collectFrontTxs collects front-run transaction candidates from frontTxBucket that can accompany with the given frontTxEntry. Note that we consider multiple front-run transactions for sandwich attack.
@@ -290,74 +292,45 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 	// Collect adverse txs (same direction as back-run, i.e. B→A) between front and back
 	adverseEntries := f.collectAdverseEntries(frontTxEntries, backTxEntries)
 
+	frontInlineTransfers := collectInlineTransferEvidences(frontTxEntries, f.Txs, transferSideFront)
+	backInlineTransfers := collectInlineTransferEvidences(backTxEntries, f.Txs, transferSideBack)
+	frontTransfers := make([]*TransferEvidence, 0, len(frontInlineTransfers)+4)
+	frontTransfers = append(frontTransfers, frontInlineTransfers...)
+	backTransfers := make([]*TransferEvidence, 0, len(backInlineTransfers))
+	backTransfers = append(backTransfers, backInlineTransfers...)
+
 	// If signers of frontTxs and backTxs share at least one signer, it is confirmed right now
 	if !utils.SignersOverlap(frontSigners, backSigners) {
 		// Different signers, cannot be confirmed right now
 		// Check owner condition
-		ownersOfBInFrtTxs := MapSet.NewSet[string]()
-		for _, frtTxEntry := range frontTxEntries {
-			frtTx := f.Txs[frtTxEntry.TxIdx]
-			for owner, bc := range frtTx.OwnerBalanceChanges {
-				if bc[tokenB].TotalAmount > 0 {
-					// This owner may be the attacker
-					ownersOfBInFrtTxs.Add(owner)
-				}
-			}
-		}
-		ownersOfBInBckTxs := MapSet.NewSet[string]()
-		for _, bckTxEntry := range backTxEntries {
-			bckTx := f.Txs[bckTxEntry.TxIdx]
-			for owner, bc := range bckTx.OwnerBalanceChanges {
-				if bc[tokenB].TotalAmount < 0 {
-					// This owner may be the attacker
-					ownersOfBInBckTxs.Add(owner)
-				}
-			}
-		}
+		ownersOfBInFrtTxs := collectFrontOwnersByToken(frontTxEntries, f.Txs, tokenB)
+		ownersOfBInBckTxs := collectBackOwnersByToken(backTxEntries, f.Txs, tokenB)
 		// Owner same, consider confirmed
 		if !ownersOfBInFrtTxs.IsSuperset(ownersOfBInBckTxs) {
-			// Owner different, need further check
-			// We check if there is a transfer tx of tokenB from attackers to others, where tokenB is transferred from owners in frontTx(s) to owners in backTx(s)
-			// Search txs between front and back
-			transferTxs := make([]*types.Transaction, 0)
-			for i := frontTxEntries[len(frontTxEntries)-1].Position + 1; i < backTxEntries[0].Position; i++ {
-				tx := f.Txs[i]
-				if tx == nil || tx.IsFailed || tx.IsVote {
-					continue // Skip failed or vote transactions
-				}
-
-				// Tx has no pool
-				if tx.RelatedPools.Cardinality() != 0 {
-					continue
-				}
-
-				// Only one owner increases tokenB and only one owner decreases tokenB
-				increaseBOwners := make([]string, 0)
-				decreaseBOwners := make([]string, 0)
-				for owner, bc := range tx.OwnerBalanceChanges {
-					if bc[tokenB].TotalAmount > 0 {
-						increaseBOwners = append(increaseBOwners, owner)
-					} else if bc[tokenB].TotalAmount < 0 {
-						decreaseBOwners = append(decreaseBOwners, owner)
-					}
-				}
-				if len(increaseBOwners) != 1 || len(decreaseBOwners) != 1 {
-					continue // More than one owner increases or decreases tokenB, cannot confirm
-				}
-				increaseBOwner := increaseBOwners[0]
-				decreaseBOwner := decreaseBOwners[0]
-
-				// Check if the most decrease of tokenB is from front owners and the most increase of tokenB is from back owners, which forms a transfer from front owners to back owners
-				if ownersOfBInFrtTxs.Contains(decreaseBOwner) && ownersOfBInBckTxs.Contains(increaseBOwner) {
-					// Found a transfer tx of tokenB from frt owners to bck owners
-					transferTxs = append(transferTxs, tx)
-				}
-			}
-			if len(transferTxs) == 0 {
-				return false // No transfer tx found, cannot confirm this sandwich
+			// Owner different, need transfer evidence from front-side inline/direct
+			directFrontTransfers := collectDirectTransferEvidences(
+				f.Txs,
+				frontTxEntries[len(frontTxEntries)-1].Position+1,
+				backTxEntries[0].Position,
+				tokenB,
+				ownersOfBInFrtTxs,
+				ownersOfBInBckTxs,
+				transferSideFront,
+			)
+			directAmtB := sumTransferEvidenceAmount(directFrontTransfers)
+			inlineBridgeAmtB := sumFrontInlineBridgeAmount(frontInlineTransfers, tokenB, ownersOfBInFrtTxs, ownersOfBInBckTxs)
+			bridgeAmtB := directAmtB + inlineBridgeAmtB
+			if bridgeAmtB <= 0 {
+				return false
 			}
 
-			f.lastTransferTxs = transferTxs
+			// Compare front-side transfer evidence with back-side sold tokenB.
+			similarTransfer, _ := f.HasSimilarAmount(backAmtB, bridgeAmtB, float64(threshold))
+			if !similarTransfer {
+				return false
+			}
+
+			frontTransfers = append(frontTransfers, directFrontTransfers...)
 		}
 	}
 
@@ -368,6 +341,8 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 	f.lastBackTxEntries = backTxEntries
 	f.lastVictimEntries = victimEntries
 	f.lastAdverseEntries = adverseEntries
+	f.lastFrontTransfers = frontTransfers
+	f.lastBackTransfers = backTransfers
 	f.perfect = perfect
 	f.relativeAmtDiffB = relativeAmtDiff
 	f.FrontToTotalAmount = frontAmtB
@@ -473,19 +448,23 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 	for _, fe := range f.lastFrontTxEntries {
 		frontTxs = append(frontTxs, f.makeSandwichTx(sandwichId, fe, "frontRun"))
 	}
-	transferTxs := make([]*types.SandwichTx, 0, len(f.lastTransferTxs))
-	for _, te := range f.lastTransferTxs {
-		transferTxs = append(transferTxs, &types.SandwichTx{
-			SandwichID:          sandwichId,
-			Transaction:         *te,
-			Type:                "transfer",
-			SandwichTxTokenInfo: types.SandwichTxTokenInfo{},
-			InBundle:            false,
-		})
+	frontTransferTxs := make([]*types.SandwichTx, 0, len(f.lastFrontTransfers))
+	for _, evidence := range f.lastFrontTransfers {
+		transferTx := makeTransferSandwichTx(sandwichId, evidence, f.lastTokenB)
+		if transferTx != nil {
+			frontTransferTxs = append(frontTransferTxs, transferTx)
+		}
 	}
 	backTxs := make([]*types.SandwichTx, 0, len(f.lastBackTxEntries))
 	for _, be := range f.lastBackTxEntries {
 		backTxs = append(backTxs, f.makeSandwichTx(sandwichId, be, "backRun"))
+	}
+	backTransferTxs := make([]*types.SandwichTx, 0, len(f.lastBackTransfers))
+	for _, evidence := range f.lastBackTransfers {
+		transferTx := makeTransferSandwichTx(sandwichId, evidence, f.lastTokenB)
+		if transferTx != nil {
+			backTransferTxs = append(backTransferTxs, transferTx)
+		}
 	}
 	victimTxs := make([]*types.SandwichTx, 0, len(f.lastVictimEntries))
 	for _, ve := range f.lastVictimEntries {
@@ -529,8 +508,9 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 	slot := f.Txs[f.lastFrontTxEntries[0].TxIdx].Slot
 	timestamp := f.Txs[f.lastFrontTxEntries[0].TxIdx].Timestamp
 
-	// Combine frontTxs, transferTxs when recording
-	frontTxs = append(frontTxs, transferTxs...)
+	// Combine side-aware transfer txs when recording.
+	frontTxs = append(frontTxs, frontTransferTxs...)
+	backTxs = append(backTxs, backTransferTxs...)
 
 	// Make InBlockSandwich
 	s := &types.InBlockSandwich{
@@ -546,9 +526,10 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 			BackConsecutive:   isEntriesConsecutive(f.lastBackTxEntries, false),
 			VictimConsecutive: isEntriesConsecutive(f.lastVictimEntries, false),
 			// Signer/owner/ata info
-			SignerSame: signerSame,
-			OwnerSame:  ownerSame,
-			ATASame:    false, // TODO:
+			SignerSame:  signerSame,
+			HasTransfer: len(frontTransferTxs)+len(backTransferTxs) > 0,
+			OwnerSame:   ownerSame,
+			ATASame:     false, // TODO:
 			// Amount info
 			Perfect:       f.perfect,
 			RelativeDiffB: f.relativeAmtDiffB,
@@ -561,6 +542,7 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 			FrontCount:    uint16(len(frontTxs)),
 			BackCount:     uint16(len(backTxs)),
 			VictimCount:   uint16(len(victimTxs)),
+			AdverseCount:  uint16(len(adverseTxs)),
 			// SandwichTxs
 			FrontRun: frontTxs,
 			BackRun:  backTxs,
@@ -692,6 +674,30 @@ func isSandwichConsecutive(frontTxs, victimTxs, backTxs []PoolEntry) bool {
 	}
 	if victimTxs[len(victimTxs)-1].Position+1 != backTxs[0].Position {
 		return false
+	}
+	return true
+}
+
+func isEntriesConsecutive(es []PoolEntry, crossBlock bool) bool {
+	if len(es) <= 1 {
+		return true
+	}
+
+	if crossBlock {
+		for i := 1; i < len(es); i++ {
+			if es[i].Slot != es[i-1].Slot {
+				return false
+			}
+			if es[i].Position != es[i-1].Position+1 {
+				return false
+			}
+		}
+	} else {
+		for i := 1; i < len(es); i++ {
+			if es[i].Position != es[i-1].Position+1 {
+				return false
+			}
+		}
 	}
 	return true
 }

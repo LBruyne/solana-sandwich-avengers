@@ -47,21 +47,24 @@ type Sandwich struct {
 	MultiBackRun  bool `ch:"multiBackRun"`  // whether there are multiple back-run txs
 	MultiVictim   bool `ch:"multiVictim"`   // whether there are multiple victim txs
 
-	SignerSame bool `ch:"signerSame"` // whether front-run and back-run have the same signer
-	OwnerSame  bool `ch:"ownerSame"`  // whether front-run and back-run have the same owner, i.e., the owner of ATA that holds the toToken in front-run and the fromToken in back-run
-	ATASame    bool `ch:"ataSame"`    // whether front-run and back-run have the same ATA that holds the toToken in front-run and the fromToken in back-run
+	SignerSame  bool `ch:"signerSame"` // whether front-run and back-run have the same signer
+	HasTransfer bool `ch:"hasTransfer"`
+
+	OwnerSame bool `ch:"ownerSame"` // whether front-run and back-run have the same owner, i.e., the owner of ATA that holds the toToken in front-run and the fromToken in back-run
+	ATASame   bool `ch:"ataSame"`   // whether front-run and back-run have the same ATA that holds the toToken in front-run and the fromToken in back-run
 
 	Perfect       bool    `ch:"perfect"`       // whether the sandwich is perfect, i.e., the amount diff of tokeb Bis exactly the same
 	RelativeDiffB float64 `ch:"relativeDiffB"` // The relative amount diff = |backTxs.fromTotalAmount - frontTxs.toTotalAmount| / max(frontTxs.toTotalAmount, backTxs.fromTotalAmount).
 	ProfitA       float64 `ch:"profitA"`       // The profit of the sandwich = backTx.toToTalAmount - frontTx.fromTotalAmount
 
-	FrontCount  uint16        `ch:"frontCount"`
-	BackCount   uint16        `ch:"backCount"`
-	VictimCount uint16        `ch:"victimCount"`
-	FrontRun    []*SandwichTx `ch:"frontRunTx" json:"frontRunTx"`
-	BackRun     []*SandwichTx `ch:"backRunTx" json:"backRunTx"`
-	Victims     []*SandwichTx `ch:"victims" json:"victims"`
-	Adverse     []*SandwichTx `ch:"adverseTx" json:"adverseTx"`
+	AdverseCount uint16        `ch:"adverseCount"`
+	FrontCount   uint16        `ch:"frontCount"`
+	BackCount    uint16        `ch:"backCount"`
+	VictimCount  uint16        `ch:"victimCount"`
+	FrontRun     []*SandwichTx `ch:"frontRunTx" json:"frontRunTx"`
+	BackRun      []*SandwichTx `ch:"backRunTx" json:"backRunTx"`
+	Victims      []*SandwichTx `ch:"victims" json:"victims"`
+	Adverse      []*SandwichTx `ch:"adverseTx" json:"adverseTx"`
 }
 
 // InBlockSandwich is a detected sandwich transaction, that front-run, victim(s) and back-run are all in the same block
@@ -83,6 +86,19 @@ func ppSandwichTxs(kind string, txs []*SandwichTx) {
 	for i, stx := range txs {
 		ti := stx.SandwichTxTokenInfo
 		PPTx(i+1, &stx.Transaction, true)
+		fmt.Printf("         type=%v\n", stx.Type)
+		if stx.Type == "transfer" {
+			fmt.Printf("         transfer token=%s amount=%.9f\n", ti.FromToken, ti.FromAmount)
+			switch len(ti.OwnersOfB) {
+			case 0:
+				// No owner linkage available for this transfer evidence.
+			case 1:
+				fmt.Printf("         owner=%s\n", ti.OwnersOfB[0])
+			default:
+				fmt.Printf("         owners=%s -> %s\n", ti.OwnersOfB[0], ti.OwnersOfB[1])
+			}
+			continue
+		}
 		fmt.Printf("         from=%s amt=%.9f  to=%s amt=%.9f\n",
 			ti.FromToken, ti.FromAmount, ti.ToToken, ti.ToAmount)
 		fmt.Printf("         poolPostBalanceB=%.9f  poolPreBalanceB=%.9f\n",
@@ -118,8 +134,8 @@ func PPInBlockSandwich(i int, s *InBlockSandwich) {
 	fmt.Printf("pair: A=%s  B=%s\n", s.TokenA, s.TokenB)
 	fmt.Printf("flags: CrossBlock=%v Consecutive=%v FrontConsec=%v BackConsec=%v VictimConsec=%v\n",
 		s.CrossBlock, s.Consecutive, s.FrontConsecutive, s.BackConsecutive, s.VictimConsecutive)
-	fmt.Printf("multi: Front=%v Back=%v Victim=%v  SignerSame=%v OwnerSame=%v ATASame=%v\n",
-		s.MultiFrontRun, s.MultiBackRun, s.MultiVictim, s.SignerSame, s.OwnerSame, s.ATASame)
+	fmt.Printf("multi: Front=%v Back=%v Victim=%v  SignerSame=%v OwnerSame=%v ATASame=%v HasTransfer=%v\n",
+		s.MultiFrontRun, s.MultiBackRun, s.MultiVictim, s.SignerSame, s.OwnerSame, s.ATASame, s.HasTransfer)
 	fmt.Printf("quality: Perfect=%v RelativeDiffB=%.9f ProfitA=%.9f\n",
 		s.Perfect, s.RelativeDiffB, s.ProfitA)
 
@@ -182,8 +198,8 @@ func PPCrossBlockSandwich(i int, s *CrossBlockSandwich) {
 	fmt.Printf("pair: A=%s  B=%s\n", s.TokenA, s.TokenB)
 	fmt.Printf("flags: CrossBlock=%v FrontConsec=%v BackConsec=%v VictimConsec=%v\n",
 		s.CrossBlock, s.FrontConsecutive, s.BackConsecutive, s.VictimConsecutive)
-	fmt.Printf("multi: Front=%v Back=%v Victim=%v  SignerSame=%v OwnerSame=%v ATASame=%v\n",
-		s.MultiFrontRun, s.MultiBackRun, s.MultiVictim, s.SignerSame, s.OwnerSame, s.ATASame)
+	fmt.Printf("multi: Front=%v Back=%v Victim=%v  SignerSame=%v OwnerSame=%v ATASame=%v HasTransfer=%v\n",
+		s.MultiFrontRun, s.MultiBackRun, s.MultiVictim, s.SignerSame, s.OwnerSame, s.ATASame, s.HasTransfer)
 	fmt.Printf("quality: Perfect=%v RelativeDiffB=%.9f ProfitA=%.9f\n",
 		s.Perfect, s.RelativeDiffB, s.ProfitA)
 

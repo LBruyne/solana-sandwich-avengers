@@ -10,7 +10,7 @@ const (
 
 // Input config
 const (
-	MIN_START_SLOT  = 350000000
+	MIN_START_SLOT  = 400000000
 	PER_LEADER_SLOT = 4 // number of continuous slots per leader
 )
 
@@ -41,6 +41,7 @@ const (
 	SOL_FETCH_SLOT_LEADER_LONG_INTERVAL  = 1000 * time.Second
 
 	SOL_FETCH_SLOT_DATA_MAX_GAP        = 10000 // the API can preserve block data ~3 hours ago
+	SOL_FETCH_SLOT_DATA_LATEST_GAP     = 5000  // only sync up to this many slots behind the latest block
 	SOL_FETCH_SLOT_DATA_SLOT_NUM       = 8     // number of slots to fetch each time
 	SOL_FETCH_SLOT_DATA_PARALLEL_NUM   = 8     // number of parallel requests
 	SOL_FETCH_SLOT_DATA_RETRYS         = 3     // number of retries on failure
@@ -59,11 +60,13 @@ const (
 	INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD    = uint(10) // relative threshold between front-run/back-run
 	CROSSBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD = uint(10)
 	SANDWICH_AMOUNT_SOL_TOLERANCE             = 0.1
+	SANDWICH_OWNER_MATCH_TOLERANCE            = 0.05 // relative tolerance for matching source/sink owners by token delta
 
 	SANDWICH_BACKRUN_MAX_GAP  = 500 // Max positional gap between consecutive multi-back-run txs from same attacker
 	SANDWICH_FRONTRUN_MAX_GAP = 500 // Max positional gap between consecutive multi-front-run txs from same attacker
 
-	AMM_POOL_CACHE_SIZE = 10000 // LRU capacity for known AMM pool addresses
+	AMM_POOL_CACHE_SIZE      = 10000 // LRU capacity for known AMM pool addresses
+	ACCOUNT_OWNER_CACHE_SIZE = 50000 // LRU capacity for account owner lookups (address -> owner program)
 
 	CROSS_BLOCK_CACHE_SIZE                        = 64
 	SOL_PROCESS_CROSS_BLOCK_SANDWICH_PARALLEL_NUM = 8

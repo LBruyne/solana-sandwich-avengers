@@ -8,7 +8,7 @@ import (
 const (
 	SOL_UNIT = 1e9 // 1 SOL = 10^9 lamports
 
-	EPSILON = 1e-3 // Infinite small value for float comparison
+	EPSILON = 1e-4 // Infinite small value for float comparison
 )
 
 func HasString(slice []string, str string) bool {

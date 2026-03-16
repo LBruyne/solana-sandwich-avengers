@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
     `tokenA` String,
     `tokenB` String,
 
+    `hasTransfer` Bool,
     `signerSame` Bool,
     `ownerSame` Bool,
     `ataSame` Bool,
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
     `frontCount` UInt16,
     `backCount` UInt16,
     `victimCount` UInt16,
+    `adverseCount` UInt16,
     `frontConsecutive` Bool,
     `backConsecutive` Bool,
     `victimConsecutive` Bool,
