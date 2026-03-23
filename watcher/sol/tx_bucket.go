@@ -398,3 +398,4 @@ func isAMMByOwner(addr string) (bool, bool) {
 	}
 	return utils.IsLabeledDexPrograms(owner), true
 }
+

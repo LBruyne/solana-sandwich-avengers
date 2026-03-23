@@ -140,7 +140,10 @@ func (d *ClickhouseDB) CreateTables() error {
 
 			perfect Bool,
 			relativeDiffB Float64,
-			profitA Float64
+			profitA Float64,
+
+			intentScore Float64 DEFAULT 0,
+			maxSlippageUtilization Float64 DEFAULT 0
 		)
 		ENGINE = MergeTree
 		ORDER BY (slot, timestamp, sandwichId)
@@ -176,7 +179,13 @@ func (d *ClickhouseDB) CreateTables() error {
 			toTotalAmount Float64,
 
 			diffA Float64,
-			diffB Float64
+			diffB Float64,
+
+			slippageLimitType String DEFAULT '',
+			slippageLimitAmount Float64 DEFAULT 0,
+			slippageActualAmount Float64 DEFAULT 0,
+			slippageUtilization Float64 DEFAULT -1,
+			slippageDexName String DEFAULT ''
 		)
 		ENGINE = MergeTree
 		ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)
@@ -189,6 +198,23 @@ func (d *ClickhouseDB) CreateTables() error {
 		}
 		logger.GlobalLogger.Info("Check or create table in DB", "query", q)
 	}
+
+	// Add new columns to existing tables for backward compatibility
+	alterQueries := []string{
+		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS intentScore Float64 DEFAULT 0`,
+		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS maxSlippageUtilization Float64 DEFAULT 0`,
+		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageLimitType String DEFAULT ''`,
+		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageLimitAmount Float64 DEFAULT 0`,
+		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageActualAmount Float64 DEFAULT 0`,
+		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageUtilization Float64 DEFAULT -1`,
+		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageDexName String DEFAULT ''`,
+	}
+	for _, q := range alterQueries {
+		if err := d.conn.Exec(context.Background(), q); err != nil {
+			logger.GlobalLogger.Warn("ALTER TABLE failed (may already exist)", "query", q, "err", err)
+		}
+	}
+
 	return nil
 }
 
@@ -381,9 +407,10 @@ func (d *ClickhouseDB) UpdateSlotTxsCheckInBundle(slots []uint64, check bool) er
 	if len(slots) == 0 {
 		return nil
 	}
-	if err := d.conn.Exec(context.Background(), "SET mutations_sync = 1"); err != nil {
-		return fmt.Errorf("failed to set mutations_sync: %w", err)
-	}
+
+	ctx := clickhouse.Context(context.Background(), clickhouse.WithSettings(clickhouse.Settings{
+		"mutations_sync": 1,
+	}))
 
 	q := fmt.Sprintf(`
 		ALTER TABLE solwich.slot_txs
@@ -396,7 +423,7 @@ func (d *ClickhouseDB) UpdateSlotTxsCheckInBundle(slots []uint64, check bool) er
 	for _, s := range slots {
 		args = append(args, s)
 	}
-	return d.conn.Exec(context.Background(), q, args...)
+	return d.conn.Exec(ctx, q, args...)
 }
 
 func (d *ClickhouseDB) InsertSlotLeaders(leaders types.SlotLeaders) error {
@@ -485,9 +512,10 @@ func (d *ClickhouseDB) UpdateSandwichTxsInBundle(results []types.JitoBundleMarkR
 	if len(results) == 0 {
 		return nil
 	}
-	if err := d.conn.Exec(context.Background(), "SET mutations_sync = 1"); err != nil {
-		return fmt.Errorf("failed to set mutations_sync: %w", err)
-	}
+
+	ctx := clickhouse.Context(context.Background(), clickhouse.WithSettings(clickhouse.Settings{
+		"mutations_sync": 1,
+	}))
 
 	const batchSize = 500
 	type pair struct {
@@ -521,7 +549,7 @@ func (d *ClickhouseDB) UpdateSandwichTxsInBundle(results []types.JitoBundleMarkR
 			WHERE (slot, signature) IN (%s)
 		`, strings.Join(pairs, ", "))
 
-		if err := d.conn.Exec(context.Background(), q, args...); err != nil {
+		if err := d.conn.Exec(ctx, q, args...); err != nil {
 			return fmt.Errorf("failed to update batch [%d:%d]: %w", i, end, err)
 		}
 	}
@@ -601,10 +629,9 @@ func (d *ClickhouseDB) QuerySlotsToCheckInBundle(limit int) ([]uint64, error) {
 		SELECT slot
 		FROM solwich.slot_txs AS t
 		ANY INNER JOIN solwich.slot_bundles AS b USING (slot)
-		WHERE t.txFetched = 1 
-		  AND t.sandwichFetched = 1 
+		WHERE t.txFetched = 1
+		  AND t.sandwichFetched = 1
 		  AND t.sandwichInBundleChecked = 0
-		  AND b.bundleFetched = 1
 		ORDER BY slot ASC
 		LIMIT %d
 	`, limit))

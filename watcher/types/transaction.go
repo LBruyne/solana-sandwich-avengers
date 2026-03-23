@@ -28,10 +28,12 @@ type Transaction struct {
 	IsFailed  bool
 	IsVote    bool
 
-	Signature   string   `json:"signature" ch:"signature"`     // The identifier of this transaction, which is the first signature in Signatures field. A 64 bytes Ed25519 signature, encoded as a base-58 string.
-	Signers     []string `json:"signers" ch:"signers"`         // All signers extracted from the transaction message. Used by all detection logic.
-	AccountKeys []string `json:"accountKeys" ch:"accountKeys"` // All accounts accessed in this transaction
-	Programs    []string `json:"programs" ch:"programs"`       // All programs invoked in this transaction
+	Signature       string           `json:"signature" ch:"signature"`     // The identifier of this transaction, which is the first signature in Signatures field. A 64 bytes Ed25519 signature, encoded as a base-58 string.
+	Signers         []string         `json:"signers" ch:"signers"`         // All signers extracted from the transaction message. Used by all detection logic.
+	AccountKeys     []string         `json:"accountKeys" ch:"accountKeys"` // All accounts accessed in this transaction
+	Programs        []string         `json:"programs" ch:"programs"`       // All programs invoked in this transaction
+	DexInstructions      []DexInstruction `json:"-" ch:"-"` // DEX-related instruction data extracted from top-level and inner instructions
+	InnerInstructionsNil bool              `json:"-" ch:"-"` // true if RPC returned null for meta.innerInstructions
 
 	// Account-balance related information
 	// In Solana, for each token/WSOL, each user has an Associated Token Account, ATA, which is controlled by the address of the holder (owner).
@@ -49,7 +51,16 @@ type Transaction struct {
 	RelatedTokens       MapSet.Set[string]               `ch:"relatedTokens" json:"relatedTokens"`             // records all tokens involved in this transaction
 	RelatedPools        MapSet.Set[string]               `ch:"relatedPools" json:"relatedPools"`               // records all pools involved in this transaction
 	RelatedPoolsInfo    map[string]PoolAmount            // pool address -> {fromToken, fromAmt, toToken, toAmt}, record the token changes of each related pool
-	HasNativeSOLDelta   map[string]bool                  // owner -> true if owner had a native SOL (lamport) balance change before the SOL/WSOL merge. AMM pools typically have constant lamport balances while user wallets change.
+	TokenDecimals       map[string]int                   `json:"-" ch:"-"` // token mint -> decimals, for converting raw amounts to float64
+}
+
+// DexInstruction stores raw instruction data for a known DEX program invocation.
+type DexInstruction struct {
+	ProgramID string   // DEX program address
+	Data      []byte   // raw instruction bytes (decoded from base64/base58)
+	Accounts  []string // resolved account addresses referenced by this instruction
+	IsInner   bool     // true if from meta.innerInstructions
+	ParentIdx int      // top-level instruction index this inner instruction belongs to (-1 if top-level)
 }
 
 type Transactions []*Transaction
@@ -62,18 +73,6 @@ func (tx *Transaction) PostprocessForFindSandwich() {
 	tx.RelatedPoolsInfo = make(map[string]PoolAmount)
 	if tx.IsFailed || tx.IsVote {
 		return // Skip failed or vote transactions
-	}
-
-	// Record which owners have native SOL (lamport) balance changes BEFORE the SOL/WSOL merge.
-	// AMM pool PDAs keep a constant lamport balance (rent-exempt); only their WSOL token accounts change.
-	// User wallets typically have lamport changes when paying for swaps.
-	tx.HasNativeSOLDelta = make(map[string]bool)
-	for owner, tokenChanges := range tx.OwnerBalanceChanges {
-		if solChange, ok := tokenChanges[utils.SOL]; ok {
-			if math.Abs(solChange.GetTotalAmount()) > utils.EPSILON {
-				tx.HasNativeSOLDelta[owner] = true
-			}
-		}
 	}
 
 	// Combine SOL and WSOL

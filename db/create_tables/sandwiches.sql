@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
 
     `perfect` Bool,
     `relativeDiffB` Float64,
-    `profitA` Float64
+    `profitA` Float64,
+
+    `intentScore` Float64 DEFAULT 0,  -- Intent score for sandwich attack (0-1, higher = more likely intentional)
+    `maxSlippageUtilization` Float64 DEFAULT 0  -- Max slippage utilization across all victims (0-1)
 )
 ENGINE = MergeTree
 ORDER BY (slot, timestamp, sandwichId)

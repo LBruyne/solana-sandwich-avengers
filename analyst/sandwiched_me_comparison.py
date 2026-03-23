@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-SANDWICHED_ME_URL = "https://nextgen.mev-hub.snowgenesis.com/api/sandwiches/latest"
+SANDWICHED_ME_URL = "ison"
 
 
 def load_env():

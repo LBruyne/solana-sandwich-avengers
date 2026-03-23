@@ -11,7 +11,7 @@ const (
 	transferSideBack  = "back"
 )
 
-type TransferEvidence struct {
+type Transfer struct {
 	Tx          *types.Transaction
 	TxIdx       int
 	Side        string
@@ -71,8 +71,8 @@ func collectBackOwnersByToken(entries []PoolEntry, txs types.Transactions, token
 	return owners
 }
 
-func collectInlineTransferEvidences(entries []PoolEntry, txs types.Transactions, side string) []*TransferEvidence {
-	evidences := make([]*TransferEvidence, 0)
+func collectInlineTransfers(entries []PoolEntry, txs types.Transactions, side string) []*Transfer {
+	evidences := make([]*Transfer, 0)
 	for _, entry := range entries {
 		if !entry.HasInlineTransfer || entry.SourceOwner == "" || entry.SinkOwner == "" {
 			continue
@@ -93,7 +93,7 @@ func collectInlineTransferEvidences(entries []PoolEntry, txs types.Transactions,
 			continue
 		}
 
-		evidences = append(evidences, &TransferEvidence{
+		evidences = append(evidences, &Transfer{
 			Tx:          tx,
 			TxIdx:       entry.TxIdx,
 			Side:        side,
@@ -107,7 +107,7 @@ func collectInlineTransferEvidences(entries []PoolEntry, txs types.Transactions,
 	return evidences
 }
 
-func collectDirectTransferEvidences(
+func collectDirectTransfers(
 	txs types.Transactions,
 	startIdx int,
 	endIdx int,
@@ -115,7 +115,7 @@ func collectDirectTransferEvidences(
 	fromOwners MapSet.Set[string],
 	toOwners MapSet.Set[string],
 	side string,
-) []*TransferEvidence {
+) []*Transfer {
 	if startIdx < 0 {
 		startIdx = 0
 	}
@@ -123,10 +123,10 @@ func collectDirectTransferEvidences(
 		endIdx = len(txs)
 	}
 	if startIdx >= endIdx {
-		return make([]*TransferEvidence, 0)
+		return make([]*Transfer, 0)
 	}
 
-	evidences := make([]*TransferEvidence, 0)
+	evidences := make([]*Transfer, 0)
 	for i := startIdx; i < endIdx; i++ {
 		tx := txs[i]
 		if tx == nil || tx.IsFailed || tx.IsVote {
@@ -162,7 +162,7 @@ func collectDirectTransferEvidences(
 			continue
 		}
 
-		evidences = append(evidences, &TransferEvidence{
+		evidences = append(evidences, &Transfer{
 			Tx:          tx,
 			TxIdx:       i,
 			Side:        side,
@@ -177,7 +177,7 @@ func collectDirectTransferEvidences(
 	return evidences
 }
 
-func sumTransferEvidenceAmount(evidences []*TransferEvidence) float64 {
+func sumTransferAmount(evidences []*Transfer) float64 {
 	total := 0.0
 	for _, evidence := range evidences {
 		if evidence == nil || evidence.Amount <= 0 {
@@ -189,7 +189,7 @@ func sumTransferEvidenceAmount(evidences []*TransferEvidence) float64 {
 }
 
 func sumFrontInlineBridgeAmount(
-	evidences []*TransferEvidence,
+	evidences []*Transfer,
 	token string,
 	frontOwners MapSet.Set[string],
 	backOwners MapSet.Set[string],
@@ -210,7 +210,7 @@ func sumFrontInlineBridgeAmount(
 	return total
 }
 
-func makeTransferSandwichTx(sandwichId string, evidence *TransferEvidence, tokenB string) *types.SandwichTx {
+func makeTransferSandwichTx(sandwichId string, evidence *Transfer, tokenB string) *types.SandwichTx {
 	if evidence == nil || evidence.Tx == nil || evidence.Token == "" || evidence.Amount <= 0 {
 		return nil
 	}

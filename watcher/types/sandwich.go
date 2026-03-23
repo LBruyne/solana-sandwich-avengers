@@ -21,6 +21,13 @@ type SandwichTxTokenInfo struct {
 	PoolPreBalanceB      float64  `ch:"poolPreBalanceB"`      // Pool's tokenB balance before tx
 	PoolPostBalanceB     float64  `ch:"poolPostBalanceB"`     // Pool's tokenB balance after tx
 	OwnersOfB            []string `ch:"ownersOfB"`            // Possible attacker owners, i.e., owners of ATAs that hold tokenB in front-run and back-run
+
+	// Slippage utilization fields (meaningful only for victim txs)
+	SlippageLimitType    string  `ch:"slippageLimitType"`    // "input" (max cost) / "output" (min output) / "" (unavailable)
+	SlippageLimitAmount  float64 `ch:"slippageLimitAmount"`  // decoded limit value, converted to float64 with decimals
+	SlippageActualAmount float64 `ch:"slippageActualAmount"` // actual cost or output from balance deltas
+	SlippageUtilization  float64 `ch:"slippageUtilization"`  // ratio 0-1 (closer to 1 = tighter fit), -1 = unavailable
+	SlippageDexName      string  `ch:"slippageDexName"`      // DEX name (e.g., "pumpfun", "raydium_v4")
 }
 
 type SandwichTx struct {
@@ -56,6 +63,9 @@ type Sandwich struct {
 	Perfect       bool    `ch:"perfect"`       // whether the sandwich is perfect, i.e., the amount diff of tokeb Bis exactly the same
 	RelativeDiffB float64 `ch:"relativeDiffB"` // The relative amount diff = |backTxs.fromTotalAmount - frontTxs.toTotalAmount| / max(frontTxs.toTotalAmount, backTxs.fromTotalAmount).
 	ProfitA       float64 `ch:"profitA"`       // The profit of the sandwich = backTx.toToTalAmount - frontTx.fromTotalAmount
+
+	IntentScore            float64 `ch:"intentScore"`            // Intent score for sandwich attack (0-1, higher = more likely intentional)
+	MaxSlippageUtilization float64 `ch:"maxSlippageUtilization"` // Max slippage utilization across all victims (0-1), 0 if unavailable
 
 	AdverseCount uint16        `ch:"adverseCount"`
 	FrontCount   uint16        `ch:"frontCount"`

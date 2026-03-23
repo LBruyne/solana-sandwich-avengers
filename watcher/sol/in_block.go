@@ -28,8 +28,8 @@ type InBlockSandwichFinder struct {
 	lastBackTxEntries    []PoolEntry
 	lastVictimEntries    []PoolEntry
 	lastAdverseEntries   []PoolEntry
-	lastFrontTransfers   []*TransferEvidence
-	lastBackTransfers    []*TransferEvidence
+	lastFrontTransfers   []*Transfer
+	lastBackTransfers    []*Transfer
 	perfect              bool
 	relativeAmtDiffB     float64
 	profitA              float64
@@ -292,11 +292,11 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 	// Collect adverse txs (same direction as back-run, i.e. B→A) between front and back
 	adverseEntries := f.collectAdverseEntries(frontTxEntries, backTxEntries)
 
-	frontInlineTransfers := collectInlineTransferEvidences(frontTxEntries, f.Txs, transferSideFront)
-	backInlineTransfers := collectInlineTransferEvidences(backTxEntries, f.Txs, transferSideBack)
-	frontTransfers := make([]*TransferEvidence, 0, len(frontInlineTransfers)+4)
+	frontInlineTransfers := collectInlineTransfers(frontTxEntries, f.Txs, transferSideFront)
+	backInlineTransfers := collectInlineTransfers(backTxEntries, f.Txs, transferSideBack)
+	frontTransfers := make([]*Transfer, 0, len(frontInlineTransfers)+4)
 	frontTransfers = append(frontTransfers, frontInlineTransfers...)
-	backTransfers := make([]*TransferEvidence, 0, len(backInlineTransfers))
+	backTransfers := make([]*Transfer, 0, len(backInlineTransfers))
 	backTransfers = append(backTransfers, backInlineTransfers...)
 
 	// If signers of frontTxs and backTxs share at least one signer, it is confirmed right now
@@ -308,7 +308,7 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 		// Owner same, consider confirmed
 		if !ownersOfBInFrtTxs.IsSuperset(ownersOfBInBckTxs) {
 			// Owner different, need transfer evidence from front-side inline/direct
-			directFrontTransfers := collectDirectTransferEvidences(
+			directFrontTransfers := collectDirectTransfers(
 				f.Txs,
 				frontTxEntries[len(frontTxEntries)-1].Position+1,
 				backTxEntries[0].Position,
@@ -317,7 +317,7 @@ func (f *InBlockSandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntri
 				ownersOfBInBckTxs,
 				transferSideFront,
 			)
-			directAmtB := sumTransferEvidenceAmount(directFrontTransfers)
+			directAmtB := sumTransferAmount(directFrontTransfers)
 			inlineBridgeAmtB := sumFrontInlineBridgeAmount(frontInlineTransfers, tokenB, ownersOfBInFrtTxs, ownersOfBInBckTxs)
 			bridgeAmtB := directAmtB + inlineBridgeAmtB
 			if bridgeAmtB <= 0 {
@@ -553,6 +553,8 @@ func (f *InBlockSandwichFinder) RecordSandwich() {
 		Timestamp: timestamp,
 	}
 
+	s.MaxSlippageUtilization = computeMaxSlippageUtilization(victimTxs)
+
 	f.Sandwiches = append(f.Sandwiches, s)
 	// Mark all these txs as confirmed sandwich txs
 	if f.confirmedSandwichTxIdx == nil {
@@ -606,7 +608,7 @@ func (f *InBlockSandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntr
 			}
 		}
 	case "victim":
-		// Nothing special for victim
+		fillVictimSlippage(stx, orig, entry)
 	default:
 		// Unknown kind, do nothing
 	}

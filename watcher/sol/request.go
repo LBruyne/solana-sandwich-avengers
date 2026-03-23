@@ -17,6 +17,7 @@ import (
 
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
+	"github.com/mr-tron/base58"
 	"github.com/spf13/viper"
 )
 
@@ -351,27 +352,143 @@ func parseTransactionFromBase64(txData map[string]any) (*types.Transaction, erro
 	// IsVote transaction
 	isVote := (len(programs) == 1 && programs[0] == utils.VOTE_PROGRAM)
 
-	// Parse meta data to get Balance changes & ATA owners
-	ownerBalanceChanges, ownerPreBalances, ownerPostBalances, ataOwner, err := parseBalancesDelta(meta, accountKeys)
+	// Build combined accounts (static + loaded writable + loaded readonly) for instruction account resolution
+	combinedAccounts := buildCombinedAccounts(meta, accountKeys)
+
+	// Parse meta data to get Balance changes & ATA owners & token decimals
+	ownerBalanceChanges, ownerPreBalances, ownerPostBalances, ataOwner, tokenDecimals, err := parseBalancesDelta(meta, accountKeys)
 	if err != nil {
 		return nil, fmt.Errorf("parseTransactionMetaData failed: %w", err)
 	}
 
+	// Extract DEX instruction data from top-level and inner instructions
+	dexInstructions := parseDexInstructions(tx.Message.Instructions, programs, combinedAccounts, meta)
+
+	// Check if innerInstructions was null (RPC doesn't support extended metadata)
+	_, innerPresent := meta["innerInstructions"].([]any)
+	innerInstructionsNil := !innerPresent && meta["innerInstructions"] == nil
+
 	// Build Transaction
 	return &types.Transaction{
 		// Inside
-		IsFailed:            isFailed,
-		IsVote:              isVote,
-		Fee:                 feeLamport,
-		Signature:           signature,
-		AccountKeys:         accountKeys,
-		Signers:             signer,
-		Programs:            programs,
-		OwnerBalanceChanges: ownerBalanceChanges,
-		OwnerPreBalances:    ownerPreBalances,
-		OwnerPostBalances:   ownerPostBalances,
-		AtaOwner:            ataOwner,
+		IsFailed:             isFailed,
+		IsVote:               isVote,
+		Fee:                  feeLamport,
+		Signature:            signature,
+		AccountKeys:          accountKeys,
+		Signers:              signer,
+		Programs:             programs,
+		OwnerBalanceChanges:  ownerBalanceChanges,
+		OwnerPreBalances:     ownerPreBalances,
+		OwnerPostBalances:    ownerPostBalances,
+		AtaOwner:             ataOwner,
+		DexInstructions:      dexInstructions,
+		InnerInstructionsNil: innerInstructionsNil,
+		TokenDecimals:        tokenDecimals,
 	}, nil
+}
+
+// buildCombinedAccounts builds the full account list: static keys + loaded writable + loaded readonly.
+// This combined list is needed for resolving instruction account indices in versioned transactions.
+func buildCombinedAccounts(meta map[string]any, accountKeys []string) []string {
+	loaded, _ := meta["loadedAddresses"].(map[string]any)
+	var wr, ro []any
+	if loaded != nil {
+		wr, _ = loaded["writable"].([]any)
+		ro, _ = loaded["readonly"].([]any)
+	}
+	accounts := make([]string, 0, len(accountKeys)+len(wr)+len(ro))
+	accounts = append(accounts, accountKeys...)
+	for _, v := range wr {
+		if s, ok := v.(string); ok {
+			accounts = append(accounts, s)
+		}
+	}
+	for _, v := range ro {
+		if s, ok := v.(string); ok {
+			accounts = append(accounts, s)
+		}
+	}
+	return accounts
+}
+
+// parseDexInstructions extracts instruction data for known DEX programs from both
+// top-level instructions and inner instructions (CPI calls).
+func parseDexInstructions(topLevelInsts []solana.CompiledInstruction, programs []string, combinedAccounts []string, meta map[string]any) []types.DexInstruction {
+	var result []types.DexInstruction
+
+	// Top-level instructions
+	for i, inst := range topLevelInsts {
+		programID := programs[i]
+		if !utils.IsLabeledDexPrograms(programID) {
+			continue
+		}
+		accounts := make([]string, 0, len(inst.Accounts))
+		for _, idx := range inst.Accounts {
+			if int(idx) < len(combinedAccounts) {
+				accounts = append(accounts, combinedAccounts[int(idx)])
+			}
+		}
+		dataCopy := make([]byte, len(inst.Data))
+		copy(dataCopy, inst.Data)
+		result = append(result, types.DexInstruction{
+			ProgramID: programID,
+			Data:      dataCopy,
+			Accounts:  accounts,
+			IsInner:   false,
+			ParentIdx: -1,
+		})
+	}
+
+	// Inner instructions from meta
+	innerInsts, _ := meta["innerInstructions"].([]any)
+	for _, group := range innerInsts {
+		groupMap, ok := group.(map[string]any)
+		if !ok {
+			continue
+		}
+		parentIdx := int(groupMap["index"].(float64))
+		instructions, _ := groupMap["instructions"].([]any)
+		for _, inst := range instructions {
+			instMap, ok := inst.(map[string]any)
+			if !ok {
+				continue
+			}
+			// Skip parsed instructions (token transfers, etc.) — they don't have raw data
+			if _, hasParsed := instMap["parsed"]; hasParsed {
+				continue
+			}
+			programID, _ := instMap["programId"].(string)
+			if !utils.IsLabeledDexPrograms(programID) {
+				continue
+			}
+			dataStr, _ := instMap["data"].(string)
+			if dataStr == "" {
+				continue
+			}
+			dataBytes, err := base58.Decode(dataStr)
+			if err != nil {
+				continue
+			}
+			// Resolve account addresses
+			rawAccounts, _ := instMap["accounts"].([]any)
+			accounts := make([]string, 0, len(rawAccounts))
+			for _, a := range rawAccounts {
+				if addr, ok := a.(string); ok {
+					accounts = append(accounts, addr)
+				}
+			}
+			result = append(result, types.DexInstruction{
+				ProgramID: programID,
+				Data:      dataBytes,
+				Accounts:  accounts,
+				IsInner:   true,
+				ParentIdx: parentIdx,
+			})
+		}
+	}
+
+	return result
 }
 
 /*
@@ -393,26 +510,26 @@ Balances example:
 
 ]
 */
-func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]map[string]types.AtaAmounts, map[string]map[string]float64, map[string]map[string]float64, map[string]string, error) {
+func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]map[string]types.AtaAmounts, map[string]map[string]float64, map[string]map[string]float64, map[string]string, map[string]int, error) {
 	if meta == nil {
-		return nil, nil, nil, nil, fmt.Errorf("nil meta")
+		return nil, nil, nil, nil, nil, fmt.Errorf("nil meta")
 	}
 	// Read balances
 	postBalances, ok := meta["postBalances"].([]interface{})
 	if !ok {
-		return nil, nil, nil, nil, fmt.Errorf("invalid postBalances")
+		return nil, nil, nil, nil, nil, fmt.Errorf("invalid postBalances")
 	}
 	postTokenBalances, ok := meta["postTokenBalances"].([]interface{})
 	if !ok {
-		return nil, nil, nil, nil, fmt.Errorf("invalid postTokenBalances")
+		return nil, nil, nil, nil, nil, fmt.Errorf("invalid postTokenBalances")
 	}
 	preBalances, ok := meta["preBalances"].([]interface{})
 	if !ok {
-		return nil, nil, nil, nil, fmt.Errorf("invalid preBalances")
+		return nil, nil, nil, nil, nil, fmt.Errorf("invalid preBalances")
 	}
 	preTokenBalances, ok := meta["preTokenBalances"].([]interface{})
 	if !ok {
-		return nil, nil, nil, nil, fmt.Errorf("invalid preTokenBalances")
+		return nil, nil, nil, nil, nil, fmt.Errorf("invalid preTokenBalances")
 	}
 	// Read loaded addresses (writable + readonly)
 	loaded, _ := meta["loadedAddresses"].(map[string]any)
@@ -429,14 +546,14 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		if s, ok := v.(string); ok {
 			accounts = append(accounts, s)
 		} else {
-			return nil, nil, nil, nil, fmt.Errorf("unexpected loaded writable account type: %T", v)
+			return nil, nil, nil, nil, nil, fmt.Errorf("unexpected loaded writable account type: %T", v)
 		}
 	}
 	for _, v := range ro {
 		if s, ok := v.(string); ok {
 			accounts = append(accounts, s)
 		} else {
-			return nil, nil, nil, nil, fmt.Errorf("unexpected loaded readonly account type: %T", v)
+			return nil, nil, nil, nil, nil, fmt.Errorf("unexpected loaded readonly account type: %T", v)
 		}
 	}
 
@@ -476,6 +593,10 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 	}
 
 	ataOwner := make(map[string]string)
+	tokenDecimals := make(map[string]int)
+	// SOL always has 9 decimals
+	tokenDecimals[utils.SOL] = 9
+	tokenDecimals[utils.WSOL] = 9
 	// SPL token balance deltas
 	// Pre token balances
 	for _, tokenBalance := range preTokenBalances {
@@ -499,6 +620,7 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		amountInt, _ := strconv.Atoi(amount)
 		preb := float64(amountInt) / math.Pow10(decimals)
 
+		tokenDecimals[tokenAddr] = decimals
 		// Record ATA owner
 		ataOwner[ataAddr] = owner
 		// Record owner balance change
@@ -561,7 +683,7 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		ownerPostBalances[owner][tokenAddr] += postb
 	}
 
-	return ownerBalanceChanges, ownerPreBalances, ownerPostBalances, ataOwner, nil
+	return ownerBalanceChanges, ownerPreBalances, ownerPostBalances, ataOwner, tokenDecimals, nil
 }
 
 // parseTransaction parses a single transaction item from `getBlock` when encoding is JSON (not base64).
