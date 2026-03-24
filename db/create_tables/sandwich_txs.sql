@@ -30,7 +30,14 @@ CREATE TABLE IF NOT EXISTS solwich.sandwich_txs
 
     -- Only the last back-run txs in a sandwich have the diff
     `diffA` Float64,         -- back.ToTotal - front.FromTotal
-    `diffB` Float64          -- front.ToTotal - back.FromTotal
+    `diffB` Float64,         -- front.ToTotal - back.FromTotal
+
+    -- Slippage fields (meaningful only for victim txs)
+    `slippageLimitType` String DEFAULT '',        -- "input" (max cost) / "output" (min output) / "" (unavailable)
+    `slippageLimitAmount` Float64 DEFAULT 0,      -- decoded limit value, converted to float64 with decimals
+    `slippageActualAmount` Float64 DEFAULT 0,     -- actual cost or output from balance deltas
+    `slippageUtilization` Float64 DEFAULT -1,     -- ratio 0-1 (closer to 1 = tighter fit), -1 = no protection, -2 = unsupported, -3 = missing inner
+    `slippageDexName` String DEFAULT ''           -- DEX name (e.g., "pumpfun", "raydium_v4")
 )
 ENGINE = MergeTree
 ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)

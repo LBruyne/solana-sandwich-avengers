@@ -237,6 +237,29 @@ func makeTransferSandwichTx(sandwichId string, evidence *Transfer, tokenB string
 	return stx
 }
 
+// classifyTransferTypes determines which transfer sub-types are present.
+func classifyTransferTypes(frontTransfers, backTransfers []*Transfer) (hasFrontInline, hasDirect, hasBackInline bool) {
+	for _, t := range frontTransfers {
+		if t == nil {
+			continue
+		}
+		if t.IsInline {
+			hasFrontInline = true
+		} else {
+			hasDirect = true
+		}
+	}
+	for _, t := range backTransfers {
+		if t == nil {
+			continue
+		}
+		if t.IsInline {
+			hasBackInline = true
+		}
+	}
+	return
+}
+
 func appendUniqueString(items []string, value string) []string {
 	if value == "" {
 		return items

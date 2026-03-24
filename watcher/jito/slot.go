@@ -102,7 +102,7 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 				// Update slot_bundle status
 				status := types.SlotBundlesStatus{
 					Slot:          s,
-					BundleFetched: len(validBundles) > 0,
+					BundleFetched: true,
 					BundleCount:   uint64(len(validBundles)),
 					BundleTxCount: txCount,
 				}
@@ -122,7 +122,7 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 		go func() {
 			for {
 				// Find the first (oldest) slot in sandwich_txs, that has already checked sandwich, but not yet checked inBundle and bundles have been fetched.
-				slots, err := ch.QuerySlotsToCheckInBundle(config.JITO_MARK_IN_BUNDLE_SLOT_NUM)
+				slots, err := ch.QuerySlotsToCheckInBundle(config.JITO_MARK_IN_BUNDLE_SLOT_NUM, config.JITO_MARK_IN_BUNDLE_SAFE_LAG)
 				if err != nil {
 					logger.JitoLogger.Error("QuerySlotsToCheckInBundle failed", "err", err)
 					time.Sleep(config.JITO_MARK_IN_BUNDLE_SANDWICH_TX_INTERVAL)

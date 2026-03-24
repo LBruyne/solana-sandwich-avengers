@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
     `tokenB` String,
 
     `hasTransfer` Bool,
+    `hasFrontInlineTransfer` Bool,
+    `hasDirectTransfer` Bool,
+    `hasBackInlineTransfer` Bool,
     `signerSame` Bool,
     `ownerSame` Bool,
     `ataSame` Bool,

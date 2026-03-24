@@ -6,13 +6,6 @@ builtin:
   TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA: Token Program
 
 labeled_dex:
-  # Aggregator
-  # 6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma: "OKX DEX: Aggregation Router V2"
-  # JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4: Jupiter Aggregator v6
-  # DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M: Jupiter DCA program
-  # DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH: DFlow Aggregator v4
-  # AxiomfHaWDemCFBLBayqnEnNwE6b7B2Qz3UmzMpgbMG6: "Axiom: Trading Program 1"
-
   # AMM
   pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA: Pump.fun AMM
   6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P: Pump.fun
@@ -55,3 +48,10 @@ labeled_pools:
   GF8SKKobum6UJnhX2mLHePU38htg5vdr9zcY4jH8Pqs2: "AlphaQ (USDT-USDC) Pool 1"
   F2KCaXcp7AoQtxTDvNEDCyMyWjSCAMWNzcyN9dsPfPs5: "AlphaQ (JupUSD-USDC) Pool 2"
   SCoRcH8c2dpjvcJD6FiPbCSQyQgu3PcUAWj2Xxx3mqn: SCorch
+
+labeled_aggregators:
+  6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma: "OKX DEX: Aggregation Router V2"
+  JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4: Jupiter Aggregator v6
+  DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M: Jupiter DCA program
+  DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH: DFlow Aggregator v4
+  AxiomfHaWDemCFBLBayqnEnNwE6b7B2Qz3UmzMpgbMG6: "Axiom: Trading Program 1"

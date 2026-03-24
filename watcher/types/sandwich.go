@@ -54,8 +54,11 @@ type Sandwich struct {
 	MultiBackRun  bool `ch:"multiBackRun"`  // whether there are multiple back-run txs
 	MultiVictim   bool `ch:"multiVictim"`   // whether there are multiple victim txs
 
-	SignerSame  bool `ch:"signerSame"` // whether front-run and back-run have the same signer
-	HasTransfer bool `ch:"hasTransfer"`
+	SignerSame             bool `ch:"signerSame"` // whether front-run and back-run have the same signer
+	HasTransfer            bool `ch:"hasTransfer"`
+	HasFrontInlineTransfer bool `ch:"hasFrontInlineTransfer"` // front tx contains inline transfer (source != sink within same tx)
+	HasDirectTransfer      bool `ch:"hasDirectTransfer"`      // separate direct transfer tx exists between front and back
+	HasBackInlineTransfer  bool `ch:"hasBackInlineTransfer"`  // back tx contains inline transfer (source != sink within same tx)
 
 	OwnerSame bool `ch:"ownerSame"` // whether front-run and back-run have the same owner, i.e., the owner of ATA that holds the toToken in front-run and the fromToken in back-run
 	ATASame   bool `ch:"ataSame"`   // whether front-run and back-run have the same ATA that holds the toToken in front-run and the fromToken in back-run

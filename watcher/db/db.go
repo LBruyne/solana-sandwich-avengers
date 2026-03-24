@@ -44,5 +44,5 @@ type Database interface {
 
 	// others
 	QueryFirstSlotToCheckInBundle() (uint64, error)        // First slot in slot_txs where slot_txs.SandwichInBundleChecked = false, slot_txs.SandwichFetched = slot_txs.txFetched = true, and also exists in slot_bundles that slot_bundles.bundleFetched = true
-	QuerySlotsToCheckInBundle(limit int) ([]uint64, error) // A multiple slots version of QueryFirstSlotToCheckInBundle
+	QuerySlotsToCheckInBundle(limit int, safeLag uint64) ([]uint64, error) // A multiple slots version of QueryFirstSlotToCheckInBundle
 }

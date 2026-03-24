@@ -122,6 +122,9 @@ func (d *ClickhouseDB) CreateTables() error {
 			tokenB String,
 
 			hasTransfer Bool,
+			hasFrontInlineTransfer Bool,
+			hasDirectTransfer Bool,
+			hasBackInlineTransfer Bool,
 			signerSame Bool,
 			ownerSame Bool,
 			ataSame Bool,
@@ -202,12 +205,18 @@ func (d *ClickhouseDB) CreateTables() error {
 	// Add new columns to existing tables for backward compatibility
 	alterQueries := []string{
 		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS intentScore Float64 DEFAULT 0`,
+
 		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS maxSlippageUtilization Float64 DEFAULT 0`,
+		
 		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageLimitType String DEFAULT ''`,
 		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageLimitAmount Float64 DEFAULT 0`,
 		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageActualAmount Float64 DEFAULT 0`,
 		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageUtilization Float64 DEFAULT -1`,
 		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageDexName String DEFAULT ''`,
+
+		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS hasFrontInlineTransfer Bool DEFAULT false`,
+		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS hasDirectTransfer Bool DEFAULT false`,
+		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS hasBackInlineTransfer Bool DEFAULT false`,
 	}
 	for _, q := range alterQueries {
 		if err := d.conn.Exec(context.Background(), q); err != nil {
@@ -624,7 +633,7 @@ func (d *ClickhouseDB) QueryFirstSlotToCheckInBundle() (uint64, error) {
 	return slot, nil
 }
 
-func (d *ClickhouseDB) QuerySlotsToCheckInBundle(limit int) ([]uint64, error) {
+func (d *ClickhouseDB) QuerySlotsToCheckInBundle(limit int, safeLag uint64) ([]uint64, error) {
 	rows, err := d.conn.Query(context.Background(), fmt.Sprintf(`
 		SELECT slot
 		FROM solwich.slot_txs AS t
@@ -632,9 +641,10 @@ func (d *ClickhouseDB) QuerySlotsToCheckInBundle(limit int) ([]uint64, error) {
 		WHERE t.txFetched = 1
 		  AND t.sandwichFetched = 1
 		  AND t.sandwichInBundleChecked = 0
+		  AND t.slot <= (SELECT max(slot) FROM solwich.slot_txs WHERE sandwichFetched = 1) - %d
 		ORDER BY slot ASC
 		LIMIT %d
-	`, limit))
+	`, safeLag, limit))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query slots to check in bundle: %w", err)
 	}

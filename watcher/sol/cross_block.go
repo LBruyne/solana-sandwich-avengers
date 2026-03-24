@@ -521,6 +521,9 @@ func (f *CrossBlockSandwichFinder) RecordSandwich() {
 	slot := f.Txs[f.lastFrontTxEntries[0].TxIdx].Slot
 	timestamp := f.Txs[f.lastFrontTxEntries[0].TxIdx].Timestamp
 
+	// Classify transfer types from collected evidence.
+	hasFrontInlineTransfer, hasDirectTransfer, hasBackInlineTransfer := classifyTransferTypes(f.lastFrontTransfers, f.lastBackTransfers)
+
 	// Combine side-aware transfer txs when recording.
 	frontTxs = append(frontTxs, frontTransferTxs...)
 	backTxs = append(backTxs, backTransferTxs...)
@@ -539,15 +542,17 @@ func (f *CrossBlockSandwichFinder) RecordSandwich() {
 			BackConsecutive:   isEntriesConsecutive(f.lastBackTxEntries, true),
 			VictimConsecutive: isEntriesConsecutive(f.lastVictimEntries, true),
 			// Signer/owner/ata info
-			SignerSame: signerSame,
-			OwnerSame:  ownerSame,
-			ATASame:    false, // TODO:
+			SignerSame:             signerSame,
+			OwnerSame:              ownerSame,
+			ATASame:                false, // TODO:
+			HasTransfer:            len(frontTransferTxs)+len(backTransferTxs) > 0,
+			HasFrontInlineTransfer: hasFrontInlineTransfer,
+			HasDirectTransfer:      hasDirectTransfer,
+			HasBackInlineTransfer:  hasBackInlineTransfer,
 			// Amount info
 			Perfect:       f.perfect,
 			RelativeDiffB: f.relativeAmtDiffB,
 			ProfitA:       f.profitA,
-
-			HasTransfer: len(frontTransferTxs)+len(backTransferTxs) > 0,
 
 			// Counts
 			MultiFrontRun: len(f.lastFrontTxEntries) > 1,
