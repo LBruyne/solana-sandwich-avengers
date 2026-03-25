@@ -8,3 +8,5 @@ tqdm
 ipykernel
 matplotlib
 seaborn
+interpret
+cloudscraper

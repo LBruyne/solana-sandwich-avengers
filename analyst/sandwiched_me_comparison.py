@@ -7,26 +7,26 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-SANDWICHED_ME_URL = "ison"
+SANDWICHED_ME_URL = "https://nextgen.mev-hub.snowgenesis.com/api/sandwiches/latest"
 
 
-def load_env():
-    load_dotenv()
-    return {
-        "host": os.getenv("NEW_CLICKHOUSE_HOST"),
-        "port": int(os.getenv("NEW_CLICKHOUSE_PORT")),
-        "username": os.getenv("NEW_CLICKHOUSE_USERNAME"),
-        "password": os.getenv("NEW_CLICKHOUSE_PASSWORD"),
-    }
+# def load_env():
+#     load_dotenv()
+#     return {
+#         "host": os.getenv("NEW_CLICKHOUSE_HOST"),
+#         "port": int(os.getenv("NEW_CLICKHOUSE_PORT")),
+#         "username": os.getenv("NEW_CLICKHOUSE_USERNAME"),
+#         "password": os.getenv("NEW_CLICKHOUSE_PASSWORD"),
+#     }
 
 
-config = load_env()
-client = clickhouse_connect.get_client(
-    host=config["host"],
-    port=config["port"],
-    username=config["username"],
-    password=config["password"],
-)
+# config = load_env()
+# client = clickhouse_connect.get_client(
+#     host=config["host"],
+#     port=config["port"],
+#     username=config["username"],
+#     password=config["password"],
+# )
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -334,10 +334,11 @@ def main(
     db_wait_timeout_sec: int = 3000,
     db_wait_poll_sec: int = 10,
 ):
-    # site_df = collect_site_sandwiches(
-    #     target_count=site_target_count,
-    #     sleep_sec=site_sleep_sec,
-    # )
+    print(111)
+    site_df = collect_site_sandwiches(
+        target_count=site_target_count,
+        sleep_sec=site_sleep_sec,
+    )
 
     site_df = pd.read_csv("sandwiches_site.csv")
 
@@ -345,22 +346,22 @@ def main(
         print("[STOP] No site sandwiches collected.")
         return
 
-    max_site_slot = int(site_df["slot"].max())
-    min_site_slot = int(site_df["slot"].min())
-    print(
-        f"[SITE] min_site_slot={min_site_slot}, max_site_slot={max_site_slot}, total_sandwiches={len(site_df)}"
-    )
+    # max_site_slot = int(site_df["slot"].max())
+    # min_site_slot = int(site_df["slot"].min())
+    # print(
+    #     f"[SITE] min_site_slot={min_site_slot}, max_site_slot={max_site_slot}, total_sandwiches={len(site_df)}"
+    # )
 
-    ok = wait_until_db_has_slot_gt(
-        max_site_slot, timeout_sec=db_wait_timeout_sec, poll_sec=db_wait_poll_sec
-    )
-    if not ok:
-        print("[STOP] Timeout waiting DB to surpass max_site_slot. Exiting.")
-        return
+    # ok = wait_until_db_has_slot_gt(
+    #     max_site_slot, timeout_sec=db_wait_timeout_sec, poll_sec=db_wait_poll_sec
+    # )
+    # if not ok:
+    #     print("[STOP] Timeout waiting DB to surpass max_site_slot. Exiting.")
+    #     return
 
-    db_df = fetch_db_sandwiches_in_range(min_site_slot, max_site_slot)
+    # db_df = fetch_db_sandwiches_in_range(min_site_slot, max_site_slot)
 
-    merge_and_report(site_df, db_df)
+    # merge_and_report(site_df, db_df)
 
 
 if __name__ == "__main__":
