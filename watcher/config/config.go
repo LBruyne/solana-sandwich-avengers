@@ -33,6 +33,7 @@ const (
 
 	// Jito bundles by slot
 	JITO_CHECK_SANDWICH_INTERVAL = 5 * time.Second
+	JITO_FETCH_BUNDLE_SAFE_LAG   = uint64(1000) // only fetch bundles for slots at least this far behind the sandwich detection frontier
 
 	SOL_FETCH_SLOT_LEADER_MAX_GAP        = 4000000 // the API can preserve slot-leader data ~0.5 month ago
 	SOL_FETCH_SLOT_LEADER_LIMIT          = 5000
@@ -56,7 +57,7 @@ const (
 	JITO_MARK_IN_BUNDLE_SANDWICH_TX_INTERVAL = 10 * time.Second // interval to mark sandwich txs in bundle
 	JITO_MARK_IN_BUNDLE_SLOT_NUM             = 1000
 	JITO_MARK_IN_BUNDLE_PARALLEL_NUM         = 8
-	JITO_MARK_IN_BUNDLE_SAFE_LAG            = uint64(1000) // only check slots at least this far behind the sandwich detection frontier, to ensure cross-block sandwiches are fully written
+	JITO_MARK_IN_BUNDLE_SAFE_LAG            = uint64(2000) // only check slots at least this far behind the sandwich detection frontier, to ensure cross-block sandwiches are fully written and bundles are correctly fetched
 
 	INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD    = uint(10) // relative threshold between front-run/back-run
 	CROSSBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD = uint(10)

@@ -1,13 +1,11 @@
 package jito
 
 import (
-	"fmt"
 	"sync"
 	"time"
 	"watcher/config"
 	"watcher/db"
 	"watcher/logger"
-	"watcher/sol"
 	"watcher/types"
 	"watcher/utils"
 
@@ -22,21 +20,13 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 
 	startSlot = utils.AlignSlotToStep(startSlot, config.PER_LEADER_SLOT)
 
-	// Fetch current slot from Solana RPC
-	solanaSlot, err := sol.GetCurrentSlot()
-	if err != nil {
-		return fmt.Errorf("GetCurrentSlot failed: %w", err)
-	}
-	if startSlot > solanaSlot {
-		logger.SolLogger.Warn("Start slot is greater than current slot, nothing to do", "start", startSlot, "current", solanaSlot)
-		return nil
-	}
-	logger.JitoLogger.Info("Starting Jito bundle fetcher", "start_slot", startSlot, "current_remote_slot", solanaSlot)
+	logger.JitoLogger.Info("Starting Jito bundle fetcher", "start_slot", startSlot)
 
 	// Task 1: fetch bundles by slot, from startSlot
 	if runFetchBundle {
-		go func(start uint64, solS uint64) {
+		go func(start uint64) {
 			s := start
+			var ceiling uint64 // max slot we are allowed to fetch (sandwich frontier - safe lag)
 			for {
 				// Check if slot s has already been fetched
 				n, err := ch.QuerySlotBundleBySlot(s)
@@ -51,18 +41,22 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 					continue
 				}
 
-				// Fetch current slot from Solana RPC when approaching head
-				if s >= solS {
-					cur, err := sol.GetCurrentSlot()
+				// Use sandwich detection frontier as ceiling instead of RPC slot,
+				// so we never fetch slots that Jito API hasn't indexed yet.
+				if s >= ceiling {
+					maxSw, err := ch.QueryMaxSandwichCheckedSlot()
 					if err != nil {
-						logger.JitoLogger.Error("GetCurrentSlot failed", "err", err)
+						logger.JitoLogger.Error("QueryMaxSandwichCheckedSlot failed", "err", err)
+						time.Sleep(config.JITO_CHECK_SANDWICH_INTERVAL)
 						continue
 					}
-					solS = cur
-					time.Sleep(config.JITO_CHECK_SANDWICH_INTERVAL)
+					if maxSw > config.JITO_FETCH_BUNDLE_SAFE_LAG {
+						ceiling = maxSw - config.JITO_FETCH_BUNDLE_SAFE_LAG
+					}
+					logger.JitoLogger.Info("Updated fetch ceiling from sandwich frontier", "maxSandwichSlot", maxSw, "safeLag", config.JITO_FETCH_BUNDLE_SAFE_LAG, "ceiling", ceiling)
 				}
-				if s > solS {
-					logger.JitoLogger.Info("Reached current slot, sleep and retry", "slot", s, "current", solS)
+				if s > ceiling {
+					logger.JitoLogger.Info("Reached ceiling, sleep and retry", "slot", s, "ceiling", ceiling)
 					time.Sleep(config.JITO_CHECK_SANDWICH_INTERVAL)
 					continue
 				}
@@ -114,7 +108,7 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 				}
 				s++
 			}
-		}(startSlot, solanaSlot)
+		}(startSlot)
 	}
 
 	// Task 2: scan sandwich txs to mark inBundle

@@ -10,3 +10,6 @@ matplotlib
 seaborn
 interpret
 cloudscraper
+scikit-learn
+xgboost
+lightgbm

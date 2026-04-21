@@ -618,6 +618,19 @@ func (d *ClickhouseDB) QuerySandwichTxsBySlots(slots []uint64) (map[uint64][]str
 	return result, rows.Err()
 }
 
+func (d *ClickhouseDB) QueryMaxSandwichCheckedSlot() (uint64, error) {
+	row := d.conn.QueryRow(context.Background(), `
+		SELECT ifNull(max(slot), toUInt64(0))
+		FROM solwich.slot_txs
+		WHERE sandwichFetched = 1
+	`)
+	var slot uint64
+	if err := row.Scan(&slot); err != nil {
+		return 0, fmt.Errorf("failed to query max sandwich checked slot: %w", err)
+	}
+	return slot, nil
+}
+
 func (d *ClickhouseDB) QueryFirstSlotToCheckInBundle() (uint64, error) {
 	row := d.conn.QueryRow(context.Background(), `
 		SELECT ifNull(min(t.slot), toUInt64(0))
@@ -641,6 +654,7 @@ func (d *ClickhouseDB) QuerySlotsToCheckInBundle(limit int, safeLag uint64) ([]u
 		WHERE t.txFetched = 1
 		  AND t.sandwichFetched = 1
 		  AND t.sandwichInBundleChecked = 0
+		  AND b.bundleCount > 0
 		  AND t.slot <= (SELECT max(slot) FROM solwich.slot_txs WHERE sandwichFetched = 1) - %d
 		ORDER BY slot ASC
 		LIMIT %d

@@ -45,17 +45,22 @@ func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry Po
 }
 
 // computeMaxSlippageUtilization returns the maximum slippage utilization across
-// all victim txs in a sandwich. Only considers normal utilization values (0~1+).
-// Special values (-1=NoProtection, -2=Unsupported, -3=MissingInner) are skipped.
-// Returns 0 if no valid utilization is found.
+// all victim txs in a sandwich.
+//
+// Returns:
+//   - -2 if any victim is Unsupported(-2) or MissingInner(-3): data unavailable
+//   - -1 if ALL victims are NoProtection(-1): consumption concept not applicable
+//   - max of [0,1] values otherwise (victims with protection are the binding constraint)
 func computeMaxSlippageUtilization(victims []*types.SandwichTx) float64 {
-	maxUtil := 0.0
+	maxUtil := -1.0
 	for _, v := range victims {
 		if v == nil {
 			continue
 		}
-		// Only consider normal utilization values (≥0)
-		if v.SlippageUtilization >= 0 && v.SlippageUtilization > maxUtil {
+		if v.SlippageUtilization == dex.SlippageUnsupported || v.SlippageUtilization == dex.SlippageMissingInner {
+			return dex.SlippageUnsupported
+		}
+		if v.SlippageUtilization > maxUtil {
 			maxUtil = v.SlippageUtilization
 		}
 	}

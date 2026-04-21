@@ -77,30 +77,25 @@ def classify_program(program_id: str) -> str:
 
 
 def get_representative_program(tx_programs_lists: list) -> str:
-    """Pick the representative program from front/back tx program arrays.
+    """Pick the custom entry program from front/back tx program arrays.
 
-    Filters out builtin and aggregator programs, then returns the least common
-    remaining program (custom > dex). If no meaningful program remains, returns "".
+    Filters out builtin, aggregator, and known DEX programs. Returns the
+    custom program used as the sandwich entry point. Known DEX programs
+    (Pump.fun, Raydium, etc.) are not informative since thousands of
+    attackers share them.
 
-    Parameters
-    ----------
-    tx_programs_lists : list of list[str]
-        Each element is the programs array from one front/back tx.
+    Returns "" if no custom program is found (attacker calls DEX directly).
     """
     from collections import Counter
 
     candidates = Counter()
     for programs in tx_programs_lists:
         for p in programs:
-            if p not in BUILTIN_PROGRAMS and p not in AGGREGATOR_PROGRAMS:
+            if p not in _ALL_KNOWN:
                 candidates[p] += 1
 
     if not candidates:
         return ""
 
-    # Prefer custom programs over known DEX; among same type, pick least common
-    custom = {p: c for p, c in candidates.items() if p not in KNOWN_DEX_PROGRAMS}
-    if custom:
-        return min(custom, key=custom.get)
-
+    # Pick the least common custom program (most likely the unique entry point)
     return min(candidates, key=candidates.get)

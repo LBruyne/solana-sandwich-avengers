@@ -132,7 +132,7 @@ func collectDirectTransfers(
 		if tx == nil || tx.IsFailed || tx.IsVote {
 			continue
 		}
-		if tx.RelatedPools.Cardinality() != 0 {
+		if len(tx.DexInstructions) > 0 {
 			continue
 		}
 
