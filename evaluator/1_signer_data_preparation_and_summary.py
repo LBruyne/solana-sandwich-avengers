@@ -655,39 +655,17 @@ def print_overall_summary(summary, per_sandwich, label="ALL SIGNERS"):
     return n_signers, int(n_sandwiches), sol_profit, usd_profit
 
 
-def print_filter_comparison(all_stats, filt_stats):
-    """Print comparison between all and filtered signers."""
-    a_sig, a_sw, a_sol, a_usd = all_stats
-    f_sig, f_sw, f_sol, f_usd = filt_stats
-
-    print(f"\n{'='*80}")
-    print(f"  FILTER COMPARISON")
-    print(f"{'='*80}")
-    print(f"  {'Metric':>20}  {'All':>14}  {'Filtered':>14}  {'Retained %':>12}")
-    print(f"  {'-'*65}")
-    print(f"  {'Signers':>20}  {a_sig:>14,}  {f_sig:>14,}  {f_sig/a_sig*100:>11.2f}%")
-    print(f"  {'Sandwiches':>20}  {a_sw:>14,}  {f_sw:>14,}  {f_sw/a_sw*100:>11.2f}%")
-    print(f"  {'SOL Profit':>20}  {a_sol:>14,.2f}  {f_sol:>14,.2f}  "
-          f"{'N/A' if a_sol == 0 else f'{f_sol/a_sol*100:.2f}%':>12}")
-    print(f"  {'USD Profit':>20}  ${a_usd:>13,.2f}  ${f_usd:>13,.2f}  "
-          f"{'N/A' if a_usd == 0 else f'{f_usd/a_usd*100:.2f}%':>12}")
-
-
 # ── Chart Generation ─────────────────────────────────────────────────────────
 
-def generate_charts(summary_all, summary_filtered, out_dir, tag):
+def generate_charts(summary_all, out_dir, tag):
     """Generate all summary charts."""
     chart_dir = os.path.join(out_dir, "charts")
     os.makedirs(chart_dir, exist_ok=True)
 
     _plot_wr_distribution(summary_all, chart_dir, tag, "all")
-    _plot_wr_distribution(summary_filtered, chart_dir, tag, "filtered")
     _plot_bucket_wr_boxplot(summary_all, chart_dir, tag, "all")
-    _plot_bucket_wr_boxplot(summary_filtered, chart_dir, tag, "filtered")
     _plot_bucket_profit_bar(summary_all, chart_dir, tag, "all")
-    _plot_bucket_profit_bar(summary_filtered, chart_dir, tag, "filtered")
     _plot_bucket_signer_sandwich_count(summary_all, chart_dir, tag, "all")
-    _plot_bucket_signer_sandwich_count(summary_filtered, chart_dir, tag, "filtered")
 
     print(f"\n  Charts saved to {chart_dir}/")
 
@@ -974,32 +952,11 @@ def main():
               f"({len(entity_sizes):,} entities, {len(multi_signer)} multi-signer)")
 
     # ── Step 6: All-signer summary report ─────────────────────────────────
-    all_stats = print_overall_summary(summary_all, per_sandwich, label="ALL SIGNERS")
+    print_overall_summary(summary_all, per_sandwich, label="ALL SIGNERS")
 
-    # ── Step 7: Filtered signers (WR >= 0.5 AND USD total_profit > 0) ────
-    # Signers with no price coverage (usd_total_profit=0 from NaN sum) are excluded
-    # because we cannot confirm positive profit.
-    mask_wr = summary_all["win_rate"] >= 0.5
-    mask_profit = summary_all["usd_total_profit"] > 0
-    summary_filtered = summary_all[mask_wr & mask_profit].copy()
-
-    # Also filter per_sandwich to only include filtered signers
-    filtered_signers = set(summary_filtered.index)
-    per_sandwich_filtered = per_sandwich[per_sandwich["signer"].isin(filtered_signers)]
-
-    summary_filtered.to_csv(f"{out_dir}/signer_summary_filtered_{tag}.csv")
-    print(f"\n  signer_summary_filtered_{tag}.csv         ({len(summary_filtered):,} rows)")
-
-    filt_stats = print_overall_summary(
-        summary_filtered, per_sandwich_filtered,
-        label="FILTERED SIGNERS (WR >= 0.5 AND USD profit > 0)"
-    )
-
-    print_filter_comparison(all_stats, filt_stats)
-
-    # ── Step 8: Generate charts ───────────────────────────────────────────
+    # ── Step 7: Generate charts ───────────────────────────────────────────
     print("\nGenerating charts...")
-    generate_charts(summary_all, summary_filtered, out_dir, tag)
+    generate_charts(summary_all, out_dir, tag)
 
     # ── Step 9: Feature summary ───────────────────────────────────────────
     print(f"\n{'='*80}")

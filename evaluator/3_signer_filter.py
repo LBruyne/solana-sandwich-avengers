@@ -1,38 +1,34 @@
 """
 Phase 3: Signer Filter — Identify Intentional Sandwich Attackers
 ================================================================
-Two-track classification (default, used for standard / diff_signer_*):
+Three-track classification, applied uniformly across categories:
 
-  Track 1 (Jito Bot): Any signer with >= 1 Jito same-bundle sandwich
-    -> deterministic signal of ordering control, no other requirement
+  Track 1 (Jito Bot): >=1 Jito same-bundle sandwich (front + all victims +
+    back share one bundleId) AND USD total profit >= jito_usd_min ($10).
+    The USD floor filters structurally-matching but unprofitable bundle
+    candidates (notably ~150 entities in diff_signer_owner that aggregate
+    to ~$0).
 
   Track 2 (Signal Bot): All of the following must hold:
-    - cnt >= N_min (statistical reliability, default 5)
-    - win_rate >= 0.8 (economic motivation — sustained profitability)
-    - mean_slippage >= 0.75 (victim observation — calibrated front-runs)
-    - P(fg<=100) >= 0.6 (ordering control — front-run proximity)
+    - cnt >= n_min (statistical reliability, default 10)
+    - win_rate >= 0.8 (economic motivation)
+    - mean_slippage >= 0.75 (victim observation)
+    - P(fg<=100) >= 0.6 (ordering control)
+    - usd_total >= signal_usd_min ($10)
 
-  Thresholds are chosen at the transition point where avg USD/signer jumps
-  ~2x (from ~$500 to ~$1,400), indicating a qualitative shift from
-  coincidental HFT to intentional attackers. See 2_parameter_selection for
-  the full analysis.
+  Track 2b (Oneshot Bot, multi_split only): CNT <= oneshot_cnt_max (5) AND
+    WR >= 0.8 AND usd_total >= oneshot_usd_min ($100). Captures single
+    high-value attackers (e.g. pump.fun launch races) below Signal Bot's
+    CNT gate.
 
-Multi-split specific adjustments (category=multi_split only):
-  - Jito Bot track is skipped: in epoch 946-956, 0 multi-split sandwiches
-    appear as Jito same-bundle events (multi-split is by construction a
-    non-bundle ordering strategy).
-  - Track 2b (High-profit One-shot): adds CNT <= 5 AND WR >= 0.8 AND
-    USD total profit >= $100. Rationale: ~58% of multi-split signers have
-    CNT=1 and cannot clear Signal Bot's CNT>=5 gate, yet a subset executes
-    single high-value attacks (e.g. pump.fun launch races) with prox=1,
-    slippage ~0.8. USD>=$100 isolates those from the CNT=1 noise floor.
-  - When --multi-variant is set to multi_front/multi_back/both, the same
-    filter is applied to the corresponding structural subset only.
-
-Output: filtered bot signers and their sandwiches for downstream analysis.
+Pre-filter diagnostic charts (auto-generated per run):
+  1. WR distribution over all signers in the category (10% buckets).
+  2. Avg USD/signer by mean_slippage bin, restricted to the pool
+     {USD>=signal_usd_min, CNT>=n_min, WR>=wr_min}.
+  3. Avg USD/signer by P(fg<=100) bin, same pool.
 
 Usage:
-    python 3_signer_filter.py --start-epoch 946 --end-epoch 956
+    python 3_signer_filter.py --start-epoch 946 --end-epoch 960
     python 3_signer_filter.py --category multi_split
     python 3_signer_filter.py --category multi_split --multi-variant multi_back
 """
@@ -72,17 +68,26 @@ def parse_args():
                         "multi_front: multiFrontRun=true AND multiBackRun=false; "
                         "multi_back: multiFrontRun=false AND multiBackRun=true; "
                         "both: both flags true; all: everything in multi_split.")
-    p.add_argument("--n-min", type=int, default=5,
-                   help="Minimum sandwich count")
+    p.add_argument("--n-min", type=int, default=10,
+                   help="Signal Bot minimum sandwich count")
     p.add_argument("--wr-min", type=float, default=0.8,
                    help="Minimum win rate")
     p.add_argument("--slip-min", type=float, default=0.75,
                    help="Minimum mean slippage consumption")
     p.add_argument("--fg100-min", type=float, default=0.6,
                    help="Minimum P(fg<=100) ratio")
+    p.add_argument("--signal-usd-min", type=float, default=10.0,
+                   help="Signal Bot minimum USD total profit")
+    p.add_argument("--oneshot-cnt-max", type=int, default=5,
+                   help="Multi-split Track 2b: maximum sandwich count for "
+                        "one-shot attackers (decoupled from Signal Bot's CNT).")
     p.add_argument("--oneshot-usd-min", type=float, default=100.0,
                    help="Multi-split Track 2b: USD total threshold for "
-                        "CNT<=n_min one-shot attackers (multi_split only).")
+                        "one-shot attackers (multi_split only).")
+    p.add_argument("--jito-usd-min", type=float, default=10.0,
+                   help="Jito Bot track: minimum USD total profit. Filters "
+                        "structurally-matching but unprofitable bundle "
+                        "candidates (notably in diff_signer_owner).")
     return p.parse_args()
 
 
@@ -142,68 +147,80 @@ def _rebuild_signer_features(ps):
 
 def classify_signers(sf, ps, n_min, wr_min, slip_min, fg100_min,
                      category="standard", token_prices=None,
-                     oneshot_usd_min=100.0):
+                     signal_usd_min=10.0,
+                     oneshot_cnt_max=5, oneshot_usd_min=100.0,
+                     jito_usd_min=10.0):
     """Classify signers into Jito Bot, Signal Bot, Oneshot Bot, or Unclassified.
 
-    Track 1: Jito Bot — deterministic ordering control evidence.
-      For diff_signer_owner: skipped entirely (Jito diff-signer entities
-      are structurally-matching but systematically unprofitable).
-      For multi_split: skipped (observed count ~0 in our dataset).
+    Track 1 (Jito Bot): >=1 same-bundle sandwich AND USD>=jito_usd_min.
+      Independent track — does NOT use the Signal Bot pre-filter pool.
 
-    Track 2 (Signal Bot): WR + slippage + fg100 ratio gates on CNT >= n_min.
+    Track 2 (Signal Bot, two-stage):
+      Stage 1 — pre-filter pool:
+        usd_total >= signal_usd_min  AND
+        sandwich_count >= n_min      AND
+        win_rate >= wr_min
+      Stage 2 — final attacker set within the pool:
+        mean_slippage >= slip_min   AND
+        fg100_ratio >= fg100_min
 
-    Track 2b (Oneshot Bot, multi_split only): CNT <= n_min AND WR >= wr_min
-      AND USD total >= oneshot_usd_min. Captures single high-value attackers
-      (e.g. pump.fun launch races) who cannot clear CNT>=n_min but demonstrate
-      both economic motivation and real dollar impact.
+    Track 2b (Oneshot Bot, multi_split only): CNT <= oneshot_cnt_max AND
+      WR >= wr_min AND USD >= oneshot_usd_min.
+
+    Returns sf (with usd_total + fg100_ratio + pool/signal masks), tier
+    series, and the four signer sets including the intermediate pool.
     """
-    # Compute fg100 ratio per signer
+    # Per-signer fg100 ratio
     fg100_ratio = ps.groupby("signer").apply(
         lambda g: (g["proximity"] <= 100).mean()
     ).rename("fg100_ratio")
     sf = sf.copy()
     sf["fg100_ratio"] = fg100_ratio
 
-    # Track 1: Jito Bot
-    if category == "diff_signer_owner":
-        jito_signers = set()
-        jito_candidates = set(ps[ps["jito_bundle"] == True]["signer"].unique())
-        if jito_candidates:
-            print(f"  Jito track skipped for diff_signer_owner "
-                  f"({len(jito_candidates)} candidates excluded: "
-                  f"structurally-matching but unprofitable)")
-    elif category == "multi_split":
-        jito_signers = set()
-        jito_candidates = set(ps[ps["jito_bundle"] == True]["signer"].unique())
-        if jito_candidates:
-            print(f"  Jito track skipped for multi_split "
-                  f"({len(jito_candidates)} candidates; multi-split is by "
-                  f"construction a non-bundle ordering strategy)")
+    # Per-signer USD totals
+    ps_priced = ps.copy()
+    if token_prices is not None:
+        ps_priced["usd_profit"] = (
+            ps_priced["profit"] * ps_priced["token_a"].map(token_prices))
     else:
-        jito_signers = set(ps[ps["jito_bundle"] == True]["signer"].unique())
+        ps_priced["usd_profit"] = np.nan
+    usd_by_sig = ps_priced.groupby("signer")["usd_profit"].sum()
+    sf["usd_total"] = usd_by_sig
 
-    # Track 2: Signal Bot
-    signal_mask = (
+    # Track 1 — Jito Bot (independent of Signal pool)
+    jito_candidates = set(ps[ps["jito_bundle"] == True]["signer"].unique())
+    jito_signers = {
+        s for s in jito_candidates
+        if s in sf.index and pd.notna(sf.at[s, "usd_total"])
+        and sf.at[s, "usd_total"] >= jito_usd_min
+    }
+    n_dropped = len(jito_candidates) - len(jito_signers)
+    if jito_candidates:
+        print(f"  Jito Bot: {len(jito_candidates)} same-bundle candidates -> "
+              f"{len(jito_signers)} retained "
+              f"(dropped {n_dropped} with USD < ${jito_usd_min:.0f})")
+
+    # Track 2 Stage 1 — Signal Bot pre-filter pool
+    pool_mask = (
+        (sf["usd_total"] >= signal_usd_min) &
         (sf["sandwich_count"] >= n_min) &
-        (sf["win_rate"] >= wr_min) &
+        (sf["win_rate"] >= wr_min)
+    )
+    pool_signers = set(sf[pool_mask].index)
+
+    # Track 2 Stage 2 — Signal Bot final attacker set
+    signal_mask = (
+        pool_mask &
         (sf["mean_slippage"] >= slip_min) &
         (sf["fg100_ratio"] >= fg100_min)
     )
     signal_signers = set(sf[signal_mask].index)
 
-    # Track 2b: Oneshot Bot (multi_split only)
+    # Track 2b — Oneshot Bot (multi_split only)
     oneshot_signers = set()
     if category == "multi_split":
-        ps_priced = ps.copy()
-        if token_prices is not None:
-            ps_priced["usd_profit"] = (
-                ps_priced["profit"] * ps_priced["token_a"].map(token_prices))
-        else:
-            ps_priced["usd_profit"] = np.nan
-        usd_by_sig = ps_priced.groupby("signer")["usd_profit"].sum()
-        sf["usd_total"] = usd_by_sig
         oneshot_mask = (
-            (sf["sandwich_count"] <= n_min) &
+            (sf["sandwich_count"] <= oneshot_cnt_max) &
             (sf["win_rate"] >= wr_min) &
             (sf["usd_total"] >= oneshot_usd_min)
         )
@@ -232,7 +249,7 @@ def classify_signers(sf, ps, n_min, wr_min, slip_min, fg100_min,
     tier_series = pd.Series(tiers, name="tier")
     bot_signers = jito_signers | signal_signers | oneshot_signers
     return (sf, tier_series, bot_signers, jito_signers, signal_signers,
-            oneshot_signers)
+            oneshot_signers, pool_signers)
 
 
 # ── Summary Report ───────────────────────────────────────────────────────────
@@ -350,7 +367,277 @@ def print_report(sf, tier_series, ps, token_prices,
 
 # ── Charts ───────────────────────────────────────────────────────────────────
 
-def generate_charts(sf, ps, tier_series, bot_signers, token_prices, chart_dir, tag):
+def plot_wr_distribution_pre_filter(sf, chart_dir, tag, n_min, wr_min,
+                                    slip_min, fg100_min, signal_usd_min):
+    """Pre-filter WR histogram for ALL signers in this category.
+
+    The plot answers: "across all candidate signers (no filter applied yet),
+    how do they distribute over win-rate buckets?" Annotated with the
+    Signal-Bot thresholds so the reader sees where the cut-offs sit.
+    """
+    fig, ax = plt.subplots(figsize=(11, 6))
+    bins = np.linspace(0, 1, 11)
+    bin_labels = [f"{int(bins[i]*100)}-{int(bins[i+1]*100)}%"
+                  for i in range(len(bins) - 1)]
+    counts, _ = np.histogram(sf["win_rate"].dropna().values, bins=bins)
+    bars = ax.bar(range(len(counts)), counts, color="#4a90d9",
+                  edgecolor="black", alpha=0.85)
+    for bar, c in zip(bars, counts):
+        if c > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, c, f"{c:,}",
+                    ha="center", va="bottom", fontsize=9)
+    ax.axvline(np.searchsorted(bins, wr_min) - 0.5, color="#cc0000",
+               linestyle="--", linewidth=1.5,
+               label=f"WR threshold = {wr_min}")
+    ax.set_xticks(range(len(bin_labels)))
+    ax.set_xticklabels(bin_labels, rotation=30, ha="right")
+    ax.set_xlabel("Win Rate Bucket")
+    ax.set_ylabel("Number of Signers")
+    ax.set_title(f"Pre-filter Win-Rate Distribution "
+                 f"(N={int(sf['win_rate'].notna().sum()):,} signers)\n"
+                 f"Signal Bot gates: CNT>={n_min}, WR>={wr_min}, "
+                 f"slip>={slip_min}, fg100>={fg100_min}, "
+                 f"USD>=${signal_usd_min:.0f}")
+    ax.legend(loc="upper left")
+    ax.set_yscale("log")
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(chart_dir, f"wr_distribution_pre_filter_{tag}.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def _avg_usd_by_bin(sub, value_col, bin_edges):
+    """Group sub by binned value_col and return (labels, n_signers, avg_usd)."""
+    cuts = pd.cut(sub[value_col], bins=bin_edges, include_lowest=True,
+                  right=False)
+    g = sub.groupby(cuts, observed=False)
+    n = g.size().values
+    avg = g["usd_total"].mean().values
+    labels = [f"{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}"
+              for i in range(len(bin_edges) - 1)]
+    return labels, n, avg
+
+
+def plot_avg_usd_by_signal(sub, chart_dir, tag, signal_col, signal_label,
+                           threshold, signal_min):
+    """Bar plot of avg USD/signer per signal bin within the pre-filter pool.
+
+    Pool: signers who already pass `usd_total>=signal_min AND CNT>=n_min
+    AND WR>=wr_min`. Bin width = 0.05 (20 bins over [0, 1]), matching the
+    Phase-2 threshold-analysis convention in docs/evaluator_design.md §5.2.
+    """
+    bin_edges = np.arange(0.0, 1.0 + 1e-9, 0.05)
+    labels, n, avg = _avg_usd_by_bin(sub, signal_col, bin_edges)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    bars = ax.bar(range(len(labels)),
+                  np.where(np.isnan(avg), 0, avg),
+                  color="#e88a3c", edgecolor="black", alpha=0.85)
+    for bar, count, val in zip(bars, n, avg):
+        if count > 0:
+            top = bar.get_height()
+            usd_lbl = "$0" if (np.isnan(val) or val == 0) else f"${val:,.0f}"
+            ax.text(bar.get_x() + bar.get_width() / 2, top,
+                    f"{usd_lbl}\nn={count}",
+                    ha="center", va="bottom", fontsize=7)
+
+    # Threshold marker positioned on the bin boundary
+    thr_pos = (threshold - bin_edges[0]) / 0.05 - 0.5
+    ax.axvline(thr_pos, color="#cc0000", linestyle="--", linewidth=1.8,
+               label=f"Signal Bot threshold = {threshold}")
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels([f"{e:.2f}" for e in bin_edges[:-1]],
+                       rotation=45, ha="right", fontsize=9)
+    ax.set_xlabel(f"{signal_label} (lower edge of 0.05-width bin)")
+    ax.set_ylabel("Avg USD Profit per Signer")
+    ax.set_title(f"Avg USD/Signer by {signal_label} "
+                 f"(Pool: USD>=${signal_min:.0f}, CNT>=10, WR>=0.8 — "
+                 f"N={len(sub):,} signers)")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    suffix = signal_col.replace("mean_", "").replace("_ratio", "")
+    plt.savefig(os.path.join(chart_dir, f"avg_usd_by_{suffix}_{tag}.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def _signal_stats(values):
+    """Return basic descriptive stats for a numeric Series."""
+    v = pd.Series(values).dropna()
+    if len(v) == 0:
+        return {"n": 0}
+    return {
+        "n": int(len(v)),
+        "mean": float(v.mean()),
+        "median": float(v.median()),
+        "std": float(v.std()),
+        "min": float(v.min()),
+        "max": float(v.max()),
+        "p25": float(v.quantile(0.25)),
+        "p75": float(v.quantile(0.75)),
+    }
+
+
+def print_pool_signal_stats(pool_sf, slip_min, fg100_min):
+    """Mean/median/distribution stats for slippage and fg100 in the pool."""
+    print("\n  --- Stage-1 Pool Signal Stats ---")
+    print(f"  Pool size: {len(pool_sf):,} signers "
+          f"(passed USD>=signal_usd_min, CNT>=n_min, WR>=wr_min)")
+
+    for col, label, thr in [("mean_slippage", "Mean Slippage Consumption", slip_min),
+                            ("fg100_ratio", "P(fg <= 100)", fg100_min)]:
+        s = _signal_stats(pool_sf[col])
+        if s["n"] == 0:
+            print(f"\n  {label}: no data")
+            continue
+        passing = int((pool_sf[col] >= thr).sum())
+        print(f"\n  {label} (n={s['n']:,} non-NaN):")
+        print(f"    mean={s['mean']:.3f}  median={s['median']:.3f}  "
+              f"std={s['std']:.3f}")
+        print(f"    min={s['min']:.3f}  p25={s['p25']:.3f}  "
+              f"p75={s['p75']:.3f}  max={s['max']:.3f}")
+        print(f"    >= threshold ({thr}): {passing:,} "
+              f"({passing/s['n']*100:.1f}% of non-NaN)")
+
+
+def plot_signal_distribution(pool_sf, chart_dir, tag, signal_col, signal_label,
+                             threshold):
+    """Histogram of a signal over the Stage-1 pool, with mean/median lines."""
+    fig, ax = plt.subplots(figsize=(11, 6))
+    bin_edges = np.arange(0.0, 1.0 + 1e-9, 0.05)
+    vals = pool_sf[signal_col].dropna()
+    if len(vals) == 0:
+        plt.close(fig)
+        return
+    counts, _ = np.histogram(vals.values, bins=bin_edges)
+    bars = ax.bar(range(len(counts)), counts, color="#4a90d9",
+                  edgecolor="black", alpha=0.85)
+    for bar, c in zip(bars, counts):
+        if c > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, c, f"{c:,}",
+                    ha="center", va="bottom", fontsize=8)
+
+    mean_v = float(vals.mean())
+    med_v = float(vals.median())
+    mean_pos = (mean_v - bin_edges[0]) / 0.05 - 0.5
+    med_pos = (med_v - bin_edges[0]) / 0.05 - 0.5
+    thr_pos = (threshold - bin_edges[0]) / 0.05 - 0.5
+    ax.axvline(thr_pos, color="#cc0000", linestyle="--", linewidth=1.8,
+               label=f"Threshold = {threshold}")
+    ax.axvline(mean_pos, color="#2ca02c", linestyle="-", linewidth=1.5,
+               label=f"Mean = {mean_v:.3f}")
+    ax.axvline(med_pos, color="#9467bd", linestyle=":", linewidth=1.5,
+               label=f"Median = {med_v:.3f}")
+
+    ax.set_xticks(range(len(bin_edges) - 1))
+    ax.set_xticklabels([f"{e:.2f}" for e in bin_edges[:-1]],
+                       rotation=45, ha="right", fontsize=9)
+    ax.set_xlabel(f"{signal_label} (lower edge of 0.05 bin)")
+    ax.set_ylabel("Number of Signers")
+    ax.set_title(f"Stage-1 Pool: {signal_label} Distribution "
+                 f"(N={len(vals):,} non-NaN signers)")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    suffix = signal_col.replace("mean_", "").replace("_ratio", "")
+    plt.savefig(os.path.join(chart_dir, f"pool_{suffix}_distribution_{tag}.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_attacker_profit_cnt_scatter(attacker_sf, chart_dir, tag, n_min):
+    """Scatter of USD profit (y) vs sandwich count (x) for the final attacker set."""
+    if len(attacker_sf) == 0:
+        return
+    fig, ax = plt.subplots(figsize=(11, 7))
+    df = attacker_sf.copy()
+    df["usd"] = df["usd_total"]
+
+    cnt = df["sandwich_count"].values.astype(float)
+    usd = df["usd"].values.astype(float)
+    ax.scatter(cnt, usd, s=40, c="#cc6633", alpha=0.7,
+               edgecolors="black", linewidths=0.5)
+
+    ax.axvline(n_min, color="gray", linestyle=":", alpha=0.6,
+               label=f"CNT = {n_min}")
+    ax.set_xscale("log")
+    if (usd > 0).any():
+        ax.set_yscale("symlog", linthresh=10)
+
+    # Annotate top-5 by USD
+    top = df.nlargest(5, "usd")
+    for s, row in top.iterrows():
+        ax.annotate(s[:8], (row["sandwich_count"], row["usd"]),
+                    fontsize=8, alpha=0.8,
+                    xytext=(4, 4), textcoords="offset points")
+
+    ax.set_xlabel("Sandwich Count (CNT, log scale)")
+    ax.set_ylabel("USD Total Profit (symlog)")
+    ax.set_title(f"Final Attackers: USD Profit vs Sandwich Count "
+                 f"(N={len(df):,} signers, total ${df['usd'].sum():,.0f})")
+    ax.legend()
+    ax.grid(True, alpha=0.3, which="both")
+    plt.tight_layout()
+    plt.savefig(os.path.join(chart_dir, f"attacker_profit_cnt_{tag}.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def generate_pre_filter_charts(sf, chart_dir, tag, n_min, wr_min,
+                               slip_min, fg100_min, signal_usd_min):
+    """Pre-filter diagnostic charts (Phase-3 entry, before any track applies).
+
+    Produces:
+      1. Pre-filter WR distribution over all signers in the category.
+      2. Avg USD/signer by mean_slippage bin, restricted to the pool
+         {USD>=signal_usd_min, CNT>=n_min, WR>=wr_min}.
+      3. Avg USD/signer by P(fg<=100) bin, same pool.
+    """
+    plot_wr_distribution_pre_filter(sf, chart_dir, tag, n_min, wr_min,
+                                    slip_min, fg100_min, signal_usd_min)
+
+    pool_mask = (
+        (sf["usd_total"] >= signal_usd_min) &
+        (sf["sandwich_count"] >= n_min) &
+        (sf["win_rate"] >= wr_min)
+    )
+    pool = sf[pool_mask].copy()
+    if len(pool) == 0:
+        print(f"  [pre-filter charts] empty pool — skipping slip/fg100 plots")
+        return
+
+    plot_avg_usd_by_signal(
+        pool, chart_dir, tag,
+        signal_col="mean_slippage", signal_label="Mean Slippage Consumption",
+        threshold=slip_min, signal_min=signal_usd_min,
+    )
+    plot_avg_usd_by_signal(
+        pool, chart_dir, tag,
+        signal_col="fg100_ratio", signal_label="P(fg <= 100)",
+        threshold=fg100_min, signal_min=signal_usd_min,
+    )
+
+    # Stage-1 pool signal-distribution histograms (mean/median/threshold lines)
+    plot_signal_distribution(
+        pool, chart_dir, tag,
+        signal_col="mean_slippage",
+        signal_label="Mean Slippage Consumption",
+        threshold=slip_min,
+    )
+    plot_signal_distribution(
+        pool, chart_dir, tag,
+        signal_col="fg100_ratio",
+        signal_label="P(fg <= 100)",
+        threshold=fg100_min,
+    )
+
+
+def generate_charts(sf, ps, tier_series, bot_signers, token_prices, chart_dir, tag,
+                    pool_signers=None, signal_signers=None,
+                    slip_min=0.75, fg100_min=0.6):
     """Generate classification summary charts."""
     ps_copy = ps.copy()
     ps_copy["usd_profit"] = ps_copy["profit"] * ps_copy["token_a"].map(token_prices)
@@ -414,112 +701,131 @@ def generate_charts(sf, ps, tier_series, bot_signers, token_prices, chart_dir, t
     plt.savefig(os.path.join(chart_dir, f"classification_summary_{tag}.png"), dpi=150)
     plt.close()
 
-    # 5. Scatter: slippage vs fg100 for WR>=0.8, CNT>=5 signers
-    fig, ax = plt.subplots(figsize=(12, 9))
-    ax.set_facecolor("#f5f5f5")
+    # 5/6. Scatters over the Stage-1 pool, with Stage-2 (slip+fg100) cuts.
+    # Population restricted to the pool so the upper-right region (passed
+    # Stage-2) contains exclusively Signal Bots — no non-bot leakage.
+    if pool_signers is None or signal_signers is None:
+        return  # backward-compatibility safeguard
 
-    wr_pool = sf[(sf["win_rate"] >= 0.8) & (sf["sandwich_count"] >= 5) &
-                 sf["mean_slippage"].notna() &
-                 sf["fg100_ratio"].notna()].copy()
-    wr_pool["is_bot"] = wr_pool.index.isin(bot_signers)
-    wr_pool["usd"] = usd_by_sig
-    wr_pool["log_usd"] = np.log10(wr_pool["usd"].clip(1))
-
-    non_b = wr_pool[~wr_pool["is_bot"]].copy()
-    bots = wr_pool[wr_pool["is_bot"]].copy()
-
-    # White background for the bot quadrant (active region)
-    from matplotlib.patches import Rectangle
-    ax.add_patch(Rectangle((0.75, 0.6), 0.27, 0.42, facecolor="white",
-                            edgecolor="none", zorder=0))
-
-    # Non-bot: steel blue with visible edges
-    ax.scatter(non_b["mean_slippage"], non_b["fg100_ratio"],
-               s=np.clip(non_b["sandwich_count"] / 5, 8, 40),
-               c="#4a90d9", alpha=0.45, edgecolors="#2a5a9a",
-               linewidths=0.4, zorder=2,
-               label=f"Non-bot (n={len(non_b):,})")
-
-    # Bot: colored by USD, prominent
-    sc_bot = ax.scatter(bots["mean_slippage"], bots["fg100_ratio"],
-                        s=np.clip(bots["sandwich_count"] / 5, 15, 120),
-                        c=bots["log_usd"], cmap="YlOrRd", alpha=0.9,
-                        vmin=0, vmax=5, edgecolors="black", linewidths=0.6,
-                        zorder=3, label=f"Bot (n={len(bots):,})")
-
-    # Threshold lines
-    ax.axvline(0.75, color="#cc0000", linestyle="--", linewidth=1.8, alpha=0.8,
-               label="Slip threshold = 0.75")
-    ax.axhline(0.6, color="#cc0000", linestyle="--", linewidth=1.8, alpha=0.8,
-               label="FG100 threshold = 0.6")
-
-    ax.set_xlabel("Mean Slippage Consumption", fontsize=13)
-    ax.set_ylabel(r"P(FG $\leq$ 100)", fontsize=13)
-    ax.set_title(fr"Signer Classification (WR $\geq$ 0.8, CNT $\geq$ 5)\n"
-                 f"size = sandwich count, color = log$_{{10}}$(USD profit)",
-                 fontsize=13)
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.02)
-    ax.legend(fontsize=10, loc="lower left",
-              framealpha=0.9, edgecolor="gray")
-    ax.grid(True, alpha=0.15, color="gray")
-
-    cbar = plt.colorbar(sc_bot, ax=ax, shrink=0.75, pad=0.02)
-    cbar.set_label("log$_{10}$(USD profit)", fontsize=11)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(chart_dir, f"scatter_slip_fg100_{tag}.png"),
-                dpi=150, bbox_inches="tight")
-    plt.close()
-
-    # 6. Scatter: same layout but colored by avg USD per sandwich
-    fig, ax = plt.subplots(figsize=(12, 9))
-    ax.set_facecolor("#f5f5f5")
-
-    wr_pool["avg_usd"] = wr_pool["usd"] / wr_pool["sandwich_count"]
-    wr_pool["log_avg_usd"] = np.log10(wr_pool["avg_usd"].clip(0.01))
-    non_b = wr_pool[~wr_pool["is_bot"]].copy()
-    bots = wr_pool[wr_pool["is_bot"]].copy()
+    pool_sf = sf.loc[sf.index.isin(pool_signers) &
+                     sf["mean_slippage"].notna() &
+                     sf["fg100_ratio"].notna()].copy()
+    if len(pool_sf) == 0:
+        return
+    pool_sf["usd"] = usd_by_sig
+    pool_sf["passed_stage2"] = pool_sf.index.isin(signal_signers)
+    passed = pool_sf[pool_sf["passed_stage2"]]
+    failed = pool_sf[~pool_sf["passed_stage2"]]
 
     from matplotlib.patches import Rectangle
-    ax.add_patch(Rectangle((0.75, 0.6), 0.27, 0.42, facecolor="white",
-                            edgecolor="none", zorder=0))
 
-    ax.scatter(non_b["mean_slippage"], non_b["fg100_ratio"],
-               s=np.clip(non_b["sandwich_count"] / 5, 8, 40),
-               c="#4a90d9", alpha=0.45, edgecolors="#2a5a9a",
-               linewidths=0.4, zorder=2,
-               label=f"Non-bot (n={len(non_b):,})")
+    def _jitter(values, amount=0.008):
+        rng = np.random.default_rng(seed=42)
+        return values.values + rng.uniform(-amount, amount, size=len(values))
 
-    sc_bot2 = ax.scatter(bots["mean_slippage"], bots["fg100_ratio"],
-                         s=np.clip(bots["sandwich_count"] / 5, 15, 120),
-                         c=bots["log_avg_usd"], cmap="YlOrRd", alpha=0.9,
-                         vmin=-2, vmax=2, edgecolors="black", linewidths=0.6,
-                         zorder=3, label=f"Bot (n={len(bots):,})")
+    def _draw_scatter(color_col, color_label, vmin, vmax, fname):
+        # Single pane focused on [0.2, 1.02]; the [0, 0.2] interval is shown
+        # only as a "0" tick mark followed by a break (//) so the reader sees
+        # the axis starts at 0 but understands that range is collapsed.
+        fig, ax = plt.subplots(figsize=(13, 10))
+        ax.set_facecolor("#f5f5f5")
+        ax.add_patch(Rectangle((slip_min, fg100_min),
+                               1.02 - slip_min, 1.02 - fg100_min,
+                               facecolor="white", edgecolor="none", zorder=0))
 
-    ax.axvline(0.75, color="#cc0000", linestyle="--", linewidth=1.8, alpha=0.8,
-               label="Slip threshold = 0.75")
-    ax.axhline(0.6, color="#cc0000", linestyle="--", linewidth=1.8, alpha=0.8,
-               label="FG100 threshold = 0.6")
+        f_sorted = (failed.sort_values("sandwich_count", ascending=False)
+                    if len(failed) > 0 else failed)
+        p_sorted = passed.sort_values("sandwich_count", ascending=False)
 
-    ax.set_xlabel("Mean Slippage Consumption", fontsize=13)
-    ax.set_ylabel(r"P(FG $\leq$ 100)", fontsize=13)
-    ax.set_title(fr"Signer Classification (WR $\geq$ 0.8, CNT $\geq$ 5)\n"
-                 f"size = sandwich count, color = log$_{{10}}$(avg USD/sandwich)",
-                 fontsize=13)
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.02)
-    ax.legend(fontsize=10, loc="lower left",
-              framealpha=0.9, edgecolor="gray")
-    ax.grid(True, alpha=0.15, color="gray")
+        if len(f_sorted) > 0:
+            ax.scatter(_jitter(f_sorted["mean_slippage"]),
+                       _jitter(f_sorted["fg100_ratio"]),
+                       s=np.clip(f_sorted["sandwich_count"] / 5, 6, 35),
+                       c="#4a90d9", alpha=0.35, edgecolors="#2a5a9a",
+                       linewidths=0.3, zorder=2,
+                       label=f"Failed Stage-2 (n={len(failed):,})")
 
-    cbar2 = plt.colorbar(sc_bot2, ax=ax, shrink=0.75, pad=0.02)
-    cbar2.set_label("log$_{10}$(avg USD per sandwich)", fontsize=11)
+        sc = ax.scatter(_jitter(p_sorted["mean_slippage"]),
+                        _jitter(p_sorted["fg100_ratio"]),
+                        s=np.clip(p_sorted["sandwich_count"] / 5, 18, 140),
+                        c=p_sorted[color_col], cmap="YlOrRd", alpha=0.85,
+                        vmin=vmin, vmax=vmax,
+                        edgecolors="black", linewidths=0.5, zorder=3,
+                        label=f"Signal Bot (n={len(p_sorted):,})")
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(chart_dir, f"scatter_slip_fg100_avgprofit_{tag}.png"),
-                dpi=150, bbox_inches="tight")
-    plt.close()
+        ax.axvline(slip_min, color="#cc0000", linestyle="--", linewidth=1.8,
+                   alpha=0.8, label=f"Slip threshold = {slip_min}")
+        ax.axhline(fg100_min, color="#cc0000", linestyle="--", linewidth=1.8,
+                   alpha=0.8, label=f"FG100 threshold = {fg100_min}")
+
+        # Focus range; leave a small gap before 0.2 to host the "0" tick + break.
+        gap = 0.04
+        ax.set_xlim(0.2 - gap, 1.02)
+        ax.set_ylim(0.2 - gap, 1.02)
+
+        # Custom tick layout: "0" pinned to the left edge / bottom edge,
+        # then a break, then ticks every 0.1 from 0.2 to 1.0.
+        x_ticks = [0.2 - gap] + list(np.round(np.arange(0.2, 1.01, 0.1), 2))
+        x_lbls  = ["0"] + [f"{v:.1f}" for v in np.round(np.arange(0.2, 1.01, 0.1), 2)]
+        ax.set_xticks(x_ticks);  ax.set_xticklabels(x_lbls)
+        ax.set_yticks(x_ticks);  ax.set_yticklabels(x_lbls)
+
+        # Break marks: small slash pair across the 0..0.2 collapsed gap on
+        # both axes, drawn in axis coordinates.
+        kw = dict(transform=ax.transAxes, color="black",
+                  linewidth=1.2, clip_on=False)
+        d = 0.012
+        # x axis break — sits between "0" and 0.2 at the bottom spine
+        x_break_axis = (gap / 2) / (1.02 - (0.2 - gap))
+        ax.add_artist(plt.Line2D([x_break_axis - d, x_break_axis + d],
+                                 [-d, d], **kw))
+        ax.add_artist(plt.Line2D([x_break_axis - d + 0.005,
+                                  x_break_axis + d + 0.005],
+                                 [-d, d], **kw))
+        # y axis break — sits between "0" and 0.2 at the left spine
+        y_break_axis = (gap / 2) / (1.02 - (0.2 - gap))
+        ax.add_artist(plt.Line2D([-d, d],
+                                 [y_break_axis - d, y_break_axis + d], **kw))
+        ax.add_artist(plt.Line2D([-d, d],
+                                 [y_break_axis - d + 0.005,
+                                  y_break_axis + d + 0.005], **kw))
+
+        ax.set_xlabel("Mean Slippage Consumption", fontsize=13)
+        ax.set_ylabel(r"P(FG $\leq$ 100)", fontsize=13)
+        ax.set_title(f"Stage-1 Pool — Stage-2 Cut "
+                     f"(N={len(pool_sf):,}; passed={len(passed):,})\n"
+                     f"size = sandwich count, color = {color_label} "
+                     f"(axes broken between 0 and 0.2)", fontsize=12)
+        ax.legend(fontsize=10, loc="lower left", framealpha=0.9,
+                  edgecolor="gray")
+        ax.grid(True, alpha=0.15, color="gray")
+
+        if sc is not None:
+            cbar = plt.colorbar(sc, ax=ax, shrink=0.75, pad=0.02)
+            cbar.set_label(color_label, fontsize=11)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(chart_dir, fname),
+                    dpi=150, bbox_inches="tight")
+        plt.close()
+
+    # Pool requires usd_total >= $10, so log10 starts at 1.
+    pool_sf["log_usd"] = np.log10(pool_sf["usd"].clip(10))
+    passed = pool_sf[pool_sf["passed_stage2"]]
+    failed = pool_sf[~pool_sf["passed_stage2"]]
+    _draw_scatter("log_usd", "log$_{10}$(USD profit)", 1, 5,
+                  f"scatter_slip_fg100_{tag}.png")
+
+    # Avg USD per sandwich is positive within the pool. Floor at $1
+    # (log10=0) to keep the scale non-negative; cap at $100 (log10=2)
+    # because >99% of pool members sit in $1-$100, so a wider range
+    # would push the bulk of colours into the pale-yellow end.
+    pool_sf["avg_usd"] = pool_sf["usd"] / pool_sf["sandwich_count"]
+    pool_sf["log_avg_usd"] = np.log10(pool_sf["avg_usd"].clip(1))
+    passed = pool_sf[pool_sf["passed_stage2"]]
+    failed = pool_sf[~pool_sf["passed_stage2"]]
+    _draw_scatter("log_avg_usd", "log$_{10}$(avg USD per sandwich)",
+                  0, 2, f"scatter_slip_fg100_avgprofit_{tag}.png")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -570,15 +876,19 @@ def main():
     wr_min = args.wr_min
     slip_min = args.slip_min
     fg100_min = args.fg100_min
+    signal_usd_min = args.signal_usd_min
+    oneshot_cnt_max = args.oneshot_cnt_max
     oneshot_usd_min = args.oneshot_usd_min
+    jito_usd_min = args.jito_usd_min
 
     print(f"=== Phase 3: Signer Filter ===")
     print(f"Category: {category}" +
           (f" / variant={variant}" if category == "multi_split" else ""))
-    print(f"Parameters: N_min={n_min}, WR>={wr_min}, slip>={slip_min}, "
-          f"fg100>={fg100_min}")
+    print(f"Signal Bot gates: CNT>={n_min}, WR>={wr_min}, slip>={slip_min}, "
+          f"fg100>={fg100_min}, USD>=${signal_usd_min:.0f}")
+    print(f"Jito Bot track: same-bundle AND USD>=${jito_usd_min:.0f}")
     if category == "multi_split":
-        print(f"Oneshot track: CNT<={n_min} AND WR>={wr_min} "
+        print(f"Oneshot track: CNT<={oneshot_cnt_max} AND WR>={wr_min} "
               f"AND USD>=${oneshot_usd_min:.0f}")
     print(f"Epoch range: {args.start_epoch}-{args.end_epoch}")
 
@@ -603,10 +913,27 @@ def main():
     # Classify
     print(f"\nClassifying signers...")
     (sf, tier_series, bot_signers, jito_signers, signal_signers,
-     oneshot_signers) = classify_signers(
+     oneshot_signers, pool_signers) = classify_signers(
         sf, ps, n_min, wr_min, slip_min, fg100_min,
         category=category, token_prices=token_prices,
-        oneshot_usd_min=oneshot_usd_min)
+        signal_usd_min=signal_usd_min,
+        oneshot_cnt_max=oneshot_cnt_max, oneshot_usd_min=oneshot_usd_min,
+        jito_usd_min=jito_usd_min)
+
+    pool_sf = sf.loc[sf.index.isin(pool_signers)].copy()
+    print(f"\nStage-1 pool: {len(pool_sf):,} signers "
+          f"(USD>=${signal_usd_min:.0f} AND CNT>={n_min} AND WR>={wr_min})")
+    print_pool_signal_stats(pool_sf, slip_min, fg100_min)
+    pool_sf.to_csv(f"{out_dir}/pool_signers_{tag}.csv")
+
+    # Pre-filter diagnostic charts (WR + per-bin avg-USD + pool distributions)
+    print(f"\nGenerating pre-filter diagnostic charts...")
+    generate_pre_filter_charts(sf, chart_dir, tag, n_min, wr_min,
+                               slip_min, fg100_min, signal_usd_min)
+
+    # Final attacker scatter (Signal Bot final set after Stage-2 filter)
+    final_attacker_sf = sf.loc[sf.index.isin(signal_signers)]
+    plot_attacker_profit_cnt_scatter(final_attacker_sf, chart_dir, tag, n_min)
 
     # Report
     print_report(sf, tier_series, ps, token_prices,
@@ -674,7 +1001,9 @@ def main():
 
     # Charts
     print(f"\nGenerating charts...")
-    generate_charts(sf, ps, tier_series, bot_signers, token_prices, chart_dir, tag)
+    generate_charts(sf, ps, tier_series, bot_signers, token_prices, chart_dir, tag,
+                    pool_signers=pool_signers, signal_signers=signal_signers,
+                    slip_min=slip_min, fg100_min=fg100_min)
     print(f"  Charts saved to {chart_dir}/")
 
     print(f"\n=== Done ===")
