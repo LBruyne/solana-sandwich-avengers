@@ -19,6 +19,17 @@ API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjJhYTc1MGZlLWY0YTMt
 BASE_URL = "https://solana-gateway.moralis.io/token/mainnet"
 OUT_DIR = "data/token_prices"
 
+# Watcher stores native SOL as the literal string "SOL" in sandwiches.tokenA,
+# but Moralis only accepts mint addresses. Rewrite "SOL" to the wrapped-SOL
+# mint on the way to the API while keeping the stored CSV key as "SOL" so
+# downstream load_token_prices() continues to look it up by that key.
+SOL_WRAPPED_MINT = "So11111111111111111111111111111111111111112"
+
+
+def _api_address_for(token):
+    """Map the DB/CSV key to the address Moralis expects."""
+    return SOL_WRAPPED_MINT if token == "SOL" else token
+
 
 def get_top_tokens(client, top_n):
     """Get top tokenA by occurrence in sandwiches (profit is in tokenA units)."""
@@ -33,7 +44,7 @@ def get_top_tokens(client, top_n):
 
 def fetch_price(token_address):
     """Fetch current price from Moralis."""
-    url = f"{BASE_URL}/{token_address}/price"
+    url = f"{BASE_URL}/{_api_address_for(token_address)}/price"
     headers = {"X-API-Key": API_KEY}
     try:
         resp = requests.get(url, headers=headers, timeout=10)
@@ -66,12 +77,18 @@ def main():
     tokens = get_top_tokens(client, args.top_n)
     print(f"Top {len(tokens)} tokens to fetch prices for")
 
-    # Load existing prices to avoid re-fetching
+    # Load existing prices to avoid re-fetching. Rows whose price is NaN are
+    # NOT treated as "already fetched" so they can be retried on next run,
+    # which is how the SOL row (previously stored with a NaN price because the
+    # old crawler passed the "SOL" symbol to Moralis instead of the wrapped
+    # mint) will get a real value on the next crawl.
     out_path = f"{OUT_DIR}/prices.csv"
     if os.path.exists(out_path):
         existing = pd.read_csv(out_path)
-        existing_tokens = set(existing["token"])
-        print(f"Existing prices: {len(existing)} ({existing['usd_price'].notna().sum()} valid)")
+        existing_tokens = set(existing.loc[existing["usd_price"].notna(), "token"])
+        print(f"Existing prices: {len(existing)} "
+              f"({existing['usd_price'].notna().sum()} valid; "
+              f"{existing['usd_price'].isna().sum()} NaN will be retried)")
     else:
         existing = pd.DataFrame()
         existing_tokens = set()
