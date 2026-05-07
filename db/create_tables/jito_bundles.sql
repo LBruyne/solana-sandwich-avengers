@@ -1,4 +1,4 @@
-CREATE TABLE solwich.jito_bundles
+CREATE TABLE IF NOT EXISTS solwich.jito_bundles
 (
     `bundleId` String,
     `slot` UInt64,

@@ -1,0 +1,5 @@
+clickhouse-connect
+numpy
+pandas
+pyarrow
+python-dotenv
