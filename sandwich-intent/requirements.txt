@@ -1,0 +1,9 @@
+clickhouse-connect
+cloudscraper
+matplotlib
+numpy
+pandas
+pyarrow
+python-dotenv
+requests
+scipy

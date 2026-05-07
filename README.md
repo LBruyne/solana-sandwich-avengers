@@ -1,50 +1,173 @@
-# solana-mev
+# Solana Sandwich
 
-This repository implements an end-to-end system for detecting and analyzing sandwich attacks on Solana. The pipeline consists of a real-time detection engine, a quantitative analysis stack, and a ClickHouse-backed persistence layer.
+End-to-end research artifact for measuring sandwich attacks on Solana.
+The project ingests blocks in near real time, applies a heuristic
+detector, classifies signers as intentional attackers, and ships a
+labelled dataset together with the analysis scripts that reproduce the
+paper figures.
 
-## System Architecture
-
-The pipeline integrates on-chain data acquisition, heuristic detection, bundle-aware enrichment, and offline analysis:
-
-```mermaid
-flowchart LR
-	RPC[Solana RPC getBlock] --> W1[Watcher: Transaction Parsing]
-	W1 --> W2[Watcher: Pool/Token Buckets]
-	W2 --> W3[Watcher: In-Block Sandwich Detection]
-	W2 --> W4[Watcher: Cross-Block Sandwich Detection]
-	W3 --> DB1[(ClickHouse: sandwiches, sandwich_txs)]
-	W4 --> DB1
-	RPC --> W5[Watcher: Slot Leaders]
-	W5 --> DB2[(ClickHouse: slot_leaders, slot_txs)]
-
-	JITO[Jito Bundle API] --> W6[Watcher: Bundle Fetcher]
-	W6 --> DB3[(ClickHouse: jito_bundles, slot_bundles)]
-	DB1 --> W7[Watcher: inBundle Marking]
-	DB3 --> W7
-	W7 --> DB1
-
-	DB1 --> A1[Analyst: Parquet Export]
-	DB2 --> A1
-	A1 --> A2[Analyst: Feature Engineering & Profit Model]
-	A2 --> A3[Analyst: Attacker Clustering & Statistics]
-	A3 --> OUT[Research Outputs: CSV/Parquet/Figures]
+```
+                  Solana RPC + Jito API
+                          │
+                          ▼
+      ┌─────────────────────────────────────┐
+      │  sandwich-detector  (Go)             │
+      │  block ingest, heuristic detection,  │
+      │  Jito bundle enrichment              │
+      └────────────────┬────────────────────┘
+                       │
+                       ▼
+                 ClickHouse
+                       │
+                       ▼
+      ┌─────────────────────────────────────┐
+      │  sandwich-intent  (Python)           │
+      │  per-attacker feature aggregation,   │
+      │  three-track classifier,             │
+      │  validator-association enrichment    │
+      └────────────────┬────────────────────┘
+                       │
+            ┌──────────┴──────────┐
+            ▼                     ▼
+   ┌────────────────┐    ┌──────────────────┐
+   │ dataset/       │    │ sandwich-analysis│
+   │ public release │    │ paper figures +  │
+   │ (parquet+csv)  │    │ overview notebook│
+   └────────────────┘    └──────────────────┘
 ```
 
-## Threat Model
+The four top-level directories correspond to the four roles above. Each
+directory has its own README with detailed instructions; this top-level
+file orients new readers and gives the canonical run order.
 
-We assume an adversary capable of submitting high-priority transactions and constructing private bundles via the Jito block engine. The adversary can observe the transaction stream within the short Solana slot window and reorder their own transactions within a block or across adjacent slots, but cannot rewrite finalized blocks or tamper with validator signatures. Victims are modeled as latency-sensitive swaps routed through AMM pools; they do not coordinate with the adversary and lack access to private order flow.
+## Modules
 
-Solana’s high throughput and approximately 0.4s slot time compress the attack window and reduce observability, which makes near-real-time detection essential. Our system explicitly models this constraint by parallelizing slot ingestion, separating in-block and cross-block detection, and integrating bundle-aware post-processing.
+| Directory | Language | Role |
+|---|---|---|
+| [`sandwich-detector/`](sandwich-detector/) | Go 1.24 | Real-time sandwich detector (in-block + cross-block) and Jito bundle enrichment. Writes to ClickHouse. |
+| [`sandwich-intent/`](sandwich-intent/) | Python 3.11+ | Five-step pipeline (data acquisition → per-signer features → threshold diagnostic → attacker classifier → validator association). Reads from and writes back to ClickHouse + local `data/`. |
+| [`sandwich-analysis/`](sandwich-analysis/) | Python 3.11+ | Paper-figure scripts (§5.2, §7.1, Appendix E) and an end-to-end overview notebook. Reads `sandwich-intent/data/`. |
+| [`dataset/`](dataset/) | Python 3.11+ | Builds the public release dataset (`attackers`, `sandwiches`, `sandwich_txs` + aux). Reads `sandwich-intent/data/` and ClickHouse. |
+| [`db/create_tables/`](db/create_tables/) | SQL | ClickHouse schema for the six detector tables (created automatically by the detector on first run). |
 
-## Core Contributions
+## Quick start
 
-- [Our Contribution] A pool- and token-consistent heuristic detector that matches multi-front/multi-back sandwiches using amount-similarity constraints and victim placement rules, while tolerating SOL-specific fee noise.
-- [Our Contribution] A low-latency detection pipeline that parallelizes slot ingestion, uses a bounded cross-block cache, and enforces leader-contiguity windows to mitigate missed detections under rapid state transitions.
-- [Our Contribution] A bundle-aware enrichment path that marks sandwich transactions participating in Jito bundles, enabling separate evaluation of public versus private order flow.
+The pipeline is staged: each module depends on the output of the
+previous one. A complete reproduction looks like this.
 
-## Documentation
+### 1. Detector (Go)
 
-- [docs/watcher.md](docs/watcher.md)
-- [docs/analyst.md](docs/analyst.md)
-- [docs/database.md](docs/database.md)
-- [docs/roadmap.md](docs/roadmap.md)
+```bash
+cd sandwich-detector
+cp .env.example .env                       # ClickHouse credentials
+cp config.example.yaml config.yaml         # Solana RPC + Jito API endpoints
+./scripts/build.sh                         # produces ./sandwich-detector
+
+# in three long-running terminals (or via the wrapper scripts):
+./scripts/leader.sh   400000000            # slot leaders
+./scripts/sandwich.sh 400000000            # sandwich detection
+./scripts/jito.sh     400000000            # Jito bundle fetch + inBundle marking
+```
+
+See [`sandwich-detector/README.md`](sandwich-detector/README.md) for
+ClickHouse setup, RPC requirements, and the full tunable list.
+
+### 2. Intent classification (Python)
+
+After the detector has produced data for the target window:
+
+```bash
+cd sandwich-intent
+pip install -r requirements.txt
+cp .env.example .env                       # ClickHouse credentials
+
+# step 0 (run once per release window)
+python 0_crawl_stakewiz.py
+python 0_crawl_token_price.py
+python 0_crawl_sandwiched_me.py --epoch 946
+
+# steps 1 + 3 per category (1 runs feature prep; 3 classifies)
+for cat in standard multi_split diff_signer_owner; do
+    python 1_signer_data_preparation_and_summary.py --start-epoch 946 --end-epoch 960 --category $cat
+    python 3_attacker_filter.py                     --start-epoch 946 --end-epoch 960 --category $cat
+done
+
+# step 4 (validator association across the three categories)
+python 4_validator_association.py --start-epoch 946 --end-epoch 960
+```
+
+Step 2 (`2_parameter_selection.py`) is a diagnostic for the classifier
+thresholds and is not required by the rest of the pipeline.
+
+See [`sandwich-intent/README.md`](sandwich-intent/README.md) for the
+three-track classifier definition (Jito Bot, Signal Bot, Oneshot Bot)
+and the validator-enrichment math.
+
+### 3. Public dataset
+
+```bash
+pip install -r dataset/requirements.txt
+python dataset/build_dataset.py            # merge intent outputs + tx detail
+```
+
+This writes `attackers_<start>_<end>.{parquet,csv}`,
+`sandwiches_<start>_<end>.{parquet,csv}`,
+`sandwich_txs_<start>_<end>.{parquet,csv}`, and copies aux snapshots into
+`dataset/aux/`. The CSV mirrors are example slices (top-3% by USD ∪
+top-3% by count); Parquet always carries the full 380-attacker dataset.
+
+See [`dataset/README.md`](dataset/README.md) for the full schema and a
+data dictionary.
+
+### 4. Paper figures and overview notebook
+
+```bash
+cd sandwich-analysis
+pip install -r requirements.txt
+
+python sec5_2_wr_distribution.py
+python sec5_2_appE_charts.py
+python sec7_1_enrichment_distribution.py
+python sec7_validator_charts.py --start-epoch 946 --end-epoch 960
+
+jupyter notebook analysis.ipynb            # interactive overview
+```
+
+See [`sandwich-analysis/README.md`](sandwich-analysis/README.md) for
+the input dependencies of each figure script.
+
+## Requirements
+
+- **Solana RPC** with `getBlock` returning full transaction details. The
+  public `mainnet-beta` endpoint is rate-limited and not viable for
+  continuous detection; a paid or self-hosted RPC is recommended.
+- **Jito Block Engine bundles API** (`https://bundles.jito.wtf`) — public.
+- **ClickHouse** (tested with the official Debian package).
+- **Go 1.24** (detector).
+- **Python 3.11+** with the per-directory `requirements.txt`.
+
+## Repository layout
+
+```
+sandwich-detector/   real-time detector (Go)
+sandwich-intent/     attacker classification pipeline (Python)
+sandwich-analysis/   paper figures and overview notebook (Python)
+dataset/             public release artifacts + build script
+db/create_tables/    ClickHouse schema (one .sql per table)
+LICENSE              MIT
+README.md            this file
+```
+
+`sandwich-intent/data/` and the per-module log directories are
+gitignored; the scripts regenerate them deterministically from
+ClickHouse and the inputs of preceding steps.
+
+## Citing
+
+If you use this code or the published dataset, please cite the
+accompanying paper. A BibTeX entry will be added once the paper is
+public.
+
+## License
+
+[MIT](LICENSE).

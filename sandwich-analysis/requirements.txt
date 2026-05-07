@@ -1,0 +1,10 @@
+clickhouse-connect
+ipykernel
+itables
+matplotlib
+numpy
+pandas
+pyarrow
+python-dotenv
+requests
+tqdm
