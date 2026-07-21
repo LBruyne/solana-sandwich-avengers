@@ -203,9 +203,11 @@ func GetBlock(slot uint64) (*types.Block, error) {
 	if err != nil {
 		// Normalize well-known error patterns so caller can branch on them
 		msg := err.Error()
-		// e.g. "Slot 123 was skipped, or missing due to ledger jump to recent snapshot"
-		if regexp.MustCompile(`^RPC getBlock returned error: \d+ Slot \d+ was skipped, or missing due to ledger jump to recent snapshot$`).MatchString(msg) ||
-			regexp.MustCompile(`Slot \d+ was skipped, or missing due to ledger jump to recent snapshot`).MatchString(msg) {
+		// Skipped/missing slot. Self-hosted nodes report "...ledger jump to recent snapshot";
+		// archival RPCs (Helius) report code -32009 "...missing in long-term storage". Both mean
+		// the slot has no block and must not be retried.
+		if regexp.MustCompile(`Slot \d+ was skipped, or missing due to ledger jump to recent snapshot`).MatchString(msg) ||
+			regexp.MustCompile(`Slot \d+ was skipped, or missing in long-term storage`).MatchString(msg) {
 			return nil, fmt.Errorf(utils.SKIPPED_BLOCK)
 		}
 		// e.g. "Block 123 cleaned up, does not exist on node. First available block: 456"
@@ -440,7 +442,10 @@ func parseDexInstructions(topLevelInsts []solana.CompiledInstruction, programs [
 		})
 	}
 
-	// Inner instructions from meta
+	// Inner (CPI) instructions from meta. Under encoding=base64 these arrive compiled
+	// ({programIdIndex, accounts:[indices], data:<base58>}); under jsonParsed they carry
+	// resolved {programId, accounts:[addresses]}. Handle both so the same path works
+	// regardless of the RPC encoding, resolving indices against combinedAccounts.
 	innerInsts, _ := meta["innerInstructions"].([]any)
 	for _, group := range innerInsts {
 		groupMap, ok := group.(map[string]any)
@@ -454,14 +459,21 @@ func parseDexInstructions(topLevelInsts []solana.CompiledInstruction, programs [
 			if !ok {
 				continue
 			}
-			// Skip parsed instructions (token transfers, etc.) — they don't have raw data
+			// Fully-parsed instructions (SPL transfers, etc.) carry no raw data to decode.
 			if _, hasParsed := instMap["parsed"]; hasParsed {
 				continue
 			}
+
 			programID, _ := instMap["programId"].(string)
+			if programID == "" {
+				if idx, ok := instMap["programIdIndex"].(float64); ok && int(idx) < len(combinedAccounts) {
+					programID = combinedAccounts[int(idx)]
+				}
+			}
 			if !utils.IsLabeledDexPrograms(programID) {
 				continue
 			}
+
 			dataStr, _ := instMap["data"].(string)
 			if dataStr == "" {
 				continue
@@ -470,14 +482,21 @@ func parseDexInstructions(topLevelInsts []solana.CompiledInstruction, programs [
 			if err != nil {
 				continue
 			}
-			// Resolve account addresses
+
+			// Accounts are either resolved addresses (jsonParsed) or indices (base64).
 			rawAccounts, _ := instMap["accounts"].([]any)
 			accounts := make([]string, 0, len(rawAccounts))
 			for _, a := range rawAccounts {
-				if addr, ok := a.(string); ok {
-					accounts = append(accounts, addr)
+				switch v := a.(type) {
+				case string:
+					accounts = append(accounts, v)
+				case float64:
+					if int(v) < len(combinedAccounts) {
+						accounts = append(accounts, combinedAccounts[int(v)])
+					}
 				}
 			}
+
 			result = append(result, types.DexInstruction{
 				ProgramID: programID,
 				Data:      dataBytes,
@@ -617,8 +636,8 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		uiTokenAmount, _ := tokenBalance["uiTokenAmount"].(map[string]any)
 		amount, _ := uiTokenAmount["amount"].(string)
 		decimals := int(uiTokenAmount["decimals"].(float64))
-		amountInt, _ := strconv.Atoi(amount)
-		preb := float64(amountInt) / math.Pow10(decimals)
+		amountRaw, _ := strconv.ParseUint(amount, 10, 64) // SPL raw amounts are u64; Atoi overflows high-supply tokens to 0
+		preb := float64(amountRaw) / math.Pow10(decimals)
 
 		tokenDecimals[tokenAddr] = decimals
 		// Record ATA owner
@@ -660,8 +679,13 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		uiTokenAmount := tokenBalance["uiTokenAmount"].(map[string]any)
 		amount, _ := uiTokenAmount["amount"].(string)
 		decimals := int(uiTokenAmount["decimals"].(float64))
-		amountInt, _ := strconv.Atoi(amount)
-		postb := float64(amountInt) / math.Pow10(decimals)
+		amountRaw, _ := strconv.ParseUint(amount, 10, 64)
+		postb := float64(amountRaw) / math.Pow10(decimals)
+
+		// Record decimals here too: a token first appearing in postTokenBalances (e.g. a freshly
+		// created ATA receiving a memecoin) is absent from the pre loop, and would otherwise
+		// fall back to the 9-decimal default when its slippage limit is converted.
+		tokenDecimals[tokenAddr] = decimals
 
 		// Record ATA owner
 		ataOwner[ataAddr] = owner
