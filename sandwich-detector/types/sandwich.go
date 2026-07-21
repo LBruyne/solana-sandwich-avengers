@@ -44,7 +44,13 @@ type Sandwich struct {
 	SandwichID        string `ch:"sandwichId"`
 	TokenA            string `ch:"tokenA"`
 	TokenB            string `ch:"tokenB"`
-	CrossBlock        bool   `ch:"crossBlock"`        // whether the sandwich spans multiple blocks
+	CrossBlock        bool   `ch:"crossBlock"`        // whether the sandwich spans multiple slots
+	CrossLeader       bool   `ch:"crossLeader"`       // whether front and back fall under different slot leaders (implies CrossBlock)
+	FrontLeader       string `ch:"frontLeader"`       // leader of the first front-run slot ("" if unknown)
+	BackLeader        string `ch:"backLeader"`        // leader of the last back-run slot ("" if unknown)
+	WindowStartSlot   uint64 `ch:"windowStartSlot"`   // first slot of the detection window this sandwich was found in
+	WindowEndSlot     uint64 `ch:"windowEndSlot"`     // last slot of the detection window this sandwich was found in
+	RpcSource         string `ch:"rpcSource"`         // data source: "live" (self-hosted) or "helius" (archival backfill)
 	Consecutive       bool   `ch:"consecutive"`       // whether the sandwich txs are consecutive in the block, i.e., F_last + 1 == V_first and V_last + 1 == B_first
 	FrontConsecutive  bool   `ch:"frontConsecutive"`  // whether the front-run txs are consecutive in the block, i.e., F_1 + 1 == F_2, F_2 + 1 == F_3, ...
 	BackConsecutive   bool   `ch:"backConsecutive"`   // whether the back-run txs are consecutive in the block, i.e., B_1 + 1 == B_2, B_2 + 1 == B_3, ...
