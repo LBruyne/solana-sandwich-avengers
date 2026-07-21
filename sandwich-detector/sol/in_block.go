@@ -49,8 +49,10 @@ func (f *InBlockSandwichFinder) Find() {
 
 	// For each bucket, scan its reverse bucket to find possible sandwiches
 	// For a pool in frontTx(s), A is incomeToken, B is expenseTokens; in backTx(s), B is incomeToken, A is expenseToken
-	// Front direction: (pool, A, B)
-	for key, frontTxBucket := range f.buckets {
+	// Front direction: (pool, A, B). Iterate in a stable order so overlapping sandwiches
+	// resolve deterministically (greedy tx claiming makes bucket order significant).
+	for _, key := range sortedBucketKeys(f.buckets) {
+		frontTxBucket := f.buckets[key]
 		if len(frontTxBucket) == 0 {
 			continue
 		}

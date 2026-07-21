@@ -1,0 +1,624 @@
+package sol
+
+import (
+	"math"
+	"sandwich-detector/config"
+	"sandwich-detector/types"
+	"sandwich-detector/utils"
+
+	MapSet "github.com/deckarep/golang-set/v2"
+)
+
+// SandwichFinder detects sandwiches within a single detection window — an ordered
+// sequence of transactions that may span one or more slots. It unifies the former
+// in-block and cross-block finders: an in-block sandwich is simply the case where
+// every leg shares a slot. Positional logic keys on TxIdx (the index within the
+// window's tx sequence); for a single-slot window TxIdx equals the block position,
+// so results match the old in-block finder on cleanly-parsed blocks.
+//
+// leaderBySlot, when provided, classifies a sandwich as cross-leader (front and back
+// under different leaders). It may be nil, in which case crossLeader is always false.
+type SandwichFinder struct {
+	Txs             types.Transactions
+	LeaderBySlot    map[uint64]string
+	RpcSource       string
+	AmountThreshold uint
+	Sandwiches      []*types.CrossBlockSandwich
+
+	// Internal states
+	buckets                map[PoolKey][]PoolEntry
+	confirmedSandwichTxIdx map[int]bool // TxIdx confirmed as a front/back leg of some sandwich
+
+	// Last evaluated sandwich, staged by Evaluate and consumed by RecordSandwich.
+	lastTokenA           string
+	lastTokenB           string
+	lastFrontTxEntries   []PoolEntry
+	lastBackTxEntries    []PoolEntry
+	lastVictimEntries    []PoolEntry
+	lastAdverseEntries   []PoolEntry
+	lastFrontTransfers   []*Transfer
+	lastBackTransfers    []*Transfer
+	perfect              bool
+	relativeAmtDiffB     float64
+	profitA              float64
+	FrontFromTotalAmount float64
+	FrontToTotalAmount   float64
+	BackFromTotalAmount  float64
+	BackToTotalAmount    float64
+}
+
+// NewSandwichFinder builds a finder over an already slot/position-ordered tx window.
+// confirmedSandwichTxIdx may be shared across windows so a front/back leg is claimed by
+// at most one sandwich; pass nil for an isolated window.
+func NewSandwichFinder(txs types.Transactions, leaderBySlot map[uint64]string, amountThreshold uint, rpcSource string, confirmed map[int]bool) *SandwichFinder {
+	if confirmed == nil {
+		confirmed = make(map[int]bool)
+	}
+	return &SandwichFinder{
+		Txs:                    txs,
+		LeaderBySlot:           leaderBySlot,
+		RpcSource:              rpcSource,
+		AmountThreshold:        amountThreshold,
+		Sandwiches:             make([]*types.CrossBlockSandwich, 0),
+		confirmedSandwichTxIdx: confirmed,
+	}
+}
+
+// Find scans every (pool, A, B) bucket against its reverse (pool, B, A) bucket for
+// front→victim→back patterns. Suppose a sandwich is front-run(s) A→B, victim(s) A→B,
+// back-run(s) B→A.
+func (f *SandwichFinder) Find() {
+	f.Sandwiches = make([]*types.CrossBlockSandwich, 0)
+	if f.confirmedSandwichTxIdx == nil {
+		f.confirmedSandwichTxIdx = make(map[int]bool)
+	}
+	f.buckets = filterAndBuildTxBuckets(f.Txs, true)
+
+	for _, key := range sortedBucketKeys(f.buckets) {
+		frontTxBucket := f.buckets[key]
+		if len(frontTxBucket) == 0 {
+			continue
+		}
+		revKey := PoolKey{PoolAddress: key.PoolAddress, IncomeToken: key.ExpenseToken, ExpenseToken: key.IncomeToken}
+		backTxBucket, ok := f.buckets[revKey]
+		if !ok || len(backTxBucket) == 0 {
+			continue
+		}
+
+		for i := 0; i < len(frontTxBucket); i++ {
+			candidateFrontTxEntries := f.collectFrontTxs(frontTxBucket[i], frontTxBucket)
+			if len(candidateFrontTxEntries) == 0 {
+				continue
+			}
+
+			// Small-to-large: match the seed front alone first, then widen. This keeps
+			// independent sandwiches (F1-V1-B1-F2-V2-B2) from being grouped as one.
+			var backTxEntries []PoolEntry
+			for k := 1; k <= len(candidateFrontTxEntries); k++ {
+				backTxEntries = f.collectBackTxs(candidateFrontTxEntries[:k], backTxBucket)
+				if len(backTxEntries) > 0 {
+					break
+				}
+			}
+			if len(backTxEntries) == 0 {
+				continue
+			}
+
+			f.RecordSandwich()
+			f.ResetSandwichState()
+		}
+	}
+}
+
+func (f *SandwichFinder) ResetSandwichState() {
+	f.lastFrontTxEntries = nil
+	f.lastBackTxEntries = nil
+	f.lastVictimEntries = nil
+	f.lastAdverseEntries = nil
+	f.lastFrontTransfers = nil
+	f.lastBackTransfers = nil
+}
+
+// collectFrontTxs grows a multi-front group from a seed: same-signer entries within
+// SANDWICH_FRONTRUN_MAX_GAP of the previous accepted front (measured in TxIdx).
+func (f *SandwichFinder) collectFrontTxs(seed PoolEntry, frontTxBucket []PoolEntry) []PoolEntry {
+	res := make([]PoolEntry, 0)
+	maxGap := config.SANDWICH_FRONTRUN_MAX_GAP
+
+	if f.confirmedSandwichTxIdx[seed.TxIdx] {
+		return res
+	}
+	if tx := f.Txs[seed.TxIdx]; tx == nil || tx.IsFailed || tx.IsVote {
+		return res
+	}
+
+	signers := seed.Signers
+	res = append(res, seed)
+	lastIdx := seed.TxIdx
+
+	// frontTxBucket is sorted by (slot, position), so scan forward.
+	for _, entry := range frontTxBucket {
+		if entry.TxIdx <= lastIdx {
+			continue
+		}
+		if entry.TxIdx-lastIdx > maxGap {
+			break
+		}
+		if f.confirmedSandwichTxIdx[entry.TxIdx] || f.Txs[entry.TxIdx] == nil || f.Txs[entry.TxIdx].IsFailed || f.Txs[entry.TxIdx].IsVote {
+			continue
+		}
+		if !utils.SignersOverlap(entry.Signers, signers) {
+			continue
+		}
+		res = append(res, entry)
+		lastIdx = entry.TxIdx
+	}
+	return res
+}
+
+// collectBackTxs finds the back-run group that forms a sandwich with the given fronts.
+// The first back seed must sit at least two positions after the last front (leaving room
+// for a victim); accompanying backs share a signer and stay within SANDWICH_BACKRUN_MAX_GAP.
+func (f *SandwichFinder) collectBackTxs(frontTxEntries []PoolEntry, backTxBucket []PoolEntry) []PoolEntry {
+	maxGap := config.SANDWICH_BACKRUN_MAX_GAP
+	lastFrontIdx := frontTxEntries[len(frontTxEntries)-1].TxIdx + 1
+
+	for i, startBackEntry := range backTxBucket {
+		if startBackEntry.TxIdx <= lastFrontIdx {
+			continue
+		}
+		if f.confirmedSandwichTxIdx[startBackEntry.TxIdx] || f.Txs[startBackEntry.TxIdx] == nil || f.Txs[startBackEntry.TxIdx].IsFailed || f.Txs[startBackEntry.TxIdx].IsVote {
+			continue
+		}
+
+		signers := startBackEntry.Signers
+		candidateBackTxEntries := []PoolEntry{startBackEntry}
+		lastIdx := startBackEntry.TxIdx
+
+		for j := i + 1; j < len(backTxBucket); j++ {
+			backEntry := backTxBucket[j]
+			if backEntry.TxIdx <= lastIdx {
+				continue
+			}
+			if backEntry.TxIdx-lastIdx > maxGap {
+				break
+			}
+			if f.confirmedSandwichTxIdx[backEntry.TxIdx] || f.Txs[backEntry.TxIdx] == nil || f.Txs[backEntry.TxIdx].IsFailed || f.Txs[backEntry.TxIdx].IsVote {
+				continue
+			}
+			if !utils.SignersOverlap(backEntry.Signers, signers) {
+				continue
+			}
+			candidateBackTxEntries = append(candidateBackTxEntries, backEntry)
+			lastIdx = backEntry.TxIdx
+		}
+
+		// Small-to-large over the back group as well.
+		for k := 1; k <= len(candidateBackTxEntries); k++ {
+			if f.Evaluate(frontTxEntries, candidateBackTxEntries[:k]) {
+				return candidateBackTxEntries[:k]
+			}
+		}
+	}
+	return make([]PoolEntry, 0)
+}
+
+// Evaluate checks the amount round-trip, victim presence and attacker linkage, staging
+// the sandwich in f.last* on success. Unlike the old cross-block finder it does NOT require
+// front and back to be in different slots — a same-slot match is an in-block sandwich.
+func (f *SandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntries []PoolEntry) bool {
+	if len(frontTxEntries) == 0 || len(backTxEntries) == 0 {
+		return false
+	}
+
+	tokenA := frontTxEntries[0].IncomeToken
+	if tokenA == "" || tokenA != backTxEntries[0].ExpenseToken {
+		return false
+	}
+	tokenB := frontTxEntries[0].ExpenseToken
+	if tokenB == "" || tokenB != backTxEntries[0].IncomeToken {
+		return false
+	}
+	frontSigners := unionSigners(frontTxEntries)
+	backSigners := unionSigners(backTxEntries)
+
+	threshold := f.AmountThreshold
+	var frontAmtB float64
+	for _, fe := range frontTxEntries {
+		if fe.ExpenseAmt < 0 {
+			frontAmtB += -fe.ExpenseAmt
+		}
+	}
+	var backAmtB float64
+	for _, be := range backTxEntries {
+		if be.IncomeAmt > 0 {
+			backAmtB += be.IncomeAmt
+		}
+	}
+
+	// frontAmtB should cover backAmtB (SOL tokenB is exempt to tolerate fee noise).
+	if tokenB != utils.SOL && utils.FloatRound(frontAmtB, 3) < utils.FloatRound(backAmtB, 3) {
+		return false
+	}
+	similar, relativeAmtDiff := f.HasSimilarAmount(frontAmtB, backAmtB, float64(threshold))
+	if !similar {
+		return false
+	}
+	var perfect bool
+	if tokenB == utils.SOL {
+		perfect = relativeAmtDiff <= (config.SANDWICH_AMOUNT_SOL_TOLERANCE / 100)
+	} else {
+		perfect = relativeAmtDiff == 0.0
+	}
+
+	victimEntries := f.collectVictimEntries(frontTxEntries, backTxEntries)
+	if len(victimEntries) == 0 {
+		return false
+	}
+	adverseEntries := f.collectAdverseEntries(frontTxEntries, backTxEntries)
+
+	frontInlineTransfers := collectInlineTransfers(frontTxEntries, f.Txs, transferSideFront)
+	backInlineTransfers := collectInlineTransfers(backTxEntries, f.Txs, transferSideBack)
+	frontTransfers := make([]*Transfer, 0, len(frontInlineTransfers)+4)
+	frontTransfers = append(frontTransfers, frontInlineTransfers...)
+	backTransfers := make([]*Transfer, 0, len(backInlineTransfers))
+	backTransfers = append(backTransfers, backInlineTransfers...)
+
+	// Attacker linkage: same signer → confirmed. Otherwise same owner set, else transfer evidence.
+	if !utils.SignersOverlap(frontSigners, backSigners) {
+		ownersOfBInFrtTxs := collectFrontOwnersByToken(frontTxEntries, f.Txs, tokenB)
+		ownersOfBInBckTxs := collectBackOwnersByToken(backTxEntries, f.Txs, tokenB)
+		if !ownersOfBInFrtTxs.IsSuperset(ownersOfBInBckTxs) {
+			directFrontTransfers := collectDirectTransfers(
+				f.Txs,
+				frontTxEntries[len(frontTxEntries)-1].TxIdx+1,
+				backTxEntries[0].TxIdx,
+				tokenB,
+				ownersOfBInFrtTxs,
+				ownersOfBInBckTxs,
+				transferSideFront,
+			)
+			directAmtB := sumTransferAmount(directFrontTransfers)
+			inlineBridgeAmtB := sumFrontInlineBridgeAmount(frontInlineTransfers, tokenB, ownersOfBInFrtTxs, ownersOfBInBckTxs)
+			bridgeAmtB := directAmtB + inlineBridgeAmtB
+			if bridgeAmtB <= 0 {
+				return false
+			}
+			similarTransfer, _ := f.HasSimilarAmount(backAmtB, bridgeAmtB, float64(threshold))
+			if !similarTransfer {
+				return false
+			}
+			frontTransfers = append(frontTransfers, directFrontTransfers...)
+		}
+	}
+
+	f.lastTokenA = tokenA
+	f.lastTokenB = tokenB
+	f.lastFrontTxEntries = frontTxEntries
+	f.lastBackTxEntries = backTxEntries
+	f.lastVictimEntries = victimEntries
+	f.lastAdverseEntries = adverseEntries
+	f.lastFrontTransfers = frontTransfers
+	f.lastBackTransfers = backTransfers
+	f.perfect = perfect
+	f.relativeAmtDiffB = relativeAmtDiff
+	f.FrontToTotalAmount = frontAmtB
+	f.BackFromTotalAmount = backAmtB
+	var frontAmtA float64
+	for _, fe := range frontTxEntries {
+		if fe.IncomeAmt > 0 {
+			frontAmtA += fe.IncomeAmt
+		}
+	}
+	var backAmtA float64
+	for _, be := range backTxEntries {
+		if be.ExpenseAmt < 0 {
+			backAmtA += -be.ExpenseAmt
+		}
+	}
+	estimateBackAmtA := frontAmtB * backAmtA / backAmtB
+	f.profitA = estimateBackAmtA - frontAmtA
+	f.FrontFromTotalAmount = frontAmtA
+	f.BackToTotalAmount = backAmtA
+	return true
+}
+
+func (f *SandwichFinder) collectVictimEntries(frontTxEntries, backTxEntries []PoolEntry) []PoolEntry {
+	if len(frontTxEntries) == 0 || len(backTxEntries) == 0 {
+		return make([]PoolEntry, 0)
+	}
+	frontEndIdx := frontTxEntries[len(frontTxEntries)-1].TxIdx
+	backBeginIdx := backTxEntries[0].TxIdx
+	if backBeginIdx <= frontEndIdx+1 {
+		return make([]PoolEntry, 0)
+	}
+	// Victims trade the same pool and direction as the front.
+	frontKey := PoolKey{
+		PoolAddress:  frontTxEntries[0].PoolAddress,
+		IncomeToken:  frontTxEntries[0].IncomeToken,
+		ExpenseToken: frontTxEntries[0].ExpenseToken,
+	}
+	frontTxBucket := f.buckets[frontKey]
+	frontSigners := unionSigners(frontTxEntries)
+	backSigners := unionSigners(backTxEntries)
+
+	victims := make([]PoolEntry, 0)
+	for _, e := range frontTxBucket {
+		// A victim may serve multiple sandwiches, so confirmed txs are not excluded here.
+		if f.Txs[e.TxIdx] == nil || f.Txs[e.TxIdx].IsFailed || f.Txs[e.TxIdx].IsVote {
+			continue
+		}
+		if e.TxIdx <= frontEndIdx || e.TxIdx >= backBeginIdx {
+			continue
+		}
+		if utils.SignersOverlap(e.Signers, frontSigners) || utils.SignersOverlap(e.Signers, backSigners) {
+			continue
+		}
+		victims = append(victims, e)
+	}
+	return victims
+}
+
+// collectAdverseEntries collects txs between front and back trading in the back direction
+// (B→A) with non-attacker signers — recorded for counts only.
+func (f *SandwichFinder) collectAdverseEntries(frontTxEntries, backTxEntries []PoolEntry) []PoolEntry {
+	if len(frontTxEntries) == 0 || len(backTxEntries) == 0 {
+		return make([]PoolEntry, 0)
+	}
+	frontEndIdx := frontTxEntries[len(frontTxEntries)-1].TxIdx
+	backBeginIdx := backTxEntries[0].TxIdx
+	if backBeginIdx <= frontEndIdx+1 {
+		return make([]PoolEntry, 0)
+	}
+	backKey := PoolKey{
+		PoolAddress:  backTxEntries[0].PoolAddress,
+		IncomeToken:  backTxEntries[0].IncomeToken,
+		ExpenseToken: backTxEntries[0].ExpenseToken,
+	}
+	backTxBucket := f.buckets[backKey]
+	frontSigners := unionSigners(frontTxEntries)
+	backSigners := unionSigners(backTxEntries)
+
+	adverse := make([]PoolEntry, 0)
+	for _, e := range backTxBucket {
+		if f.Txs[e.TxIdx] == nil || f.Txs[e.TxIdx].IsFailed || f.Txs[e.TxIdx].IsVote {
+			continue
+		}
+		if e.TxIdx <= frontEndIdx || e.TxIdx >= backBeginIdx {
+			continue
+		}
+		if utils.SignersOverlap(e.Signers, frontSigners) || utils.SignersOverlap(e.Signers, backSigners) {
+			continue
+		}
+		adverse = append(adverse, e)
+	}
+	return adverse
+}
+
+// HasSimilarAmount reports whether two amounts are within threshold percent, returning the
+// rounded relative difference. Differences below 1e-6 are treated as exact (float64 noise).
+func (f *SandwichFinder) HasSimilarAmount(frontAmt, backAmt float64, threshold float64) (bool, float64) {
+	if frontAmt <= 0 || backAmt <= 0 {
+		return false, -1.0
+	}
+	relativeDiff := math.Abs(frontAmt-backAmt) / math.Max(frontAmt, backAmt)
+	if relativeDiff <= 1e-6 {
+		return true, 0.0
+	}
+	return relativeDiff <= threshold/100.0, utils.FloatRound(relativeDiff, 6)
+}
+
+// crossBlock reports whether the front and back legs span more than one slot.
+func (f *SandwichFinder) isCrossBlock() bool {
+	minSlot, maxSlot := f.lastFrontTxEntries[0].Slot, f.lastFrontTxEntries[0].Slot
+	for _, e := range append(append([]PoolEntry{}, f.lastFrontTxEntries...), f.lastBackTxEntries...) {
+		if e.Slot < minSlot {
+			minSlot = e.Slot
+		}
+		if e.Slot > maxSlot {
+			maxSlot = e.Slot
+		}
+	}
+	return minSlot != maxSlot
+}
+
+func (f *SandwichFinder) RecordSandwich() {
+	if len(f.lastFrontTxEntries) == 0 || len(f.lastBackTxEntries) == 0 || len(f.lastVictimEntries) == 0 {
+		return
+	}
+
+	sandwichId := makeSandwichID(f.Txs[f.lastFrontTxEntries[0].TxIdx].Signature, f.Txs[f.lastBackTxEntries[0].TxIdx].Signature)
+
+	frontTxs := make([]*types.SandwichTx, 0, len(f.lastFrontTxEntries))
+	for _, fe := range f.lastFrontTxEntries {
+		frontTxs = append(frontTxs, f.makeSandwichTx(sandwichId, fe, "frontRun"))
+	}
+	frontTransferTxs := make([]*types.SandwichTx, 0, len(f.lastFrontTransfers))
+	for _, evidence := range f.lastFrontTransfers {
+		if transferTx := makeTransferSandwichTx(sandwichId, evidence, f.lastTokenB); transferTx != nil {
+			frontTransferTxs = append(frontTransferTxs, transferTx)
+		}
+	}
+	backTxs := make([]*types.SandwichTx, 0, len(f.lastBackTxEntries))
+	for _, be := range f.lastBackTxEntries {
+		backTxs = append(backTxs, f.makeSandwichTx(sandwichId, be, "backRun"))
+	}
+	backTransferTxs := make([]*types.SandwichTx, 0, len(f.lastBackTransfers))
+	for _, evidence := range f.lastBackTransfers {
+		if transferTx := makeTransferSandwichTx(sandwichId, evidence, f.lastTokenB); transferTx != nil {
+			backTransferTxs = append(backTransferTxs, transferTx)
+		}
+	}
+	victimTxs := make([]*types.SandwichTx, 0, len(f.lastVictimEntries))
+	for _, ve := range f.lastVictimEntries {
+		victimTxs = append(victimTxs, f.makeSandwichTx(sandwichId, ve, "victim"))
+	}
+	adverseTxs := make([]*types.SandwichTx, 0, len(f.lastAdverseEntries))
+	for _, ae := range f.lastAdverseEntries {
+		adverseTxs = append(adverseTxs, f.makeSandwichTx(sandwichId, ae, "adverse"))
+	}
+	if len(frontTxs) > 0 {
+		lf := frontTxs[len(frontTxs)-1]
+		lf.SandwichTxTokenInfo.FromTotalAmount = f.FrontFromTotalAmount
+		lf.SandwichTxTokenInfo.ToTotalAmount = f.FrontToTotalAmount
+	}
+	if len(backTxs) > 0 {
+		lb := backTxs[len(backTxs)-1]
+		lb.SandwichTxTokenInfo.FromTotalAmount = f.BackFromTotalAmount
+		lb.SandwichTxTokenInfo.ToTotalAmount = f.BackToTotalAmount
+		lb.SandwichTxTokenInfo.DiffA = f.BackToTotalAmount - f.FrontFromTotalAmount
+		lb.SandwichTxTokenInfo.DiffB = f.FrontToTotalAmount - f.BackFromTotalAmount
+	}
+
+	allFrontSigners := unionSigners(f.lastFrontTxEntries)
+	allBackSigners := unionSigners(f.lastBackTxEntries)
+	signerSame := utils.SignersOverlap(allFrontSigners, allBackSigners)
+	frontOwners := MapSet.NewSet[string]()
+	backOwners := MapSet.NewSet[string]()
+	for _, frtSTx := range frontTxs {
+		frontOwners.Append(frtSTx.OwnersOfB...)
+	}
+	for _, bckSTx := range backTxs {
+		backOwners.Append(bckSTx.OwnersOfB...)
+	}
+	ownerSame := frontOwners.IsSuperset(backOwners)
+
+	// Classify block/leader span.
+	crossBlock := f.isCrossBlock()
+	frontSlot := f.lastFrontTxEntries[0].Slot
+	backSlot := f.lastBackTxEntries[len(f.lastBackTxEntries)-1].Slot
+	var frontLeader, backLeader string
+	crossLeader := false
+	if f.LeaderBySlot != nil {
+		frontLeader = f.LeaderBySlot[frontSlot]
+		backLeader = f.LeaderBySlot[backSlot]
+		crossLeader = frontLeader != "" && backLeader != "" && frontLeader != backLeader
+	}
+	windowStartSlot, windowEndSlot := f.sandwichSlotSpan()
+
+	slot := f.Txs[f.lastFrontTxEntries[0].TxIdx].Slot
+	timestamp := f.Txs[f.lastFrontTxEntries[0].TxIdx].Timestamp
+
+	hasFrontInlineTransfer, hasDirectTransfer, hasBackInlineTransfer := classifyTransferTypes(f.lastFrontTransfers, f.lastBackTransfers)
+
+	frontTxs = append(frontTxs, frontTransferTxs...)
+	backTxs = append(backTxs, backTransferTxs...)
+
+	s := &types.CrossBlockSandwich{
+		Sandwich: types.Sandwich{
+			SandwichID:  sandwichId,
+			TokenA:      f.lastTokenA,
+			TokenB:      f.lastTokenB,
+			CrossBlock:  crossBlock,
+			CrossLeader: crossLeader,
+			FrontLeader: frontLeader,
+			BackLeader:  backLeader,
+
+			WindowStartSlot: windowStartSlot,
+			WindowEndSlot:   windowEndSlot,
+			RpcSource:       f.RpcSource,
+
+			Consecutive:       isSandwichConsecutive(f.lastFrontTxEntries, f.lastVictimEntries, f.lastBackTxEntries),
+			FrontConsecutive:  isEntriesConsecutive(f.lastFrontTxEntries, crossBlock),
+			BackConsecutive:   isEntriesConsecutive(f.lastBackTxEntries, crossBlock),
+			VictimConsecutive: isEntriesConsecutive(f.lastVictimEntries, crossBlock),
+
+			SignerSame:             signerSame,
+			OwnerSame:              ownerSame,
+			ATASame:                false, // TODO
+			HasTransfer:            len(frontTransferTxs)+len(backTransferTxs) > 0,
+			HasFrontInlineTransfer: hasFrontInlineTransfer,
+			HasDirectTransfer:      hasDirectTransfer,
+			HasBackInlineTransfer:  hasBackInlineTransfer,
+
+			Perfect:       f.perfect,
+			RelativeDiffB: f.relativeAmtDiffB,
+			ProfitA:       f.profitA,
+
+			MultiFrontRun: len(f.lastFrontTxEntries) > 1,
+			MultiBackRun:  len(f.lastBackTxEntries) > 1,
+			MultiVictim:   len(f.lastVictimEntries) > 1,
+			FrontCount:    uint16(len(frontTxs)),
+			BackCount:     uint16(len(backTxs)),
+			VictimCount:   uint16(len(victimTxs)),
+			AdverseCount:  uint16(len(adverseTxs)),
+			FrontRun:      frontTxs,
+			BackRun:       backTxs,
+			Victims:       victimTxs,
+			Adverse:       adverseTxs,
+		},
+		Slot:      slot,
+		Timestamp: timestamp,
+	}
+	s.MaxSlippageUtilization = computeMaxSlippageUtilization(victimTxs)
+
+	f.Sandwiches = append(f.Sandwiches, s)
+	for _, e := range f.lastFrontTxEntries {
+		f.confirmedSandwichTxIdx[e.TxIdx] = true
+	}
+	for _, e := range f.lastBackTxEntries {
+		f.confirmedSandwichTxIdx[e.TxIdx] = true
+	}
+}
+
+// sandwichSlotSpan returns the min and max slot over all legs of the staged sandwich.
+func (f *SandwichFinder) sandwichSlotSpan() (uint64, uint64) {
+	minSlot, maxSlot := f.lastFrontTxEntries[0].Slot, f.lastFrontTxEntries[0].Slot
+	consider := func(entries []PoolEntry) {
+		for _, e := range entries {
+			if e.Slot < minSlot {
+				minSlot = e.Slot
+			}
+			if e.Slot > maxSlot {
+				maxSlot = e.Slot
+			}
+		}
+	}
+	consider(f.lastFrontTxEntries)
+	consider(f.lastVictimEntries)
+	consider(f.lastBackTxEntries)
+	return minSlot, maxSlot
+}
+
+// makeSandwichTx builds a SandwichTx of the given kind ("frontRun"/"backRun"/"victim"/"adverse").
+func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind string) *types.SandwichTx {
+	orig := f.Txs[entry.TxIdx]
+	stx := &types.SandwichTx{
+		SandwichID:  sandwichId,
+		Transaction: *orig,
+		SandwichTxTokenInfo: types.SandwichTxTokenInfo{
+			FromToken:            entry.IncomeToken,
+			ToToken:              entry.ExpenseToken,
+			FromAmount:           math.Abs(entry.IncomeAmt),
+			ToAmount:             math.Abs(entry.ExpenseAmt),
+			OwnersOfB:            []string{},
+			AttackerPreBalanceB:  0.0,
+			AttackerPostBalanceB: 0.0,
+			PoolPreBalanceB:      orig.GetOwnerPreBalance(entry.PoolAddress, f.lastTokenB),
+			PoolPostBalanceB:     orig.GetOwnerPostBalance(entry.PoolAddress, f.lastTokenB),
+		},
+		InBundle: false,
+		Type:     kind,
+	}
+	switch kind {
+	case "frontRun":
+		for owner, bc := range orig.OwnerBalanceChanges {
+			if bc[f.lastTokenB].TotalAmount > 0 {
+				stx.SandwichTxTokenInfo.OwnersOfB = append(stx.SandwichTxTokenInfo.OwnersOfB, owner)
+				stx.SandwichTxTokenInfo.AttackerPreBalanceB += orig.OwnerPreBalances[owner][f.lastTokenB]
+				stx.SandwichTxTokenInfo.AttackerPostBalanceB += orig.OwnerPostBalances[owner][f.lastTokenB]
+			}
+		}
+	case "backRun":
+		for owner, bc := range orig.OwnerBalanceChanges {
+			if bc[f.lastTokenB].TotalAmount < 0 {
+				stx.SandwichTxTokenInfo.OwnersOfB = append(stx.SandwichTxTokenInfo.OwnersOfB, owner)
+				stx.SandwichTxTokenInfo.AttackerPreBalanceB += orig.OwnerPreBalances[owner][f.lastTokenB]
+				stx.SandwichTxTokenInfo.AttackerPostBalanceB += orig.OwnerPostBalances[owner][f.lastTokenB]
+			}
+		}
+	case "victim":
+		fillVictimSlippage(stx, orig, entry)
+	}
+	return stx
+}

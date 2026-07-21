@@ -23,6 +23,27 @@ var knownAMMPools = NewAMMPoolLRU(config.AMM_POOL_CACHE_SIZE)
 // is a known DEX program. Reduces RPC calls across blocks.
 var accountOwnerCache = NewAccountOwnerLRU(config.ACCOUNT_OWNER_CACHE_SIZE)
 
+// sortedBucketKeys returns the bucket keys in a stable order (pool, incomeToken,
+// expenseToken). Detection claims front/back txs greedily, so the order in which buckets
+// are scanned decides which sandwich wins when txs could serve several — iterating the map
+// directly would make results depend on Go's randomized map order and be irreproducible.
+func sortedBucketKeys(buckets map[PoolKey][]PoolEntry) []PoolKey {
+	keys := make([]PoolKey, 0, len(buckets))
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].PoolAddress != keys[j].PoolAddress {
+			return keys[i].PoolAddress < keys[j].PoolAddress
+		}
+		if keys[i].IncomeToken != keys[j].IncomeToken {
+			return keys[i].IncomeToken < keys[j].IncomeToken
+		}
+		return keys[i].ExpenseToken < keys[j].ExpenseToken
+	})
+	return keys
+}
+
 // unionSigners returns the union of all Signers sets from the given entries.
 // Used to build a comprehensive signer set for multi-front/multi-back comparisons.
 func unionSigners(entries []PoolEntry) MapSet.Set[string] {

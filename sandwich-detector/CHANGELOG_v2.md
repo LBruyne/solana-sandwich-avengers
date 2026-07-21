@@ -54,3 +54,23 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
   from "arbitrage" in logs; not a rejection reason.
 - Verified: `sol/tx_bucket_test.go` — single swap counts as 1 (no over-rejection), two swaps as 2
   (rejected). Existing slippage/sandwich fixtures unchanged.
+
+## Phase 3 — unified finder + deterministic detection (part 1: finder + determinism)
+- **Detection is now reproducible.** v1 iterated the pool-bucket map directly; Go randomizes map
+  order, and because front/back txs are claimed greedily, blocks with overlapping sandwiches
+  produced a DIFFERENT set of sandwiches on each run (verified: v1 in-block gave 38 vs 40 sandwiches
+  on the same block across runs). Both finders now iterate buckets in a stable (pool, incomeToken,
+  expenseToken) order (`sortedBucketKeys`). **Rebuttal note:** the existing v1 headline counts were
+  produced by non-reproducible detection; a v2 re-run is deterministic.
+- **New unified `SandwichFinder`** (`sol/sandwich_finder.go`) over a window = ordered tx sequence +
+  optional slot→leader map. It generalizes the cross-block finder (keys on TxIdx, which equals the
+  block position for a single-slot window) and drops the "front and back must be different slots"
+  restriction, so an in-block sandwich is just the single-slot case. Classifies each sandwich by
+  crossBlock (front/back span >1 slot) and crossLeader (different leaders), and fills
+  frontLeader/backLeader/windowStartSlot/windowEndSlot/rpcSource. Fixes folded in vs v1 in-block:
+  positional logic is TxIdx-based throughout (v1 passed block Position as a slice index into
+  collectDirectTransfers — a latent bug on parse-gapped blocks).
+- Verified: `sol/sandwich_finder_parity_test.go` (env-gated live) — unified finder over a single
+  block == v1 in-block finder (identical sandwichIds) on 5 real archival slots (1–40 sandwiches each).
+- NOT YET WIRED: orchestration still calls the v1 finders; the sliding double-rotation windows,
+  cross-round dedup, and deletion of the v1 finders are part 2 (with Phase 4).
