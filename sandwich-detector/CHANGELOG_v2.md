@@ -38,3 +38,19 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
   (>~9.2e18) to 0; switched to `strconv.ParseUint(_, 10, 64)`.
 - **Archival skipped-slot recognized.** Added the `-32009 "Slot N was skipped, or missing in
   long-term storage"` pattern (confirmed live on Helius) so archival skips aren't retried 12×.
+
+## Phase 2 — swap identification / atomic-arbitrage FP defenses
+- **(a) Reject multi-swap txs.** A clean single swap decodes to exactly one swap instruction; a tx
+  with >1 decodable swap is a multi-hop route or an atomic arbitrage (both legs in one tx) and is
+  dropped at bucketing. This is the primary arb defense: an arb's second pool otherwise mimics a
+  user (spends IncomeToken, receives ExpenseToken matching the first pool) and the tx buckets as a
+  clean swap. Uses the existing DEX decoders (`dex.ExtractSlippage`). **Recall note:** genuine
+  multi-hop aggregator-routed victims are also dropped — they can't be attributed to a single pool
+  anyway, so they were never usable for single-pool sandwich matching.
+- **(b) Swap counterparty must not be a known pool.** The source/sink owner search now skips owners
+  that are labeled/known AMM pools, so a second pool can't be picked as the swap user.
+- **(c) Aggregator labels enabled.** `utils.IsLabeledAggregator` (Jupiter/OKX/DFlow/…, previously
+  loaded but unused) now annotates aggregator-routed txs — used to distinguish "multi-hop route"
+  from "arbitrage" in logs; not a rejection reason.
+- Verified: `sol/tx_bucket_test.go` — single swap counts as 1 (no over-rejection), two swaps as 2
+  (rejected). Existing slippage/sandwich fixtures unchanged.

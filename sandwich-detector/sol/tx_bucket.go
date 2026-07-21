@@ -6,6 +6,7 @@ import (
 	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
+	"sandwich-detector/sol/dex"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
 
@@ -76,6 +77,19 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 			continue
 		}
 		if tx.RelatedPools.Cardinality() == 0 {
+			continue
+		}
+
+		// A clean single swap decodes to exactly one swap instruction. More than one means a
+		// multi-hop route or an atomic arbitrage (both legs in one tx) — neither is attributable
+		// to a single pool, and an arb otherwise masquerades as a clean swap (its second pool
+		// mimics a user spending IncomeToken and receiving ExpenseToken). Drop them.
+		if countDecodableSwaps(tx) > 1 {
+			if isAggregatorRouted(tx) {
+				logger.SolLogger.Debug("Skip multi-hop aggregator-routed swap", "signature", tx.Signature)
+			} else {
+				logger.SolLogger.Debug("Skip multi-swap tx (likely atomic arbitrage)", "signature", tx.Signature)
+			}
 			continue
 		}
 
@@ -152,6 +166,39 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 	}
 
 	return buckets
+}
+
+// countDecodableSwaps counts how many of a tx's DEX instructions decode as swaps.
+// A clean single swap yields exactly one; more indicate a multi-hop route or arbitrage.
+func countDecodableSwaps(tx *types.Transaction) int {
+	n := 0
+	for _, di := range tx.DexInstructions {
+		if dex.ExtractSlippage(di.ProgramID, di.Data) != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// isAggregatorRouted reports whether any top-level program is a known swap aggregator.
+func isAggregatorRouted(tx *types.Transaction) bool {
+	for _, p := range tx.Programs {
+		if utils.IsLabeledAggregator(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isIdentifiedPool reports whether an owner is already known to be an AMM pool
+// (explicitly labeled or resolved via the owner cache). Used to keep the swap
+// counterparty from being selected as the swap user.
+func isIdentifiedPool(owner string) bool {
+	if utils.IsLabeledDexPool(owner) || knownAMMPools.Contains(owner) {
+		return true
+	}
+	isAMM, cached := isAMMByOwner(owner)
+	return cached && isAMM
 }
 
 // identifyAMMPool determines whether a single pool-like participant is an AMM pool.
@@ -254,7 +301,7 @@ func pickUnifiedSwapOwner(tx *types.Transaction, ammPool, incomeToken, expenseTo
 	bestScore := math.MaxFloat64
 
 	for owner, tokenChanges := range tx.OwnerBalanceChanges {
-		if owner == ammPool {
+		if owner == ammPool || isIdentifiedPool(owner) {
 			continue
 		}
 
@@ -291,7 +338,7 @@ func pickClosestOwnerByTokenDelta(tx *types.Transaction, excludedOwner string, t
 	bestDiff := math.MaxFloat64
 
 	for owner, tokenChanges := range tx.OwnerBalanceChanges {
-		if owner == excludedOwner {
+		if owner == excludedOwner || isIdentifiedPool(owner) {
 			continue
 		}
 		ataAmounts, ok := tokenChanges[token]
