@@ -88,14 +88,17 @@ CLICKHOUSE_PASSWORD=
 jito:
   bundles-url: https://bundles.jito.wtf/api/v1/bundles
 sol:
-  rpc: https://solana-mainnet.core.chainstack.com/<your-key>   # primary (live + backfill)
-  rpc-archival:                                                # optional backfill override
+  rpc-chainstack: https://solana-mainnet.core.chainstack.com  # default (live + backfill)
+  rpc-helius: https://mainnet.helius-rpc.com                  # backfill fallback
+  rpc: http://64.130.32.137:8899                              # self-hosted, live fallback
 ```
 
-`sol.rpc` is the primary endpoint for both live and backfill; use an archival,
-rate-limit-friendly RPC (we use Chainstack Core — archival + paid). `sol.rpc-archival`
-optionally overrides the backfill endpoint; if neither is archival, backfill falls back
-to `HELIUS_RPC_API_KEY`. Detection throughput is bounded by RPC quality.
+config.yaml holds **base URLs only** — the API keys live in `.env` (`CHAINSTACK_API_KEY`
+joins `rpc-chainstack` as the URL path; `HELIUS_RPC_API_KEY` joins `rpc-helius` as
+`?api-key=`), so no keyed URL is ever written to config or logs. Resolution order —
+live: Chainstack → self-hosted → Helius; backfill: Chainstack → Helius (the self-hosted
+node keeps only ~6h of ledger and is never used for backfill). Detection throughput is
+bounded by RPC quality.
 
 Detection thresholds, parallelism, and timing intervals are compile-time
 constants in [`config/config.go`](config/config.go); see the [Tuning](#tuning)

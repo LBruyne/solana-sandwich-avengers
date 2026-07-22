@@ -10,8 +10,6 @@ import (
 	"sandwich-detector/logger"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
-
-	"github.com/spf13/viper"
 )
 
 // parseLeaderFromRewards returns the block producer, taken from the Fee reward recipient. It
@@ -85,20 +83,13 @@ func (tb *tokenBucket) close() {
 var rpcLimiter *tokenBucket
 
 // buildArchivalURL resolves the endpoint for historical backfill. It must serve blocks older than
-// the live node's ~few-hour ledger window, so we prefer a dedicated archival RPC, then the primary
-// sol.rpc (Chainstack Core is archival), and finally a Helius endpoint built from HELIUS_RPC_API_KEY.
-// Returns "" when nothing archival is configured.
+// the self-hosted node's ~few-hour ledger window, so only the archival providers qualify:
+// Chainstack (paid default), then Helius. sol.rpc (self-hosted) is never used here.
 func buildArchivalURL() string {
-	if u := viper.GetString("sol.rpc-archival"); u != "" {
+	if u := buildChainstackURL(); u != "" {
 		return u
 	}
-	if u := viper.GetString("sol.rpc"); u != "" {
-		return u
-	}
-	if key := viper.GetString("HELIUS_RPC_API_KEY"); key != "" && key != "YOUR-API-KEY" {
-		return "https://mainnet.helius-rpc.com/?api-key=" + key
-	}
-	return ""
+	return buildHeliusURL()
 }
 
 // rpcHost strips the scheme and path (which may embed an API key) so an endpoint can be logged
@@ -125,7 +116,7 @@ func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
 
 	url := buildArchivalURL()
 	if url == "" {
-		return fmt.Errorf("backfill needs an archival RPC: set sol.rpc (e.g. Chainstack), sol.rpc-archival, or HELIUS_RPC_API_KEY")
+		return fmt.Errorf("backfill needs an archival RPC: set sol.rpc-chainstack + CHAINSTACK_API_KEY, or HELIUS_RPC_API_KEY")
 	}
 	SolanaRpcURL = url
 	FetchRewards = true // resolve leaders from rewards

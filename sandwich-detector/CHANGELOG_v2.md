@@ -169,23 +169,27 @@ The epoch-950 spot-check (3000 slots) confirmed the invariant and refined the sw
   stable bucket order maximizes CORE recall. This ambiguity affects only non-CORE shapes (removed by
   the intent filter) and is an inherent property of greedy sandwich matching, documented here.
 
-## Phase 10 — default RPC is Chainstack (archival, paid)
-- **Primary RPC is now Chainstack Core** (`sol.rpc` in config.yaml), used for BOTH live and backfill.
-  It is archival (serves genesis-to-tip — verified on slots 100M / 300M / 410M) and paid, so backfill
-  no longer needs a Helius-specific endpoint or an aggressive throttle. Measured throughput: ~37–39
-  full-block base64 fetches/sec at 40 concurrency, 0 errors / no 429 — well above the 8-worker fetch
-  pool. (Go's `http` client is not WAF-blocked; only Python-urllib's default User-Agent was — a probe
-  artifact, not a code path.)
-- **Backfill endpoint generalized.** `buildHeliusURL` → `buildArchivalURL`, resolving in order:
-  `sol.rpc-archival` → `sol.rpc` (Chainstack is archival) → Helius from `HELIUS_RPC_API_KEY` (now a
-  fallback only). Renamed config key `sol.rpc-helius` → `sol.rpc-archival`; `GetSolanaRpcURL` uses it
-  as the live fallback. The endpoint is logged host-only so an embedded key is never written to logs.
+## Phase 10 — default RPC is Chainstack (archival, paid); base-URL/key split
+- **Default RPC is now Chainstack Core**, used for BOTH live and backfill. It is archival (serves
+  genesis-to-tip — verified on slots 100M / 300M / 410M) and paid, so backfill no longer needs a
+  Helius-specific endpoint or an aggressive throttle. Measured throughput: ~37–39 full-block base64
+  fetches/sec at 40 concurrency, 0 errors / no 429 — well above the 8-worker fetch pool. (Go's
+  `http` client is not WAF-blocked; only Python-urllib's default User-Agent was — a probe artifact,
+  not a code path.)
+- **Config holds base URLs only; API keys live in .env.** `sol.rpc-chainstack` +
+  `CHAINSTACK_API_KEY` (key = URL path segment), `sol.rpc-helius` + `HELIUS_RPC_API_KEY`
+  (key = `?api-key=`), `sol.rpc` = the self-hosted node. Composed in `buildChainstackURL` /
+  `buildHeliusURL`; no keyed URL is ever written to config, and endpoint log lines are host-only
+  (`rpcHost`).
+- **Resolution order** — live (`GetSolanaRpcURL`): Chainstack → self-hosted `sol.rpc` → Helius.
+  Backfill (`buildArchivalURL`): Chainstack → Helius; the self-hosted node keeps ~6h of ledger and
+  is never picked for backfill. Contract pinned by `TestRpcURLResolution`/`TestRpcHostRedaction`.
 - **`--rps` default is now 0 = no throttle** (a paid RPC absorbs the 8-worker fetch concurrency, and
   CallRpc still backs off on any 429). Set `--rps 10` only on rate-limited tiers (Helius free).
   Removed the now-unused `HELIUS_DEFAULT_BACKFILL_RPS` constant.
 - **rpcSource for backfill rows is now `backfill`** (was `helius`) — a provider-agnostic mode label,
   since backfill and live can both run on Chainstack.
-- Verified end-to-end via the real CLI over 400 archival slots (epoch 950) on Chainstack: 204
+- Verified end-to-end via the real CLI: 400 archival slots (epoch 950) on Chainstack → 204
   sandwiches (3 in-block / 27 same-leader / 174 cross-leader), rpcSource=backfill, 400/400 leaders
-  resolved from rewards, 0 duplicate ids, clean exit, no 429. config.yaml holds the keyed URL and is
-  gitignored; config.example.yaml documents the Chainstack format with a `<your-key>` placeholder.
+  resolved from rewards, 0 duplicate ids, clean exit, no 429; and with CHAINSTACK_API_KEY unset the
+  same command resolves to mainnet.helius-rpc.com (fallback path exercised live).

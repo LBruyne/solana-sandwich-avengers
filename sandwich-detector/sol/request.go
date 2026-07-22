@@ -24,14 +24,45 @@ import (
 
 var SolanaRpcURL string
 
+// GetSolanaRpcURL resolves the RPC endpoint: an explicit override (backfill sets it), then
+// Chainstack (the paid archival default), then the self-hosted node, then Helius.
 func GetSolanaRpcURL() string {
 	if SolanaRpcURL != "" {
 		return SolanaRpcURL
 	}
+	if u := buildChainstackURL(); u != "" {
+		return u
+	}
 	if rpc := viper.GetString("sol.rpc"); rpc != "" {
 		return rpc
 	}
-	return viper.GetString("sol.rpc-archival")
+	return buildHeliusURL()
+}
+
+// buildChainstackURL joins the Chainstack base URL (config sol.rpc-chainstack) with the API key
+// from the environment (.env CHAINSTACK_API_KEY) — the key is the URL path segment, so it lives in
+// .env rather than config.yaml. Returns "" when either half is missing.
+func buildChainstackURL() string {
+	base := viper.GetString("sol.rpc-chainstack")
+	key := viper.GetString("CHAINSTACK_API_KEY")
+	if base == "" || key == "" || key == "YOUR-API-KEY" {
+		return ""
+	}
+	return strings.TrimRight(base, "/") + "/" + key
+}
+
+// buildHeliusURL joins the Helius base URL (config sol.rpc-helius) with the API key from the
+// environment (.env HELIUS_RPC_API_KEY). Returns "" when no key is configured.
+func buildHeliusURL() string {
+	key := viper.GetString("HELIUS_RPC_API_KEY")
+	if key == "" || key == "YOUR-API-KEY" {
+		return ""
+	}
+	base := viper.GetString("sol.rpc-helius")
+	if base == "" {
+		base = "https://mainnet.helius-rpc.com"
+	}
+	return strings.TrimRight(base, "/") + "/?api-key=" + key
 }
 
 type SolanaRpcRequest struct {
