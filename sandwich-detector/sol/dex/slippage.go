@@ -20,9 +20,10 @@ const (
 
 // Slippage analysis constants
 const (
-	SlippageNoProtection = float64(-1) // utilization value when limit is 0 (no slippage protection)
-	SlippageUnsupported  = float64(-2) // utilization value when DEX is not supported
-	SlippageMissingInner = float64(-3) // utilization value when DEX instruction is in innerInstructions but RPC returned null
+	SlippageNoProtection = float64(-1) // limit is effectively unlimited (victim set no slippage bound)
+	SlippageUnsupported  = float64(-2) // DEX has no decoder, so the limit cannot be read
+	SlippageMissingInner = float64(-3) // swap is in innerInstructions but the RPC returned null (data unavailable)
+	SlippageAmbiguous    = float64(-4) // multiple swap instructions in one tx — can't match a limit to this pool
 	LimitTypeInput      = "input"     // max cost limit (e.g., max_sol_cost)
 	LimitTypeOutput     = "output"    // minimum output limit (e.g., minimum_amount_out)
 

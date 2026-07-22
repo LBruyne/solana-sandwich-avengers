@@ -22,8 +22,9 @@ type VictimSlippageResult struct {
 //   - fromToken: token A mint address (SOL or token address)
 //   - toToken: token B mint address
 //
-// Returns nil if no DEX instruction can be decoded, or if multiple decodable
-// instructions exist (multi-swap tx where we can't match instruction to pool).
+// Returns nil if no DEX instruction can be decoded. If multiple decodable instructions exist
+// (multi-swap tx where we can't match instruction to pool) it returns a result carrying the
+// SlippageAmbiguous sentinel.
 func ComputeVictimSlippage(
 	dexInstructions []DexInstructionRef,
 	tokenDecimals map[string]int,
@@ -48,9 +49,10 @@ func ComputeVictimSlippage(
 		return nil
 	}
 	if decodedCount > 1 {
-		// Multiple swap instructions in one tx — treat as no slippage protection
+		// Multiple swap instructions in one tx — we cannot tell which limit binds this pool.
+		// This is "unmeasured", distinct from a victim that genuinely set no protection (-1).
 		return &VictimSlippageResult{
-			Utilization: SlippageNoProtection,
+			Utilization: SlippageAmbiguous,
 		}
 	}
 

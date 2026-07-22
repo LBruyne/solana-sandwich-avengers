@@ -44,25 +44,50 @@ func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry Po
 	stx.SlippageDexName = result.DexName
 }
 
-// computeMaxSlippageUtilization returns the maximum slippage utilization across
-// all victim txs in a sandwich.
+// computeMaxSlippageUtilization summarizes a sandwich by the slippage utilization of its
+// tightest measurable victim.
 //
-// Returns:
-//   - -2 if any victim is Unsupported(-2) or MissingInner(-3): data unavailable
-//   - -1 if ALL victims are NoProtection(-1): consumption concept not applicable
-//   - max of [0,1] values otherwise (victims with protection are the binding constraint)
+//   - If any victim has a real utilization in [0,1], return the maximum — that victim is the
+//     binding constraint and shows how far the attacker pushed the price.
+//   - Otherwise every victim is unmeasured, so return the reason, kept distinct (v2 no longer
+//     collapses MissingInner into Unsupported): MissingInner(-3) > Ambiguous(-4) >
+//     Unsupported(-2) > NoProtection(-1).
 func computeMaxSlippageUtilization(victims []*types.SandwichTx) float64 {
-	maxUtil := -1.0
+	maxReal := -1.0
+	sawReal := false
+	var sawMissingInner, sawAmbiguous, sawUnsupported, sawNoProtection bool
 	for _, v := range victims {
 		if v == nil {
 			continue
 		}
-		if v.SlippageUtilization == dex.SlippageUnsupported || v.SlippageUtilization == dex.SlippageMissingInner {
-			return dex.SlippageUnsupported
-		}
-		if v.SlippageUtilization > maxUtil {
-			maxUtil = v.SlippageUtilization
+		switch u := v.SlippageUtilization; {
+		case u >= 0:
+			sawReal = true
+			if u > maxReal {
+				maxReal = u
+			}
+		case u == dex.SlippageMissingInner:
+			sawMissingInner = true
+		case u == dex.SlippageAmbiguous:
+			sawAmbiguous = true
+		case u == dex.SlippageUnsupported:
+			sawUnsupported = true
+		default: // SlippageNoProtection
+			sawNoProtection = true
 		}
 	}
-	return maxUtil
+	switch {
+	case sawReal:
+		return maxReal
+	case sawMissingInner:
+		return dex.SlippageMissingInner
+	case sawAmbiguous:
+		return dex.SlippageAmbiguous
+	case sawUnsupported:
+		return dex.SlippageUnsupported
+	case sawNoProtection:
+		return dex.SlippageNoProtection
+	default:
+		return dex.SlippageNoProtection
+	}
 }

@@ -112,3 +112,16 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
 - Verified via the real CLI over 16 archival slots on the free tier: 63 sandwiches (21 cross-block,
   1 cross-leader), rpcSource=helius, 16 leaders populated from rewards, cross-leader tagged with
   distinct front/back leaders, 0 duplicate ids, clean exit, no 429 failures.
+
+## Phase 6 — slippage semantics
+- New `SlippageAmbiguous` (-4) sentinel. A victim tx with >1 decodable swap instruction now scores
+  -4 ("can't match a limit to this pool"), distinct from -1 NoProtection (victim genuinely set no
+  bound). (After Phase 2 such txs are usually dropped at bucketing, but the sentinel keeps the
+  meaning honest where they aren't.)
+- Sandwich-level `computeMaxSlippageUtilization` no longer collapses MissingInner(-3) into
+  Unsupported(-2). It now returns the max REAL utilization when any victim has one (the binding
+  victim), and otherwise the specific unmeasured reason (MissingInner > Ambiguous > Unsupported >
+  NoProtection). **Changes vs v1:** a sandwich with a measurable victim plus an unmeasured one now
+  reports the measurable utilization instead of -2; and -3 is preserved instead of being reported
+  as -2. Relevant to any downstream that reads maxSlippageUtilization.
+- (Token-decimals fix that also affects limit conversion was already landed in Phase 1.)
