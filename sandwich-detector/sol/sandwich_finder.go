@@ -28,6 +28,7 @@ type SandwichFinder struct {
 	// Internal states
 	buckets                map[PoolKey][]PoolEntry
 	confirmedSandwichTxIdx map[int]bool // TxIdx confirmed as a front/back leg of some sandwich
+	sameLeaderPass         bool         // when true, cross-leader candidates are deferred to a later pass
 
 	// Last evaluated sandwich, staged by Evaluate and consumed by RecordSandwich.
 	lastTokenA           string
@@ -74,11 +75,27 @@ func (f *SandwichFinder) Find() {
 	}
 	f.buckets = filterAndBuildTxBuckets(f.Txs, true)
 
-	// Scan each (pool, A, B) front bucket against its reverse (pool, B, A) back bucket, in a stable
-	// key order. Front/back txs are claimed greedily (confirmedSandwichTxIdx), so bucket order is
-	// significant when a tx could serve several sandwiches; a stable order keeps detection
-	// reproducible. (A tx can be a front in one direction and a back in the other; which sandwich
-	// wins a contested tx is an inherent ambiguity of greedy matching, resolved by this order.)
+	// Two-tier claiming. Same-leader sandwiches (in-block + same-leader cross-block) are matched
+	// FIRST and claim their front/back legs; only then is cross-leader matching run, on whatever
+	// legs remain. Without this, a coincidental cross-leader match — of which there are far more,
+	// found over wider two-rotation windows — greedily steals a real same-leader sandwich's back-run
+	// (a SELL that a reverse cross-leader match treats as its front), so the real sandwich is lost.
+	// With no leader map every candidate is same-leader, so the second pass adds nothing and
+	// single-slot/in-block behavior is unchanged.
+	f.sameLeaderPass = true
+	f.scanBuckets()
+	if f.LeaderBySlot != nil {
+		f.sameLeaderPass = false
+		f.scanBuckets()
+	}
+}
+
+// scanBuckets scans each (pool, A, B) front bucket against its reverse (pool, B, A) back bucket in a
+// stable key order. Front/back txs are claimed greedily (confirmedSandwichTxIdx), so bucket order is
+// significant when a tx could serve several sandwiches; a stable order keeps detection reproducible.
+// (A tx can be a front in one direction and a back in the other; which sandwich wins a contested tx
+// is an inherent ambiguity of greedy matching, resolved by this order and the same-leader-first tier.)
+func (f *SandwichFinder) scanBuckets() {
 	for _, key := range sortedBucketKeys(f.buckets) {
 		frontTxBucket := f.buckets[key]
 		if len(frontTxBucket) == 0 {
@@ -113,6 +130,17 @@ func (f *SandwichFinder) Find() {
 			f.ResetSandwichState()
 		}
 	}
+}
+
+// stagedIsCrossLeader reports whether the sandwich currently staged in f.last* spans two leaders,
+// using the same rule RecordSandwich applies. Used to defer cross-leader matches to the second tier.
+func (f *SandwichFinder) stagedIsCrossLeader() bool {
+	if f.LeaderBySlot == nil || len(f.lastFrontTxEntries) == 0 || len(f.lastBackTxEntries) == 0 {
+		return false
+	}
+	fl := f.LeaderBySlot[f.lastFrontTxEntries[0].Slot]
+	bl := f.LeaderBySlot[f.lastBackTxEntries[len(f.lastBackTxEntries)-1].Slot]
+	return fl != "" && bl != "" && fl != bl
 }
 
 func (f *SandwichFinder) ResetSandwichState() {
@@ -203,6 +231,12 @@ func (f *SandwichFinder) collectBackTxs(frontTxEntries []PoolEntry, backTxBucket
 		// Small-to-large over the back group as well.
 		for k := 1; k <= len(candidateBackTxEntries); k++ {
 			if f.Evaluate(frontTxEntries, candidateBackTxEntries[:k]) {
+				// In the same-leader tier, defer a cross-leader match so its legs stay available
+				// to any tighter same-leader sandwich; the second pass will pick it up.
+				if f.sameLeaderPass && f.stagedIsCrossLeader() {
+					f.ResetSandwichState()
+					continue
+				}
 				return candidateBackTxEntries[:k]
 			}
 		}
