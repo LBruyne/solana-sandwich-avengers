@@ -264,17 +264,27 @@ func (f *SandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntries []Po
 	}
 	adverseEntries := f.collectAdverseEntries(frontTxEntries, backTxEntries)
 
-	frontInlineTransfers := collectInlineTransfers(frontTxEntries, f.Txs, transferSideFront)
-	backInlineTransfers := collectInlineTransfers(backTxEntries, f.Txs, transferSideBack)
-	frontTransfers := make([]*Transfer, 0, len(frontInlineTransfers)+4)
-	frontTransfers = append(frontTransfers, frontInlineTransfers...)
-	backTransfers := make([]*Transfer, 0, len(backInlineTransfers))
-	backTransfers = append(backTransfers, backInlineTransfers...)
+	// Transfer evidence is only meaningful when the signer CHANGES between front and back — it is
+	// the linkage mechanism of wallet-rotating attackers. For same-signer sandwiches an inferred
+	// inline transfer is routing noise (aggregator hop, owner-inference tolerance), and flagging it
+	// overcounts transfer-style evasion: on v1 epoch-955 data, 1,733 of 2,310 hasTransfer
+	// sandwiches (75%) had signerSame=true. Front inline evidence is further restricted to
+	// transfers that actually land in the back side's owner set — the same criterion
+	// sumFrontInlineBridgeAmount applies to bridge amounts.
+	frontTransfers := make([]*Transfer, 0, 4)
+	backTransfers := make([]*Transfer, 0)
 
 	// Attacker linkage: same signer → confirmed. Otherwise same owner set, else transfer evidence.
 	if !utils.SignersOverlap(frontSigners, backSigners) {
+		frontInlineTransfers := collectInlineTransfers(frontTxEntries, f.Txs, transferSideFront)
+		backTransfers = append(backTransfers, collectInlineTransfers(backTxEntries, f.Txs, transferSideBack)...)
 		ownersOfBInFrtTxs := collectFrontOwnersByToken(frontTxEntries, f.Txs, tokenB)
 		ownersOfBInBckTxs := collectBackOwnersByToken(backTxEntries, f.Txs, tokenB)
+		for _, ev := range frontInlineTransfers {
+			if ev.SinkOwner != "" && ownersOfBInBckTxs.Contains(ev.SinkOwner) {
+				frontTransfers = append(frontTransfers, ev)
+			}
+		}
 		if !ownersOfBInFrtTxs.IsSuperset(ownersOfBInBckTxs) {
 			directFrontTransfers := collectDirectTransfers(
 				f.Txs,
