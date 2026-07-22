@@ -68,22 +68,9 @@ func RunSandwichCmd(startSlot uint64) error {
 		// 	types.PPBlock(b, 5, true)
 		// }
 
-		// Process blocks to find sandwiches over sliding double-rotation windows.
-		logger.SolLogger.Info("Process slot data (start)", "start", startSlot, "num_fetched", len(blocks))
-		timeProcess := time.Now()
-		sandwiches := ProcessBlocksForSandwich(blocks, "live", true)
-		logger.SolLogger.Info("Process slot data (done)", "start", startSlot, "num_sandwiches", len(sandwiches), "process_time", time.Since(timeProcess).String())
-
-		// Save to DB
-		logger.SolLogger.Info("Store sandwiches related information to DB (start)")
-		timeStore := time.Now()
-		if err := StoreSandwichesToDB(ch, sandwiches); err != nil {
-			logger.SolLogger.Error("Failed to store sandwiches to DB", "err", err)
-		}
-		if err := StoreSlotSandwichStatusToDB(ch, blocks, sandwiches); err != nil {
-			logger.SolLogger.Error("Failed to store slot sandwich status to DB", "err", err)
-		}
-		logger.SolLogger.Info("Store sandwiches related information to DB (done)", "store_time", time.Since(timeStore).String())
+		// Process blocks over sliding double-rotation windows and persist. Live streaming defers
+		// the tail rotation so a sandwich straddling the not-yet-fetched next rotation is caught.
+		processAndStore(blocks, "live", true)
 
 		// Update next start slot
 		startSlot += uint64(numToFetch)
@@ -323,6 +310,21 @@ func getSlotLeaderFromDB(slot uint64) (string, error) {
 		return "", fmt.Errorf("QuerySlotLeader failed: %w", err)
 	}
 	return leader, nil
+}
+
+// processAndStore runs windowed detection over the batch and persists the sandwiches and the
+// per-slot status. Shared by the live and backfill runners.
+func processAndStore(blocks types.Blocks, rpcSource string, deferTail bool) {
+	timeProcess := time.Now()
+	sandwiches := ProcessBlocksForSandwich(blocks, rpcSource, deferTail)
+	logger.SolLogger.Info("Processed slot data", "num_blocks", len(blocks), "num_sandwiches", len(sandwiches), "process_time", time.Since(timeProcess).String())
+
+	if err := StoreSandwichesToDB(ch, sandwiches); err != nil {
+		logger.SolLogger.Error("Failed to store sandwiches to DB", "err", err)
+	}
+	if err := StoreSlotSandwichStatusToDB(ch, blocks, sandwiches); err != nil {
+		logger.SolLogger.Error("Failed to store slot sandwich status to DB", "err", err)
+	}
 }
 
 func StoreSandwichesToDB(ch db.Database, sandwiches []*types.CrossBlockSandwich) error {

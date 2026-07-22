@@ -92,5 +92,23 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
 - Backfill mode passes deferTail=false (flush every rotation); live passes true (hold the tail
   rotation until the next batch completes it). rpcSource is threaded through to the stored row.
 - STILL TODO (later phases): OwnerSame currently still uses the raw-delta owner set (fold the
-  Evaluate-set fix in a follow-up); dual-mode CLI + Helius rate-limit (Phase 5); slippage semantics
-  (Phase 6); jito test isolation + broader tests (Phase 7).
+  Evaluate-set fix in a follow-up); slippage semantics (Phase 6); jito test isolation (Phase 7).
+
+## Phase 5 — dual-mode CLI (live vs Helius backfill)
+- `sandwich --mode live|backfill` (default live) with `-e/--end-slot` and `--rps`. Live is
+  unchanged (self-hosted RPC, follows the tip). Backfill scans a bounded [start, end] range against
+  Helius archival and exits cleanly.
+- **Helius endpoint** built from `HELIUS_RPC_API_KEY` (or an explicit `sol.rpc-helius` URL). The key
+  was previously dead config; it is now the backfill endpoint.
+- **Rate limiting**: a dependency-free token bucket throttles all RPC to `--rps` (default 10 for the
+  Helius free tier); HTTP 429 triggers exponential backoff (`RPC_RATE_LIMIT_BACKOFF` → cap) in
+  CallRpc. Live mode is unthrottled.
+- **Leaders from rewards**: backfill sets `getBlock rewards:true` and resolves the slot leader from
+  the Fee reward, seeding the cache and `slot_leaders` — so cross-block/cross-leader detection works
+  on ranges the `slot_leaders` table doesn't yet cover (no separate `leader` run needed).
+- **Failed-slot retry ledger**: slots that fail to fetch (not genuine skips) are collected and
+  retried once at the end, instead of being silently dropped.
+- rpcSource is stored as 'helius' for backfill rows so they're distinguishable from live rows.
+- Verified via the real CLI over 16 archival slots on the free tier: 63 sandwiches (21 cross-block,
+  1 cross-leader), rpcSource=helius, 16 leaders populated from rewards, cross-leader tagged with
+  distinct front/back leaders, 0 duplicate ids, clean exit, no 429 failures.

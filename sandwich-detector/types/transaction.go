@@ -16,6 +16,7 @@ type Block struct {
 	Timestamp    time.Time
 	Txs          []*Transaction
 	ValidTxCount uint64
+	Leader       string // block producer, resolved from the Fee reward when rewards are fetched (backfill)
 }
 
 type Blocks []*Block

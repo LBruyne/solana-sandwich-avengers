@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"sandwich-detector/config"
@@ -61,17 +62,32 @@ func CallRpc(method string, params []interface{}) (interface{}, error) {
 		Params:  params,
 	}
 
-	var resp SolanaRpcResponse
-	err := utils.PostUrlResponseWithRetry(url, req, &resp, config.DefaultRetryTimes, logger.SolLogger)
-	if err != nil {
-		return nil, fmt.Errorf("RPC %s failed: %w", method, err)
-	}
+	backoff := config.RPC_RATE_LIMIT_BACKOFF
+	for {
+		rpcLimiter.acquire() // throttle to the configured RPS in backfill; no-op in live mode
 
-	if resp.Error != nil {
-		return nil, fmt.Errorf("RPC %s returned error: %d %s", method, resp.Error.Code, resp.Error.Message)
+		var resp SolanaRpcResponse
+		err := utils.PostUrlResponseWithRetry(url, req, &resp, config.DefaultRetryTimes, logger.SolLogger)
+		if err != nil {
+			// Throttling (HTTP 429): wait and retry with exponential backoff up to the cap.
+			if isRateLimited(err) && backoff <= config.RPC_RATE_LIMIT_BACKOFF_MAX {
+				logger.SolLogger.Warn("RPC throttled, backing off", "method", method, "backoff", backoff.String())
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return nil, fmt.Errorf("RPC %s failed: %w", method, err)
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("RPC %s returned error: %d %s", method, resp.Error.Code, resp.Error.Message)
+		}
+		return resp.Result, nil
 	}
+}
 
-	return resp.Result, nil
+// isRateLimited reports whether an RPC error was an HTTP 429 (too many requests).
+func isRateLimited(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "status 429")
 }
 
 func GetSlotLeaders(start, limit uint64) (types.SlotLeaders, error) {
@@ -187,6 +203,11 @@ func GetBlocks(startSlot, count uint64) types.Blocks {
 	return blocks
 }
 
+// FetchRewards, when set, requests block rewards so GetBlock can resolve the slot leader
+// (the Fee reward recipient). Backfill turns this on to populate leaders for ranges where the
+// slot_leaders table is empty; live mode leaves it off since getSlotLeaders feeds that table.
+var FetchRewards bool
+
 func GetBlock(slot uint64) (*types.Block, error) {
 	params := []interface{}{
 		slot,
@@ -194,7 +215,7 @@ func GetBlock(slot uint64) (*types.Block, error) {
 			"encoding":                       "base64",
 			"maxSupportedTransactionVersion": 0,
 			"transactionDetails":             "full", // include full txs
-			"rewards":                        false,  // rewards not needed here
+			"rewards":                        FetchRewards,
 			"commitment":                     "finalized",
 		},
 	}
@@ -273,6 +294,7 @@ func GetBlock(slot uint64) (*types.Block, error) {
 		BlockHeight:  height,
 		ValidTxCount: 0,
 		Txs:          make([]*types.Transaction, 0, len(txsData)),
+		Leader:       parseLeaderFromRewards(obj),
 	}
 	// Parse transactions (each item has meta + transaction{ message{...}, signatures... }; message is base64 per our request)
 	for i, txData := range txsData {
