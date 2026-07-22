@@ -434,6 +434,19 @@ func prefetchPoolOwners(txs types.Transactions) {
 			knownAMMPools.Add(addr)
 		}
 	}
+
+	// Negative-cache addresses with no on-chain account (closed ATAs, ephemeral accounts):
+	// they cannot be AMM pools, yet they dominate the candidate set — measured ~98% of
+	// prefetch traffic was re-querying the same null addresses every window. An empty owner
+	// makes isAMMByOwner answer (false, cached). Skipped when the batch errored so unqueried
+	// addresses stay eligible for the next window.
+	if err == nil {
+		for addr := range needed {
+			if _, ok := owners[addr]; !ok {
+				accountOwnerCache.Put(addr, "")
+			}
+		}
+	}
 }
 
 // isAMMByOwner checks the accountOwnerCache to determine if an address is an

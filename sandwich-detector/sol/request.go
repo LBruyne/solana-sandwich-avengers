@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
@@ -82,6 +83,26 @@ type SolanaRpcResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// rpcCallCounts tracks requests per RPC method since process start (one count per
+// send-attempt group; internal transport retries on failure are not counted). Lets a
+// long backfill report its actual RPC usage for quota accounting.
+var rpcCallCounts sync.Map // method -> *atomic.Uint64
+
+func countRpcCall(method string) {
+	c, _ := rpcCallCounts.LoadOrStore(method, new(atomic.Uint64))
+	c.(*atomic.Uint64).Add(1)
+}
+
+// RpcCallCountSnapshot returns the accumulated per-method RPC request counts.
+func RpcCallCountSnapshot() map[string]uint64 {
+	snap := make(map[string]uint64)
+	rpcCallCounts.Range(func(k, v any) bool {
+		snap[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	return snap
+}
+
 func CallRpc(method string, params []interface{}) (interface{}, error) {
 	url := GetSolanaRpcURL()
 
@@ -95,6 +116,7 @@ func CallRpc(method string, params []interface{}) (interface{}, error) {
 	backoff := config.RPC_RATE_LIMIT_BACKOFF
 	for {
 		rpcLimiter.acquire() // throttle to the configured RPS in backfill; no-op in live mode
+		countRpcCall(method)
 
 		var resp SolanaRpcResponse
 		err := utils.PostUrlResponseWithRetry(url, req, &resp, config.DefaultRetryTimes, logger.SolLogger)
@@ -166,7 +188,7 @@ func GetBlocks(startSlot, count uint64) types.Blocks {
 	}
 	endSlot := startSlot + count - 1
 
-	parallel := config.SOL_FETCH_SLOT_DATA_PARALLEL_NUM
+	parallel := FetchParallelism
 	if parallel <= 0 {
 		parallel = 1
 	}
@@ -237,6 +259,10 @@ func GetBlocks(startSlot, count uint64) types.Blocks {
 // (the Fee reward recipient). Backfill turns this on to populate leaders for ranges where the
 // slot_leaders table is empty; live mode leaves it off since getSlotLeaders feeds that table.
 var FetchRewards bool
+
+// FetchParallelism is the worker count GetBlocks uses. Backfill raises it to
+// BACKFILL_FETCH_PARALLEL_NUM (the paid archival RPC absorbs it); live keeps the default.
+var FetchParallelism = config.SOL_FETCH_SLOT_DATA_PARALLEL_NUM
 
 func GetBlock(slot uint64) (*types.Block, error) {
 	params := []interface{}{
@@ -798,10 +824,12 @@ func GetMultipleAccountOwners(addresses []string) (map[string]string, error) {
 		if err != nil {
 			return result, fmt.Errorf("getMultipleAccounts failed: %w", err)
 		}
+		// A malformed-but-200 response (nil result, short value array) must be an ERROR, not
+		// silence: the caller negative-caches addresses missing from the result, so treating a
+		// bad response as authoritative absence would poison the owner cache for a whole batch.
 		if raw == nil {
-			continue
+			return result, fmt.Errorf("getMultipleAccounts returned no result for %d addresses", len(batch))
 		}
-
 		obj, ok := raw.(map[string]any)
 		if !ok {
 			return result, fmt.Errorf("unexpected getMultipleAccounts result type: %T", raw)
@@ -809,6 +837,9 @@ func GetMultipleAccountOwners(addresses []string) (map[string]string, error) {
 		values, ok := obj["value"].([]any)
 		if !ok {
 			return result, fmt.Errorf("unexpected value type: %T", obj["value"])
+		}
+		if len(values) != len(batch) {
+			return result, fmt.Errorf("getMultipleAccounts returned %d values for %d addresses", len(values), len(batch))
 		}
 
 		for i, v := range values {

@@ -193,3 +193,35 @@ The epoch-950 spot-check (3000 slots) confirmed the invariant and refined the sw
   sandwiches (3 in-block / 27 same-leader / 174 cross-leader), rpcSource=backfill, 400/400 leaders
   resolved from rewards, 0 duplicate ids, clean exit, no 429; and with CHAINSTACK_API_KEY unset the
   same command resolves to mainnet.helius-rpc.com (fallback path exercised live).
+
+## Phase 11 — performance: measured, then fixed (3.1x backfill throughput, identical results)
+Benchmark (`sol/perf_bench_test.go`, env-gated PERF_TEST) + E2E timing on 1,600 archival slots,
+all deltas verified against an unchanged sandwich-id set (1,349 = 1,349 on every config).
+- **Negative owner-caching** (tx_bucket.go): getMultipleAccounts omits accounts that do not exist
+  (closed ATAs, ephemeral accounts) — ~98% of prefetch candidates — and they were never cached, so
+  EVERY window re-queried the same null addresses. They are now cached as owner="" (isAMMByOwner
+  answers (false, cached); provably the same "not an AMM" decision, just remembered). Effect:
+  getMultipleAccounts 3,114 → 890 per 1,600 slots (-71%), E2E +43%. Hardened: a malformed-but-200
+  getMultipleAccounts response (nil result / short value array) is an error, never negative-cached.
+- **Backfill batch 32 × 16 fetch workers** (BACKFILL_FETCH_SLOT_NUM/BACKFILL_FETCH_PARALLEL_NUM;
+  live keeps 8/8 via the FetchParallelism package var). A 32-slot batch spans ~8 windows, actually
+  filling the 8-worker window pool (batch 8 yielded ~2), and amortizes per-batch fixed costs.
+  Effect: 15.4 → 34.2 slots/s. Combined with negative caching: **10.8 → 32.8–34.2 slots/s (~3.1x)**.
+- **RPC usage counter** (rpcCallCounts in request.go): per-method request counts logged at backfill
+  completion ("Backfill RPC usage") for quota accounting. Counts attempt-groups; inner transport
+  retries (up to 3 on failures) are not counted — reconcile against provider billing accordingly.
+- **Measured pure-CPU detection cost** (400-slot corpus, zero-RPC-guarded, 5 iterations ±1%):
+  bucketize 3.69 ms/block, full matcher 7.27 ms/block serial, 1.54 ms/block at the production
+  8-worker shape; cross-validated on a June-2026 corpus (3.75 / 5.29 / 1.36). Detection is NOT the
+  bottleneck — fetch is (~36 ms/block at 8 workers; JSON decode into untyped maps dominates its CPU).
+- **Bucketing vs naive linear-scan matcher**: a bucket-free variant of the same greedy algorithm
+  (candidate sets by scanning all swap legs; provably identical output, asserted per iteration) costs
+  only ~1.3–1.6x more matching CPU at today's bucket shape (avg 2.5–2.8 legs/bucket, Σ(K·S)≈330x more
+  scan ops but scans are cheap vs Evaluate). Bucketing's real value is the per-(pool,direction)
+  greedy semantics + bounded worst case on hot pools (max bucket 139–179), not a big constant factor.
+- **Negative results worth remembering**: Chainstack negotiates HTTP/2, so Go multiplexes all
+  workers over one connection — the "MaxIdleConnsPerHost=2 causes TLS churn" hypothesis is moot, and
+  forcing HTTP/1.1 with 32 connections changed nothing (34.4 vs 34.2 slots/s). Reverted.
+- Known remaining headroom (not done): typed JSON decoding of getBlock (est. biggest lever now),
+  fetch/process pipelining (depth-1 prefetch), singleflight on concurrent-window prefetch, negative-
+  cache TTL for live, per-rotation bucket caching (bucketize is only ~3.7 ms/block, low priority).

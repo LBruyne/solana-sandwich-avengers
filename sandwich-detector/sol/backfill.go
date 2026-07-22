@@ -120,6 +120,8 @@ func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
 	}
 	SolanaRpcURL = url
 	FetchRewards = true // resolve leaders from rewards
+	FetchParallelism = config.BACKFILL_FETCH_PARALLEL_NUM
+	defer func() { FetchParallelism = config.SOL_FETCH_SLOT_DATA_PARALLEL_NUM }()
 	// rps <= 0 means no explicit throttle: the paid default RPC (Chainstack) absorbs the 8-worker
 	// fetch concurrency, and CallRpc still backs off on any 429. Set --rps on rate-limited tiers
 	// (e.g. Helius free = 10).
@@ -138,7 +140,7 @@ func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
 	seenSandwichIDs = NewAMMPoolLRU(config.SEEN_SANDWICH_CACHE_SIZE)
 
 	startSlot = utils.AlignSlotToStep(startSlot, config.PER_LEADER_SLOT)
-	step := uint64(config.SOL_FETCH_SLOT_DATA_SLOT_NUM)
+	step := uint64(config.BACKFILL_FETCH_SLOT_NUM)
 
 	var failed []uint64
 	for s := startSlot; s <= endSlot; s += step {
@@ -168,6 +170,17 @@ func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
 		processAndStore(retryBlocks, "backfill", false)
 		logger.SolLogger.Info("Retried failed slots", "recovered", len(retryBlocks), "still_missing", len(failed)-len(retryBlocks))
 	}
+
+	// RPC usage for quota accounting (counts since process start; backfill is the only caller here).
+	usage := RpcCallCountSnapshot()
+	var totalCalls uint64
+	kv := make([]any, 0, len(usage)*2+2)
+	for m, n := range usage {
+		totalCalls += n
+		kv = append(kv, m, n)
+	}
+	kv = append(kv, "total", totalCalls)
+	logger.SolLogger.Info("Backfill RPC usage", kv...)
 
 	logger.SolLogger.Info("Backfill done", "start", startSlot, "end", endSlot)
 	return nil
