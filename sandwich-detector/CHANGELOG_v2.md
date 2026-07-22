@@ -225,3 +225,27 @@ all deltas verified against an unchanged sandwich-id set (1,349 = 1,349 on every
 - Known remaining headroom (not done): typed JSON decoding of getBlock (est. biggest lever now),
   fetch/process pipelining (depth-1 prefetch), singleflight on concurrent-window prefetch, negative-
   cache TTL for live, per-rotation bucket caching (bucketize is only ~3.7 ms/block, low priority).
+
+## Phase 12 — transfer evidence gated on signer change (fix hasTransfer overcount)
+- **Inline-transfer evidence is now collected only when front and back signers do NOT overlap.**
+  Transfer evidence is the linkage mechanism for wallet-rotating attackers; for a same-signer
+  sandwich an inferred inline transfer is routing noise (aggregator hop, owner-inference tolerance).
+  v1 collected it unconditionally, so **1,733 of v1's 2,310 epoch-955 hasTransfer sandwiches (75%)
+  had signerSame=true** — flagged transfer-style evasion where no wallet rotation happened. Front
+  inline evidence is further restricted to transfers landing in the back side's owner set (the same
+  criterion `sumFrontInlineBridgeAmount` already applied to bridge amounts).
+- Label-only change: on 3,000 archival slots the sandwich id set AND every per-sandwich victimCount
+  are identical to the pre-fix run (2,587 = 2,587); hasTransfer∧signerSame went 14 → 0 and
+  signerSame sandwiches now carry zero transfer evidence rows. Pinned by `sol/transfer_gate_test.go`.
+
+## Phase 12b — Meteora DLMM swap_exact_out discriminator fix
+- `meteoraDLMMSwapExactOut` was `[194,203,142,150,137,110,81,94]`, which is **not**
+  `sha256("global:swap_exact_out")[:8]` (`[250,73,101,33,38,207,75,184]`) and matches no known
+  Meteora method — a stale/mistyped constant. DLMM v1 ExactOut swaps therefore never matched and
+  fell through to `SlippageUnsupported` (-2) instead of yielding their `max_in_amount` input limit.
+  `swap_exact_out2` and the price-impact discriminators were already correct.
+- Found by an on-chain slippage audit: 4 agents re-derived 30 victim slippage values from raw
+  instruction bytes (discriminators recomputed via sha256, byte offsets, decimals, utilizations) —
+  **all 30 reproduced to <1.5e-8 relative**; this was the single decoder defect surfaced, and the
+  only >1 utilization was a boundary case (limit == actual). Pinned by `TestMeteoraDLMMDiscriminators`
+  (all six DLMM discriminators vs sha256) and `TestMeteoraDLMMExactOut`.
