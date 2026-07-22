@@ -1,6 +1,8 @@
 package sol
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"math"
 	"sandwich-detector/config"
 	"sandwich-detector/types"
@@ -621,4 +623,42 @@ func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind
 		fillVictimSlippage(stx, orig, entry)
 	}
 	return stx
+}
+
+// makeSandwichID derives a deterministic id from the first front and back signatures.
+func makeSandwichID(frontSig, backSig string) string {
+	h := sha256.Sum256([]byte(frontSig + ":" + backSig))
+	return hex.EncodeToString(h[:])
+}
+
+// isSandwichConsecutive reports whether front, victim and back are back-to-back by position
+// (F_last+1 == V_first and V_last+1 == B_first). Meaningful only within a single slot.
+func isSandwichConsecutive(frontTxs, victimTxs, backTxs []PoolEntry) bool {
+	if len(frontTxs) == 0 || len(victimTxs) == 0 || len(backTxs) == 0 {
+		return false
+	}
+	if frontTxs[len(frontTxs)-1].Position+1 != victimTxs[0].Position {
+		return false
+	}
+	if victimTxs[len(victimTxs)-1].Position+1 != backTxs[0].Position {
+		return false
+	}
+	return true
+}
+
+// isEntriesConsecutive reports whether entries are back-to-back by position. When crossBlock is
+// true they must also share a slot, so a cross-slot group is never consecutive.
+func isEntriesConsecutive(es []PoolEntry, crossBlock bool) bool {
+	if len(es) <= 1 {
+		return true
+	}
+	for i := 1; i < len(es); i++ {
+		if crossBlock && es[i].Slot != es[i-1].Slot {
+			return false
+		}
+		if es[i].Position != es[i-1].Position+1 {
+			return false
+		}
+	}
+	return true
 }

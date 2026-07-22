@@ -484,23 +484,7 @@ func (d *ClickhouseDB) QuerySlotLeader(slot uint64) (string, error) {
 	return leader, nil
 }
 
-func (d *ClickhouseDB) InsertInBlockSandwiches(rows []*types.InBlockSandwich) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO sandwiches")
-	if err != nil {
-		return fmt.Errorf("failed to prepare batch: %w", err)
-	}
-	for _, s := range rows {
-		if err := batch.AppendStruct(s); err != nil {
-			return fmt.Errorf("failed to append struct: %w", err)
-		}
-	}
-	return batch.Send()
-}
-
-func (d *ClickhouseDB) InsertCrossBlockSandwiches(rows []*types.CrossBlockSandwich) error {
+func (d *ClickhouseDB) InsertSandwiches(rows []*types.CrossBlockSandwich) error {
 	if len(rows) == 0 {
 		return nil
 	}

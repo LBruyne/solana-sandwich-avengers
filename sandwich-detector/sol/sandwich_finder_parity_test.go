@@ -10,15 +10,16 @@ import (
 	MapSet "github.com/deckarep/golang-set/v2"
 )
 
-// TestUnifiedFinderInBlockParity checks that the unified SandwichFinder run over a single
-// block finds exactly the same sandwiches as the legacy in-block finder. It is gated on a
-// live RPC (archival, since interesting slots age out of the self-hosted node): set
-// PARITY_RPC=<url> and optionally PARITY_SLOT=<slot>. Any difference is either a real bug
-// or the known Position-vs-TxIdx fix on a parse-gapped block (inspect before dismissing).
-func TestUnifiedFinderInBlockParity(t *testing.T) {
+// TestUnifiedFinderDeterminism checks that the unified finder is reproducible: two runs over the
+// same block must return the identical set of sandwichIds. (Parity against the former in-block
+// finder was validated on real slots before it was removed; the map-order nondeterminism that
+// made v1 irreproducible is fixed by sortedBucketKeys, which this guards against regressing.)
+// Gated on a live RPC (archival, since interesting slots age out of the self-hosted node):
+// set PARITY_RPC=<url> and optionally PARITY_SLOT=<slot>.
+func TestUnifiedFinderDeterminism(t *testing.T) {
 	rpc := os.Getenv("PARITY_RPC")
 	if rpc == "" {
-		t.Skip("set PARITY_RPC (archival URL) to run the in-block parity test")
+		t.Skip("set PARITY_RPC (archival URL) to run the determinism test")
 	}
 	SolanaRpcURL = rpc
 
@@ -34,28 +35,22 @@ func TestUnifiedFinderInBlockParity(t *testing.T) {
 		t.Fatalf("GetBlock(%d): %v", slot, err)
 	}
 
-	legacy := &InBlockSandwichFinder{Txs: blk.Txs, AmountThreshold: config.INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD}
-	legacy.Find()
-	legacyIDs := MapSet.NewSet[string]()
-	for _, s := range legacy.Sandwiches {
-		legacyIDs.Add(s.SandwichID)
-	}
-
-	unified := NewSandwichFinder(blk.Txs, nil, config.INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD, "live", nil)
-	unified.Find()
-	unifiedIDs := MapSet.NewSet[string]()
-	for _, s := range unified.Sandwiches {
-		if s.CrossBlock {
-			t.Errorf("unified finder produced a cross-block sandwich on a single block: %s", s.SandwichID)
-			continue
+	run := func() MapSet.Set[string] {
+		f := NewSandwichFinder(blk.Txs, nil, config.INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD, "live", nil)
+		f.Find()
+		ids := MapSet.NewSet[string]()
+		for _, s := range f.Sandwiches {
+			if s.CrossBlock {
+				t.Errorf("unexpected cross-block sandwich on a single block: %s", s.SandwichID)
+			}
+			ids.Add(s.SandwichID)
 		}
-		unifiedIDs.Add(s.SandwichID)
+		return ids
 	}
 
-	onlyLegacy := legacyIDs.Difference(unifiedIDs)
-	onlyUnified := unifiedIDs.Difference(legacyIDs)
-	t.Logf("slot %d: legacy=%d unified=%d", slot, legacyIDs.Cardinality(), unifiedIDs.Cardinality())
-	if onlyLegacy.Cardinality() != 0 || onlyUnified.Cardinality() != 0 {
-		t.Fatalf("parity mismatch: only-legacy=%v only-unified=%v", onlyLegacy.ToSlice(), onlyUnified.ToSlice())
+	first, second := run(), run()
+	t.Logf("slot %d: %d sandwiches", slot, first.Cardinality())
+	if !first.Equal(second) {
+		t.Fatalf("non-deterministic detection: run1=%v run2=%v", first.ToSlice(), second.ToSlice())
 	}
 }

@@ -6,7 +6,7 @@ import (
 )
 
 // fillVictimSlippage computes slippage utilization for a victim SandwichTx.
-// Used by both InBlockSandwichFinder and CrossBlockSandwichFinder.
+// Used by the unified SandwichFinder for victim legs.
 func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry PoolEntry) {
 	if len(orig.DexInstructions) == 0 {
 		if orig.InnerInstructionsNil {

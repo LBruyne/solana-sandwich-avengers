@@ -344,7 +344,7 @@ func TestSandwichFromJSON(t *testing.T) {
 				t.Logf("file=%s expected=%d got=%d", jsonFile, expected, len(res))
 				if len(res) > 0 {
 					for i, s := range res {
-						types.PPInBlockSandwich(i+1, s)
+						types.PPCrossBlockSandwich(i+1, s)
 					}
 				} else {
 					dumpBucketDebug(txs)

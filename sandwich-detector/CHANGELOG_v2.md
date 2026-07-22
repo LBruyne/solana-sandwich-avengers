@@ -72,5 +72,25 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
   collectDirectTransfers — a latent bug on parse-gapped blocks).
 - Verified: `sol/sandwich_finder_parity_test.go` (env-gated live) — unified finder over a single
   block == v1 in-block finder (identical sandwichIds) on 5 real archival slots (1–40 sandwiches each).
-- NOT YET WIRED: orchestration still calls the v1 finders; the sliding double-rotation windows,
-  cross-round dedup, and deletion of the v1 finders are part 2 (with Phase 4).
+## Phase 3+4 — sliding double-rotation windows, unified orchestration, dedup
+- **Detection now runs over sliding double-rotation windows.** Blocks are grouped into leader
+  rotations (maximal same-leader, slot-adjacent runs); each rotation is paired with its successor
+  `[rot_i, rot_i+1]` (step 1 rotation) and run through the unified finder once. In-block,
+  same-leader cross-block and cross-leader sandwiches all come out of one pass, tagged by
+  CrossBlock/CrossLeader — replacing v1's separate concurrent in-block (per block) and cross-block
+  (per run) passes and the cross-ID duplication between them.
+- **Cross-round dedup (owns the whole guarantee — fact tables are plain MergeTree).** A sandwich is
+  kept only by the window whose LEFT rotation holds its front-run, so an overlapping same-leader
+  sandwich (found in two adjacent windows) is emitted exactly once. A process-wide seen-sandwichId
+  LRU (`SEEN_SANDWICH_CACHE_SIZE`) suppresses re-emission across batches as windows slide. Verified
+  on 32 real archival blocks: 125 sandwiches (65 in-block / 46 same-leader-cross / 14 cross-leader),
+  **0 duplicate ids**, every cross-leader correctly cross-block with distinct known leaders.
+- **Finders unified.** in_block.go and cross_block.go (and their near-duplicate ~1300 lines) are
+  deleted; the single `SandwichFinder` is the only matcher. InBlockSandwich/CrossBlockSandwich
+  collapse to one persisted type (kept the name CrossBlockSandwich; it now carries every variant).
+  DB `InsertInBlockSandwiches`+`InsertCrossBlockSandwiches` collapse to `InsertSandwiches`.
+- Backfill mode passes deferTail=false (flush every rotation); live passes true (hold the tail
+  rotation until the next batch completes it). rpcSource is threaded through to the stored row.
+- STILL TODO (later phases): OwnerSame currently still uses the raw-delta owner set (fold the
+  Evaluate-set fix in a follow-up); dual-mode CLI + Helius rate-limit (Phase 5); slippage semantics
+  (Phase 6); jito test isolation + broader tests (Phase 7).

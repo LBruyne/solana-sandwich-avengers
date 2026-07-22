@@ -73,4 +73,9 @@ const (
 	CROSS_BLOCK_CACHE_SIZE                        = 64
 	SOL_PROCESS_CROSS_BLOCK_SANDWICH_PARALLEL_NUM = 8
 	SOL_PROCESS_CROSS_BLOCK_BUCKETS_PARALLEL_NUM  = 8
+
+	// Sliding double-rotation windows overlap and are re-checked as the frontier advances,
+	// so a sandwich can be re-found across batches. This LRU of recently emitted sandwichIds
+	// suppresses duplicate inserts; it only needs to cover the few rotations near the frontier.
+	SEEN_SANDWICH_CACHE_SIZE = 200000
 )

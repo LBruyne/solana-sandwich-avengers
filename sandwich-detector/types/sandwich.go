@@ -86,13 +86,10 @@ type Sandwich struct {
 	Adverse      []*SandwichTx `ch:"adverseTx" json:"adverseTx"`
 }
 
-// InBlockSandwich is a detected sandwich transaction, that front-run, victim(s) and back-run are all in the same block
-type InBlockSandwich struct {
-	Sandwich
-	Slot      uint64    `ch:"slot" json:"slot"`
-	Timestamp time.Time `ch:"timestamp" json:"timestamp"`
-}
-
+// CrossBlockSandwich is the persisted form of a detected sandwich: the shared Sandwich shape
+// plus the slot/timestamp of its front-run. The name is historical — it now carries every
+// variant (in-block, same-leader cross-block and cross-leader), distinguished by the
+// CrossBlock/CrossLeader fields.
 type CrossBlockSandwich struct {
 	Sandwich
 	Slot      uint64    `ch:"slot" json:"slot"`
@@ -144,27 +141,6 @@ func ppSandwichTxs(kind string, txs []*SandwichTx) {
 			// No extra info for adverse txs
 		}
 	}
-}
-
-// Pretty print an in-block sandwich
-func PPInBlockSandwich(i int, s *InBlockSandwich) {
-	fmt.Printf("==== Sandwich #%d ====\n", i)
-	fmt.Printf("slot=%d time=%s\n", s.Slot, s.Timestamp.Format(time.RFC3339))
-	fmt.Printf("pair: A=%s  B=%s\n", s.TokenA, s.TokenB)
-	fmt.Printf("flags: CrossBlock=%v Consecutive=%v FrontConsec=%v BackConsec=%v VictimConsec=%v\n",
-		s.CrossBlock, s.Consecutive, s.FrontConsecutive, s.BackConsecutive, s.VictimConsecutive)
-	fmt.Printf("multi: Front=%v Back=%v Victim=%v  SignerSame=%v OwnerSame=%v ATASame=%v HasTransfer=%v\n",
-		s.MultiFrontRun, s.MultiBackRun, s.MultiVictim, s.SignerSame, s.OwnerSame, s.ATASame, s.HasTransfer)
-	fmt.Printf("quality: Perfect=%v RelativeDiffB=%.9f ProfitA=%.9f\n",
-		s.Perfect, s.RelativeDiffB, s.ProfitA)
-
-	ppSandwichTxs("FrontRun", s.FrontRun)
-	ppSandwichTxs("Victims", s.Victims)
-	if len(s.Adverse) > 0 {
-		ppSandwichTxs("Adverse", s.Adverse)
-	}
-	ppSandwichTxs("BackRun", s.BackRun)
-	fmt.Println()
 }
 
 func summarizeCrossBlockSpan(s *CrossBlockSandwich) (minSlot, maxSlot uint64, minTime, maxTime time.Time) {

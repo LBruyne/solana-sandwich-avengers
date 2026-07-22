@@ -33,8 +33,7 @@ type Database interface {
 	QuerySlotLeader(slot uint64) (string, error)
 
 	// sandwiches
-	InsertInBlockSandwiches(rows []*types.InBlockSandwich) error
-	InsertCrossBlockSandwiches(rows []*types.CrossBlockSandwich) error
+	InsertSandwiches(rows []*types.CrossBlockSandwich) error
 
 	// sandwich_txs
 	InsertSandwichTxs(sandwichTxs []*types.SandwichTx) error
