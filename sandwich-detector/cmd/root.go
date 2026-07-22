@@ -92,7 +92,7 @@ func init() {
 		&sandwichRPS,
 		"rps",
 		0,
-		fmt.Sprintf("backfill only: max RPC requests/sec (0 = default %d for Helius free tier)", config.HELIUS_DEFAULT_BACKFILL_RPS),
+		"backfill only: max RPC requests/sec (0 = no throttle, fine for paid RPC like Chainstack; set e.g. 10 for rate-limited tiers like Helius free)",
 	)
 
 	RootCmd.AddCommand(&resetCmd, &jitoCmd, &slotCmd, &sandwichCmd)

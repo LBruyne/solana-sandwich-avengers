@@ -84,17 +84,34 @@ func (tb *tokenBucket) close() {
 // rpcLimiter throttles outbound RPC calls (see CallRpc). nil = unlimited (live self-hosted node).
 var rpcLimiter *tokenBucket
 
-// buildHeliusURL resolves the Helius archival endpoint: an explicit Helius URL in config wins,
-// otherwise it is built from HELIUS_RPC_API_KEY. Returns "" when no key is configured.
-func buildHeliusURL() string {
-	if u := viper.GetString("sol.rpc-helius"); u != "" && strings.Contains(u, "helius") {
+// buildArchivalURL resolves the endpoint for historical backfill. It must serve blocks older than
+// the live node's ~few-hour ledger window, so we prefer a dedicated archival RPC, then the primary
+// sol.rpc (Chainstack Core is archival), and finally a Helius endpoint built from HELIUS_RPC_API_KEY.
+// Returns "" when nothing archival is configured.
+func buildArchivalURL() string {
+	if u := viper.GetString("sol.rpc-archival"); u != "" {
 		return u
 	}
-	key := viper.GetString("HELIUS_RPC_API_KEY")
-	if key == "" || key == "YOUR-API-KEY" {
-		return ""
+	if u := viper.GetString("sol.rpc"); u != "" {
+		return u
 	}
-	return "https://mainnet.helius-rpc.com/?api-key=" + key
+	if key := viper.GetString("HELIUS_RPC_API_KEY"); key != "" && key != "YOUR-API-KEY" {
+		return "https://mainnet.helius-rpc.com/?api-key=" + key
+	}
+	return ""
+}
+
+// rpcHost strips the scheme and path (which may embed an API key) so an endpoint can be logged
+// without leaking credentials.
+func rpcHost(url string) string {
+	if i := strings.Index(url, "://"); i >= 0 {
+		rest := url[i+3:]
+		if j := strings.IndexAny(rest, "/?"); j >= 0 {
+			return rest[:j]
+		}
+		return rest
+	}
+	return url
 }
 
 // RunBackfillCmd scans a bounded [startSlot, endSlot] range against Helius archival RPC and
@@ -106,18 +123,21 @@ func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
 		return fmt.Errorf("end slot (%d) must be >= start slot (%d)", endSlot, startSlot)
 	}
 
-	url := buildHeliusURL()
+	url := buildArchivalURL()
 	if url == "" {
-		return fmt.Errorf("backfill needs a Helius endpoint: set HELIUS_RPC_API_KEY or sol.rpc-helius")
+		return fmt.Errorf("backfill needs an archival RPC: set sol.rpc (e.g. Chainstack), sol.rpc-archival, or HELIUS_RPC_API_KEY")
 	}
 	SolanaRpcURL = url
 	FetchRewards = true // resolve leaders from rewards
-	if rps <= 0 {
-		rps = config.HELIUS_DEFAULT_BACKFILL_RPS
+	// rps <= 0 means no explicit throttle: the paid default RPC (Chainstack) absorbs the 8-worker
+	// fetch concurrency, and CallRpc still backs off on any 429. Set --rps on rate-limited tiers
+	// (e.g. Helius free = 10).
+	if rps > 0 {
+		rpcLimiter = newTokenBucket(rps)
+		defer func() { rpcLimiter.close(); rpcLimiter = nil }()
 	}
-	rpcLimiter = newTokenBucket(rps)
-	defer func() { rpcLimiter.close(); rpcLimiter = nil; FetchRewards = false }()
-	logger.SolLogger.Info("Backfill mode", "start", startSlot, "end", endSlot, "rps", rps, "endpoint", "helius")
+	defer func() { FetchRewards = false }()
+	logger.SolLogger.Info("Backfill mode", "start", startSlot, "end", endSlot, "rps", rps, "endpoint", rpcHost(url))
 
 	ch = db.NewClickhouse()
 	defer ch.Close()
@@ -140,7 +160,7 @@ func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
 		populateLeaders(blocks)
 		// Last batch flushes the tail rotation (deferTail=false) so no sandwich is left pending.
 		deferTail := s+n-1 < endSlot
-		processAndStore(blocks, "helius", deferTail)
+		processAndStore(blocks, "backfill", deferTail)
 		logger.SolLogger.Info("Backfill progress", "processed_through", s+n-1, "end", endSlot)
 	}
 
@@ -154,7 +174,7 @@ func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
 			}
 		}
 		populateLeaders(retryBlocks)
-		processAndStore(retryBlocks, "helius", false)
+		processAndStore(retryBlocks, "backfill", false)
 		logger.SolLogger.Info("Retried failed slots", "recovered", len(retryBlocks), "still_missing", len(failed)-len(retryBlocks))
 	}
 

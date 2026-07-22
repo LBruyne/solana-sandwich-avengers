@@ -1,5 +1,12 @@
 jito:
   bundles-url: https://bundles.jito.wtf/api/v1/bundles
 sol:
-  rpc-helius: https://api.mainnet-beta.solana.com
-  rpc: # Replace with your own RPC endpoint, we use http://64.130.32.137:8899
+  # Primary RPC — used for both live detection and historical backfill. Point it at an archival,
+  # rate-limit-friendly endpoint. We use Chainstack Core (archival, paid), e.g.:
+  #   https://solana-mainnet.core.chainstack.com/<your-key>
+  # A self-hosted node (e.g. http://64.130.32.137:8899) works for live but only keeps a few hours
+  # of ledger, so it cannot backfill old ranges.
+  rpc: https://solana-mainnet.core.chainstack.com/<your-key>
+  # Optional dedicated archival endpoint; overrides sol.rpc for backfill when set. Leave empty to
+  # reuse sol.rpc. If neither is archival, backfill falls back to HELIUS_RPC_API_KEY (see .env).
+  rpc-archival:

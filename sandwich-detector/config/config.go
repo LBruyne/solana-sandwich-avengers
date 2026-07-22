@@ -79,8 +79,6 @@ const (
 	// suppresses duplicate inserts; it only needs to cover the few rotations near the frontier.
 	SEEN_SANDWICH_CACHE_SIZE = 200000
 
-	// Default requests/sec for backfill against Helius when --rps is not given (free tier is 10).
-	HELIUS_DEFAULT_BACKFILL_RPS = 10
 	// Extra backoff applied on HTTP 429, doubling per consecutive throttle up to a cap.
 	RPC_RATE_LIMIT_BACKOFF     = 500 * time.Millisecond
 	RPC_RATE_LIMIT_BACKOFF_MAX = 8 * time.Second

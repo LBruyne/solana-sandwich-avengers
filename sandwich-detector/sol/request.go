@@ -28,11 +28,10 @@ func GetSolanaRpcURL() string {
 	if SolanaRpcURL != "" {
 		return SolanaRpcURL
 	}
-	rpc := viper.GetString("sol.rpc")
-	if rpc != "" {
+	if rpc := viper.GetString("sol.rpc"); rpc != "" {
 		return rpc
 	}
-	return viper.GetString("sol.rpc-helius")
+	return viper.GetString("sol.rpc-archival")
 }
 
 type SolanaRpcRequest struct {

@@ -88,12 +88,14 @@ CLICKHOUSE_PASSWORD=
 jito:
   bundles-url: https://bundles.jito.wtf/api/v1/bundles
 sol:
-  rpc-helius: https://api.mainnet-beta.solana.com   # fallback
-  rpc:                                              # primary; required for production
+  rpc: https://solana-mainnet.core.chainstack.com/<your-key>   # primary (live + backfill)
+  rpc-archival:                                                # optional backfill override
 ```
 
-`sol.rpc` is the primary endpoint. `sol.rpc-helius` is the fallback used when
-`sol.rpc` is empty. Detection throughput is bounded by RPC quality.
+`sol.rpc` is the primary endpoint for both live and backfill; use an archival,
+rate-limit-friendly RPC (we use Chainstack Core — archival + paid). `sol.rpc-archival`
+optionally overrides the backfill endpoint; if neither is archival, backfill falls back
+to `HELIUS_RPC_API_KEY`. Detection throughput is bounded by RPC quality.
 
 Detection thresholds, parallelism, and timing intervals are compile-time
 constants in [`config/config.go`](config/config.go); see the [Tuning](#tuning)
