@@ -125,3 +125,14 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
   reports the measurable utilization instead of -2; and -3 is preserved instead of being reported
   as -2. Relevant to any downstream that reads maxSlippageUtilization.
 - (Token-decimals fix that also affects limit conversion was already landed in Phase 1.)
+
+## Phase 8 — cleanup + docs
+- **OwnerSame fix**: the sandwich's `ownerSame` label is now computed from the same owner sets the
+  Evaluate attacker-linkage check uses (collectFront/BackOwnersByToken, honoring inferred
+  sink/source owners), instead of a separate raw-delta owner set — so the label matches the
+  decision that accepted the sandwich. (Label only; does not affect sandwichId or detection.)
+- Removed the ~90-line commented-out JSON `parseTransaction` dead code in request.go.
+- Synced reference DDL: db/create_tables/sandwiches.sql gained the v2 columns; jito_bundles.sql
+  ORDER BY (slot, bundleId).
+- Updated CLAUDE.md (watcher→sandwich-detector, dual-mode commands, unified detection, test gating).
+- KEPT per request: RunJitoCmd2 + the /recent flow.

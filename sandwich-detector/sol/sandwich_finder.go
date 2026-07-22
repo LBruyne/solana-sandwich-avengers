@@ -7,8 +7,6 @@ import (
 	"sandwich-detector/config"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
-
-	MapSet "github.com/deckarep/golang-set/v2"
 )
 
 // SandwichFinder detects sandwiches within a single detection window — an ordered
@@ -475,14 +473,11 @@ func (f *SandwichFinder) RecordSandwich() {
 	allFrontSigners := unionSigners(f.lastFrontTxEntries)
 	allBackSigners := unionSigners(f.lastBackTxEntries)
 	signerSame := utils.SignersOverlap(allFrontSigners, allBackSigners)
-	frontOwners := MapSet.NewSet[string]()
-	backOwners := MapSet.NewSet[string]()
-	for _, frtSTx := range frontTxs {
-		frontOwners.Append(frtSTx.OwnersOfB...)
-	}
-	for _, bckSTx := range backTxs {
-		backOwners.Append(bckSTx.OwnersOfB...)
-	}
+	// OwnerSame uses the SAME owner sets the attacker-linkage check in Evaluate uses
+	// (honoring inferred sink/source owners), so the label matches the decision that
+	// accepted the sandwich.
+	frontOwners := collectFrontOwnersByToken(f.lastFrontTxEntries, f.Txs, f.lastTokenB)
+	backOwners := collectBackOwnersByToken(f.lastBackTxEntries, f.Txs, f.lastTokenB)
 	ownerSame := frontOwners.IsSuperset(backOwners)
 
 	// Classify block/leader span.

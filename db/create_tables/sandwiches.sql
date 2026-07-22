@@ -2,8 +2,14 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
 (
     `sandwichId` String,     -- Hash of frontTx.signature + backTx.signature
     `crossBlock` Bool,
-    `slot` UInt64,           
-    `timestamp` DateTime, 
+    `crossLeader` Bool DEFAULT false,                       -- front and back under different slot leaders (implies crossBlock)
+    `frontLeader` String DEFAULT '',                        -- leader of the first front-run slot
+    `backLeader` String DEFAULT '',                         -- leader of the last back-run slot
+    `windowStartSlot` UInt64 DEFAULT 0,                     -- detection window bounds
+    `windowEndSlot` UInt64 DEFAULT 0,
+    `rpcSource` LowCardinality(String) DEFAULT 'live',      -- 'live' (self-hosted) or 'helius' (backfill)
+    `slot` UInt64,
+    `timestamp` DateTime,
 
     `tokenA` String,
     `tokenB` String,

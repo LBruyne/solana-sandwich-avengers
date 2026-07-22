@@ -8,5 +8,5 @@ CREATE TABLE IF NOT EXISTS solwich.jito_bundles
     `landedTipLamports` UInt64
 )
 ENGINE = MergeTree
-ORDER BY timestamp
+ORDER BY (slot, bundleId)
 SETTINGS index_granularity = 8192
