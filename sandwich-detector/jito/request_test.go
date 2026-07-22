@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"sandwich-detector/logger"
 )
@@ -44,6 +45,8 @@ func TestGetRecentBundles(t *testing.T) {
 	}))
 	defer ts.Close()
 
+	orig := JitoBundleURL
+	defer func() { JitoBundleURL = orig }()
 	JitoBundleURL = ts.URL
 
 	bundles, err := GetRecentBundles(2)
@@ -81,6 +84,8 @@ func TestGetBundlesBySlot(t *testing.T) {
 	}))
 	defer ts.Close()
 
+	orig := JitoBundleURL
+	defer func() { JitoBundleURL = orig }()
 	JitoBundleURL = ts.URL
 
 	bundles, err := GetBundlesBySlot(slot)
@@ -98,9 +103,10 @@ func TestGetBundlesBySlot(t *testing.T) {
 }
 
 func TestGetRecentBundlesRealAPI(t *testing.T) {
-	if JitoBundleURL == "" {
-		t.Skip("JitoBundleURL not configured, skipping real API test")
+	if os.Getenv("JITO_REAL_TEST") == "" {
+		t.Skip("set JITO_REAL_TEST=1 to hit the live Jito API")
 	}
+	JitoBundleURL = "https://bundles.jito.wtf/api/v1/bundles"
 
 	fmt.Println("Testing real /recent API...")
 
@@ -116,11 +122,16 @@ func TestGetRecentBundlesRealAPI(t *testing.T) {
 }
 
 func TestGetBundlesBySlotRealAPI(t *testing.T) {
-	if JitoBundleURL == "" {
-		t.Skip("JitoBundleURL not configured, skipping real API test")
+	if os.Getenv("JITO_REAL_TEST") == "" {
+		t.Skip("set JITO_REAL_TEST=1 to hit the live Jito API")
 	}
+	JitoBundleURL = "https://bundles.jito.wtf/api/v1/bundles"
 
-	slot := uint64(366000000)
+	// A recent slot to stay inside the Jito API's retention window; override with JITO_TEST_SLOT.
+	slot := uint64(418768000)
+	if s := os.Getenv("JITO_TEST_SLOT"); s != "" {
+		fmt.Sscan(s, &slot)
+	}
 	fmt.Println("Testing real /slot API for slot:", slot)
 
 	bundles, err := GetBundlesBySlot(slot)
