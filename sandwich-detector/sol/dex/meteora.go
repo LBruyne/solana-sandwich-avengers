@@ -92,7 +92,7 @@ func decodeMeteoraDBC(data []byte) *SlippageInfo {
 
 // Meteora DLMM additional discriminators
 var (
-	meteoraDLMMSwapExactOut  = [8]byte{194, 203, 142, 150, 137, 110, 81, 94}  // sha256("global:swap_exact_out")[:8]
+	meteoraDLMMSwapExactOut  = [8]byte{250, 73, 101, 33, 38, 207, 75, 184}   // sha256("global:swap_exact_out")[:8]
 	meteoraDLMMSwapExactOut2 = [8]byte{43, 215, 247, 132, 137, 60, 243, 81}   // sha256("global:swap_exact_out2")[:8]
 	meteoraDLMMSwapPriceImp  = [8]byte{56, 173, 230, 208, 173, 228, 156, 205} // sha256("global:swap_with_price_impact")[:8]
 	meteoraDLMMSwapPriceImp2 = [8]byte{74, 98, 192, 214, 177, 51, 75, 51}     // sha256("global:swap_with_price_impact2")[:8]

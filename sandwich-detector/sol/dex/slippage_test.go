@@ -1,6 +1,7 @@
 package dex
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"testing"
 )
@@ -181,6 +182,50 @@ func TestMeteoraDLMMSwap(t *testing.T) {
 	info := ExtractSlippage(MeteoraDLMMProgram, data)
 	if info == nil {
 		t.Fatal("expected non-nil SlippageInfo")
+	}
+	if info.DexName != "meteora_dlmm" {
+		t.Errorf("expected dex name meteora_dlmm, got %s", info.DexName)
+	}
+}
+
+// TestMeteoraDLMMDiscriminators pins every DLMM discriminator to its on-chain Anchor value
+// (sha256("global:<method>")[:8]) so a mistyped constant fails here instead of silently
+// under-decoding real txs to -2. A stale meteoraDLMMSwapExactOut shipped this way once.
+func TestMeteoraDLMMDiscriminators(t *testing.T) {
+	cases := []struct {
+		name string
+		disc [8]byte
+	}{
+		{"swap", meteoraSwapDiscriminator},
+		{"swap2", meteoraSwap2Discriminator},
+		{"swap_exact_out", meteoraDLMMSwapExactOut},
+		{"swap_exact_out2", meteoraDLMMSwapExactOut2},
+		{"swap_with_price_impact", meteoraDLMMSwapPriceImp},
+		{"swap_with_price_impact2", meteoraDLMMSwapPriceImp2},
+	}
+	for _, c := range cases {
+		sum := sha256.Sum256([]byte("global:" + c.name))
+		var want [8]byte
+		copy(want[:], sum[:8])
+		if c.disc != want {
+			t.Errorf("%s discriminator = %v, want %v", c.name, c.disc, want)
+		}
+	}
+}
+
+// TestMeteoraDLMMExactOut confirms swap_exact_out decodes as an INPUT limit (max_in_amount is the
+// first u64) with the corrected discriminator — the regression the on-chain slippage audit found.
+func TestMeteoraDLMMExactOut(t *testing.T) {
+	data := buildAnchorInstruction(meteoraDLMMSwapExactOut, 987654321, 111111)
+	info := ExtractSlippage(MeteoraDLMMProgram, data)
+	if info == nil {
+		t.Fatal("expected non-nil SlippageInfo for swap_exact_out (was under-decoding to -2)")
+	}
+	if info.LimitType != LimitTypeInput {
+		t.Errorf("expected limit type %q, got %q", LimitTypeInput, info.LimitType)
+	}
+	if info.LimitAmount != 987654321 {
+		t.Errorf("expected max_in_amount 987654321, got %d", info.LimitAmount)
 	}
 	if info.DexName != "meteora_dlmm" {
 		t.Errorf("expected dex name meteora_dlmm, got %s", info.DexName)
