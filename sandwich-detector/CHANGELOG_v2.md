@@ -249,3 +249,22 @@ all deltas verified against an unchanged sandwich-id set (1,349 = 1,349 on every
   **all 30 reproduced to <1.5e-8 relative**; this was the single decoder defect surfaced, and the
   only >1 utilization was a boundary case (limit == actual). Pinned by `TestMeteoraDLMMDiscriminators`
   (all six DLMM discriminators vs sha256) and `TestMeteoraDLMMExactOut`.
+
+## Phase 13 — two-tier matching (same-leader claims legs before cross-leader)
+- Cross-leader detection shares one greedy pass with same-leader detection over each two-rotation
+  window. Coincidental cross-leader matches are far more numerous (epoch-955: 434k cross-leader vs
+  64k same-leader) and span wider windows, so they were **stealing real same-leader sandwiches'
+  back-runs**: a SELL that is the back of a buy-front sandwich is also a valid front for a reverse
+  cross-leader match, and whichever (pool, direction) bucket sorts first claimed it.
+- `Find` now runs **two tiers per window**: same-leader sandwiches (in-block + same-leader
+  cross-block) are matched first and claim their legs (`confirmedSandwichTxIdx`), then cross-leader
+  runs on whatever remains. `scanBuckets` is the extracted per-tier loop; `stagedIsCrossLeader`
+  gates tier 1. With no leader map every candidate is same-leader, so single-slot/in-block behavior
+  is unchanged (the parity/determinism tests still pass).
+- **Impact (epoch-955 audit):** of 98 missing CORE (high-intent) sandwiches in the un-tiered run,
+  88 had a leg stolen by a cross-leader match. Validated on a 35k-slot window: 8 of 11 previously
+  missing CORE recovered (all correctly same-leader), **0 regression** on 469 previously-retained
+  CORE, same-leader up / cross-leader down. The 3 residual are same-leader-vs-same-leader direction
+  ambiguity (unrelated to cross-leader; the txs are still detected, just paired differently) — the
+  inherent greedy limit from Phase 9. Pinned by `TestTwoTierSameLeaderWinsContestedBack` (which also
+  asserts the single-pass path still exhibits the bug).
