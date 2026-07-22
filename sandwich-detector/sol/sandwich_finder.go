@@ -74,6 +74,11 @@ func (f *SandwichFinder) Find() {
 	}
 	f.buckets = filterAndBuildTxBuckets(f.Txs, true)
 
+	// Scan each (pool, A, B) front bucket against its reverse (pool, B, A) back bucket, in a stable
+	// key order. Front/back txs are claimed greedily (confirmedSandwichTxIdx), so bucket order is
+	// significant when a tx could serve several sandwiches; a stable order keeps detection
+	// reproducible. (A tx can be a front in one direction and a back in the other; which sandwich
+	// wins a contested tx is an inherent ambiguity of greedy matching, resolved by this order.)
 	for _, key := range sortedBucketKeys(f.buckets) {
 		frontTxBucket := f.buckets[key]
 		if len(frontTxBucket) == 0 {
@@ -125,7 +130,8 @@ func (f *SandwichFinder) collectFrontTxs(seed PoolEntry, frontTxBucket []PoolEnt
 	res := make([]PoolEntry, 0)
 	maxGap := config.SANDWICH_FRONTRUN_MAX_GAP
 
-	if f.confirmedSandwichTxIdx[seed.TxIdx] {
+	// A front leg must be a clean single swap (not a multi-hop route or arbitrage) and unclaimed.
+	if seed.IsMultiSwap || f.confirmedSandwichTxIdx[seed.TxIdx] {
 		return res
 	}
 	if tx := f.Txs[seed.TxIdx]; tx == nil || tx.IsFailed || tx.IsVote {
@@ -144,7 +150,7 @@ func (f *SandwichFinder) collectFrontTxs(seed PoolEntry, frontTxBucket []PoolEnt
 		if entry.TxIdx-lastIdx > maxGap {
 			break
 		}
-		if f.confirmedSandwichTxIdx[entry.TxIdx] || f.Txs[entry.TxIdx] == nil || f.Txs[entry.TxIdx].IsFailed || f.Txs[entry.TxIdx].IsVote {
+		if entry.IsMultiSwap || f.confirmedSandwichTxIdx[entry.TxIdx] || f.Txs[entry.TxIdx] == nil || f.Txs[entry.TxIdx].IsFailed || f.Txs[entry.TxIdx].IsVote {
 			continue
 		}
 		if !utils.SignersOverlap(entry.Signers, signers) {
@@ -167,7 +173,8 @@ func (f *SandwichFinder) collectBackTxs(frontTxEntries []PoolEntry, backTxBucket
 		if startBackEntry.TxIdx <= lastFrontIdx {
 			continue
 		}
-		if f.confirmedSandwichTxIdx[startBackEntry.TxIdx] || f.Txs[startBackEntry.TxIdx] == nil || f.Txs[startBackEntry.TxIdx].IsFailed || f.Txs[startBackEntry.TxIdx].IsVote {
+		// A back leg must be a clean single swap (not a multi-hop route or arbitrage) and unclaimed.
+		if startBackEntry.IsMultiSwap || f.confirmedSandwichTxIdx[startBackEntry.TxIdx] || f.Txs[startBackEntry.TxIdx] == nil || f.Txs[startBackEntry.TxIdx].IsFailed || f.Txs[startBackEntry.TxIdx].IsVote {
 			continue
 		}
 
@@ -183,7 +190,7 @@ func (f *SandwichFinder) collectBackTxs(frontTxEntries []PoolEntry, backTxBucket
 			if backEntry.TxIdx-lastIdx > maxGap {
 				break
 			}
-			if f.confirmedSandwichTxIdx[backEntry.TxIdx] || f.Txs[backEntry.TxIdx] == nil || f.Txs[backEntry.TxIdx].IsFailed || f.Txs[backEntry.TxIdx].IsVote {
+			if backEntry.IsMultiSwap || f.confirmedSandwichTxIdx[backEntry.TxIdx] || f.Txs[backEntry.TxIdx] == nil || f.Txs[backEntry.TxIdx].IsFailed || f.Txs[backEntry.TxIdx].IsVote {
 				continue
 			}
 			if !utils.SignersOverlap(backEntry.Signers, signers) {

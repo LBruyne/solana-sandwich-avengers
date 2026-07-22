@@ -23,10 +23,10 @@ var knownAMMPools = NewAMMPoolLRU(config.AMM_POOL_CACHE_SIZE)
 // is a known DEX program. Reduces RPC calls across blocks.
 var accountOwnerCache = NewAccountOwnerLRU(config.ACCOUNT_OWNER_CACHE_SIZE)
 
-// sortedBucketKeys returns the bucket keys in a stable order (pool, incomeToken,
-// expenseToken). Detection claims front/back txs greedily, so the order in which buckets
-// are scanned decides which sandwich wins when txs could serve several — iterating the map
-// directly would make results depend on Go's randomized map order and be irreproducible.
+// sortedBucketKeys returns the bucket keys in a stable order (pool, incomeToken, expenseToken).
+// Detection claims front/back txs greedily, so the order in which buckets are scanned decides
+// which sandwich wins when txs could serve several — iterating the map directly would make results
+// depend on Go's randomized map order and be irreproducible.
 func sortedBucketKeys(buckets map[PoolKey][]PoolEntry) []PoolKey {
 	keys := make([]PoolKey, 0, len(buckets))
 	for k := range buckets {
@@ -79,6 +79,11 @@ type PoolEntry struct {
 	// HasInlineTransfer is true when SourceOwner and SinkOwner differ.
 	HasInlineTransfer bool
 
+	// IsMultiSwap is true when the tx decodes to more than one swap (a multi-hop route or an
+	// atomic arbitrage). Such a tx may still be a victim through its leg on this pool, but it is
+	// never eligible as a front/back leg — attacker legs are always clean single swaps.
+	IsMultiSwap bool
+
 	// Related pool and token info
 	PoolAddress  string
 	IncomeToken  string
@@ -101,24 +106,17 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 			continue
 		}
 
-		// A clean single swap decodes to exactly one swap instruction. More than one means a
-		// multi-hop route or an atomic arbitrage (both legs in one tx) — neither is attributable
-		// to a single pool, and an arb otherwise masquerades as a clean swap (its second pool
-		// mimics a user spending IncomeToken and receiving ExpenseToken). Drop them.
-		if countDecodableSwaps(tx) > 1 {
-			if isAggregatorRouted(tx) {
-				logger.SolLogger.Debug("Skip multi-hop aggregator-routed swap", "signature", tx.Signature)
-			} else {
-				logger.SolLogger.Debug("Skip multi-swap tx (likely atomic arbitrage)", "signature", tx.Signature)
-			}
-			continue
+		// Identify every AMM pool leg this tx has. A clean swap has exactly one; a multi-hop route
+		// or an atomic arbitrage has several. The tx is bucketed under EACH valid leg so it can be
+		// a VICTIM through whichever leg trades the sandwiched pair — but a tx with more than one
+		// leg (or >1 decodable swap) is marked IsMultiSwap and may never be a front/back attacker
+		// leg (attacker legs are always clean single swaps).
+		type ammLeg struct {
+			pool string
+			amt  types.PoolAmount
 		}
-
-		// Identify the unique AMM pool among all pool-like participants.
-		pools := tx.RelatedPools.ToSlice()
-		ammCandidates := make([]string, 0, 1)
-		ammAmountByPool := make(map[string]types.PoolAmount)
-		for _, pool := range pools {
+		legs := make([]ammLeg, 0, 1)
+		for _, pool := range tx.RelatedPools.ToSlice() {
 			amt, ok := tx.RelatedPoolsInfo[pool]
 			if !ok {
 				continue
@@ -126,45 +124,37 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 			if !identifyAMMPool(tx, pool, amt) {
 				continue
 			}
-			ammCandidates = append(ammCandidates, pool)
-			ammAmountByPool[pool] = amt
-			if len(ammCandidates) > 1 {
-				break
+			if !(amt.IncomeAmt > 0 && amt.ExpenseAmt < 0) {
+				continue
 			}
+			legs = append(legs, ammLeg{pool, amt})
 		}
-
-		// Require exactly one AMM candidate; otherwise this tx is ambiguous.
-		if len(ammCandidates) != 1 {
+		if len(legs) == 0 {
 			continue
 		}
-		ammPool := ammCandidates[0]
-		ammAmt := ammAmountByPool[ammPool]
-		// Validate AMM pool amounts
-		if !(ammAmt.IncomeAmt > 0 && ammAmt.ExpenseAmt < 0) {
-			continue
-		}
-		knownAMMPools.Add(ammPool)
+		isMultiSwap := len(legs) > 1 || countDecodableSwaps(tx) > 1
 
-		// Find source/sink owners by matching token balance changes against AMM amounts. Assume at most one source and one sink owner per transaction, which holds for most cases except some complex multi-hop swaps.
-		sourceOwner, sinkOwner, hasInlineTransfer := inferSwapSourceAndSinkOwner(tx, ammPool, ammAmt)
-
-		// Create bucket entry from AMM pool's perspective
-		key := PoolKey{PoolAddress: ammPool, IncomeToken: ammAmt.IncomeToken, ExpenseToken: ammAmt.ExpenseToken}
-		entry := PoolEntry{
-			TxIdx:             idx,
-			Slot:              tx.Slot,
-			Position:          tx.Position,
-			Signers:           MapSet.NewSet(tx.Signers...),
-			SourceOwner:       sourceOwner,
-			SinkOwner:         sinkOwner,
-			HasInlineTransfer: hasInlineTransfer,
-			PoolAddress:       ammPool,
-			IncomeToken:       ammAmt.IncomeToken,
-			ExpenseToken:      ammAmt.ExpenseToken,
-			IncomeAmt:         ammAmt.IncomeAmt,
-			ExpenseAmt:        ammAmt.ExpenseAmt,
+		for _, leg := range legs {
+			knownAMMPools.Add(leg.pool)
+			// Find source/sink owners by matching token balance changes against the AMM amounts.
+			sourceOwner, sinkOwner, hasInlineTransfer := inferSwapSourceAndSinkOwner(tx, leg.pool, leg.amt)
+			key := PoolKey{PoolAddress: leg.pool, IncomeToken: leg.amt.IncomeToken, ExpenseToken: leg.amt.ExpenseToken}
+			buckets[key] = append(buckets[key], PoolEntry{
+				TxIdx:             idx,
+				Slot:              tx.Slot,
+				Position:          tx.Position,
+				Signers:           MapSet.NewSet(tx.Signers...),
+				SourceOwner:       sourceOwner,
+				SinkOwner:         sinkOwner,
+				HasInlineTransfer: hasInlineTransfer,
+				IsMultiSwap:       isMultiSwap,
+				PoolAddress:       leg.pool,
+				IncomeToken:       leg.amt.IncomeToken,
+				ExpenseToken:      leg.amt.ExpenseToken,
+				IncomeAmt:         leg.amt.IncomeAmt,
+				ExpenseAmt:        leg.amt.ExpenseAmt,
+			})
 		}
-		buckets[key] = append(buckets[key], entry)
 	}
 
 	if crossBlock {
@@ -199,16 +189,6 @@ func countDecodableSwaps(tx *types.Transaction) int {
 		}
 	}
 	return n
-}
-
-// isAggregatorRouted reports whether any top-level program is a known swap aggregator.
-func isAggregatorRouted(tx *types.Transaction) bool {
-	for _, p := range tx.Programs {
-		if utils.IsLabeledAggregator(p) {
-			return true
-		}
-	}
-	return false
 }
 
 // isIdentifiedPool reports whether an owner is already known to be an AMM pool

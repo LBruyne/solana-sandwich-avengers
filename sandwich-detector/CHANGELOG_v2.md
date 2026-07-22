@@ -40,6 +40,9 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
   long-term storage"` pattern (confirmed live on Helius) so archival skips aren't retried 12×.
 
 ## Phase 2 — swap identification / atomic-arbitrage FP defenses
+> **NOTE: (a) and (c) below were SUPERSEDED by Phase 9** — multi-swap txs are no longer dropped at
+> bucketing (that lost real multi-hop victims); instead they are kept as victim candidates but
+> barred from being front/back legs. Defense (b) remains.
 - **(a) Reject multi-swap txs.** A clean single swap decodes to exactly one swap instruction; a tx
   with >1 decodable swap is a multi-hop route or an atomic arbitrage (both legs in one tx) and is
   dropped at bucketing. This is the primary arb defense: an arb's second pool otherwise mimics a
@@ -136,3 +139,28 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
   ORDER BY (slot, bundleId).
 - Updated CLAUDE.md (watcher→sandwich-detector, dual-mode commands, unified detection, test gating).
 - KEPT per request: RunJitoCmd2 + the /recent flow.
+
+## Phase 9 — front/back-vs-victim contract (validation-driven)
+The epoch-950 spot-check (3000 slots) confirmed the invariant and refined the swap/arb contract.
+- **Invariant (unchanged, confirmed correct):** a front/back tx belongs to exactly one sandwich as
+  a front/back (tracked in confirmedSandwichTxIdx, skipped in collectFront/BackTxs); a victim tx may
+  serve many sandwiches (never added to confirmedSandwichTxIdx, not skipped in collectVictimEntries);
+  one tx can be BOTH a front/back of one sandwich AND a victim of others.
+- **Contract:** front/back legs must be clean single swaps; a victim may be any tx (including a
+  multi-hop route or an arbitrage) as long as one of its legs trades the sandwiched (pool, direction).
+- **Change:** bucketing no longer requires exactly one AMM pool. A tx is bucketed under EACH of its
+  identified AMM legs, so a multi-hop/arb tx is a victim candidate on every pool it actually traded.
+  Any tx with >1 leg or >1 decodable swap is marked `PoolEntry.IsMultiSwap` and skipped when
+  selecting front/back seeds — so attacker legs stay clean single swaps and arbitrage can never be a
+  fake front/back, with no balance/fee heuristic. Replaced (and removed) the earlier
+  `isArbLikeFlow`/`isAggregatorRouted` attempt, which an adversarial review showed was evadable
+  (fees/tips are not added back into OwnerBalanceChanges; arb profit can land on a non-signer PDA).
+- **Recall (spot-check):** CORE (high-confidence, intent-classified) attacker recall is 72/73
+  sandwiches and 346/347 victims — the real attacks are captured. The remaining ~7% victim gap vs v1
+  is NOT arb-filtering and NOT multi-hop victims (an early diagnostic that skipped prefetchPoolOwners
+  mis-measured this); it is greedy front/back matching resolving a genuinely ambiguous case
+  differently: a tx that is a SELL can be the back of a buy-front sandwich OR the front of a reverse
+  sell-front sandwich, and the stable bucket-scan order picks one. A global-TxIdx ordering was tried
+  (it recovered some non-CORE real sandwiches) but LOST 12 CORE victims, so it was reverted — the
+  stable bucket order maximizes CORE recall. This ambiguity affects only non-CORE shapes (removed by
+  the intent filter) and is an inherent property of greedy sandwich matching, documented here.
