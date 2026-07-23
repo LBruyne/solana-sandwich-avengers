@@ -191,6 +191,23 @@ func countDecodableSwaps(tx *types.Transaction) int {
 	return n
 }
 
+// frontRunDexProgram returns the program ID of the front-run's single decodable swap instruction,
+// which identifies the sandwiched pool's DEX (the front-run is a clean single swap on that pool).
+// Returns "" when the front-run's DEX has no slippage decoder (humidifi/solfi/proprietary etc.):
+// the sandwiched pool is then undecodable, so a victim's slippage ON THAT POOL is unmeasurable and
+// must not be read off some other decodable pool the victim's route happens to touch.
+func frontRunDexProgram(tx *types.Transaction) string {
+	if tx == nil {
+		return ""
+	}
+	for _, di := range tx.DexInstructions {
+		if dex.ExtractSlippage(di.ProgramID, di.Data) != nil {
+			return di.ProgramID
+		}
+	}
+	return ""
+}
+
 // isIdentifiedPool reports whether an owner is already known to be an AMM pool
 // (explicitly labeled or resolved via the owner cache). Used to keep the swap
 // counterparty from being selected as the swap user.

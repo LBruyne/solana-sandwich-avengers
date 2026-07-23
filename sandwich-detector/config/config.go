@@ -77,6 +77,15 @@ const (
 	JITO_MARK_IN_BUNDLE_PARALLEL_NUM         = 8
 	JITO_MARK_IN_BUNDLE_SAFE_LAG             = uint64(2000) // only check slots at least this far behind the sandwich detection frontier, to ensure cross-block sandwiches are fully written and bundles are correctly fetched
 
+	// A matched front/back tokenB amount below this ui-amount is IEEE-754 residue from balance-delta
+	// summation, not a real trade (aborted-arbitrage / no-op txs that move nothing net leave ~2^-45
+	// dust). dust-vs-dust trivially passes the relativeDiffB match and fabricates phantom sandwiches,
+	// so a match whose larger tokenB side is below this floor is rejected in Evaluate (at match time,
+	// not at bucketing — a bucket-level filter perturbs isMultiSwap and the greedy claim order,
+	// dropping unrelated real sandwiches). Real trades sit at >=1e-6 with a clean empty gap in
+	// [1e-9,1e-6], so this floor drops only residue.
+	SWAP_LEG_DUST_FLOOR = 1e-6
+
 	INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD    = uint(10) // relative threshold between front-run/back-run
 	CROSSBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD = uint(10)
 	SANDWICH_AMOUNT_SOL_TOLERANCE             = 0.1

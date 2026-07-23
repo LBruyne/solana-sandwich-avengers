@@ -277,6 +277,15 @@ func (f *SandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntries []Po
 		}
 	}
 
+	// Reject phantom matches where both matched tokenB amounts are dust (below the floor): these are
+	// IEEE-754 residue from balance-delta summation on aborted-arbitrage / no-op txs that moved
+	// nothing on-chain, and dust≈dust trivially passes HasSimilarAmount. Rejecting here (at match
+	// time, before any leg is staged/claimed) avoids the greedy-claiming cascade a bucket-level
+	// filter would cause; real trades have a meaningful tokenB amount well above the floor.
+	if math.Max(frontAmtB, backAmtB) < config.SWAP_LEG_DUST_FLOOR {
+		return false
+	}
+
 	// frontAmtB should cover backAmtB (SOL tokenB is exempt to tolerate fee noise).
 	if tokenB != utils.SOL && utils.FloatRound(frontAmtB, 3) < utils.FloatRound(backAmtB, 3) {
 		return false
@@ -484,10 +493,14 @@ func (f *SandwichFinder) RecordSandwich() {
 	// that pool). Shared by every leg so sandwich-by-pool distribution can be queried.
 	front0 := f.lastFrontTxEntries[0]
 	poolDex := classifySandwichDex(f.Txs[front0.TxIdx], front0.PoolAddress)
+	// Program that runs the sandwiched pool's swap, from the front-run's clean single swap. Used to
+	// scope victim slippage to the sandwiched pool's DEX (see fillVictimSlippage): "" means that DEX
+	// has no decoder, so victim slippage there is Unsupported rather than borrowed from another leg.
+	sandwichedDexProgram := frontRunDexProgram(f.Txs[front0.TxIdx])
 
 	frontTxs := make([]*types.SandwichTx, 0, len(f.lastFrontTxEntries))
 	for _, fe := range f.lastFrontTxEntries {
-		frontTxs = append(frontTxs, f.makeSandwichTx(sandwichId, fe, "frontRun", poolDex))
+		frontTxs = append(frontTxs, f.makeSandwichTx(sandwichId, fe, "frontRun", poolDex, sandwichedDexProgram))
 	}
 	frontTransferTxs := make([]*types.SandwichTx, 0, len(f.lastFrontTransfers))
 	for _, evidence := range f.lastFrontTransfers {
@@ -497,7 +510,7 @@ func (f *SandwichFinder) RecordSandwich() {
 	}
 	backTxs := make([]*types.SandwichTx, 0, len(f.lastBackTxEntries))
 	for _, be := range f.lastBackTxEntries {
-		backTxs = append(backTxs, f.makeSandwichTx(sandwichId, be, "backRun", poolDex))
+		backTxs = append(backTxs, f.makeSandwichTx(sandwichId, be, "backRun", poolDex, sandwichedDexProgram))
 	}
 	backTransferTxs := make([]*types.SandwichTx, 0, len(f.lastBackTransfers))
 	for _, evidence := range f.lastBackTransfers {
@@ -507,11 +520,11 @@ func (f *SandwichFinder) RecordSandwich() {
 	}
 	victimTxs := make([]*types.SandwichTx, 0, len(f.lastVictimEntries))
 	for _, ve := range f.lastVictimEntries {
-		victimTxs = append(victimTxs, f.makeSandwichTx(sandwichId, ve, "victim", poolDex))
+		victimTxs = append(victimTxs, f.makeSandwichTx(sandwichId, ve, "victim", poolDex, sandwichedDexProgram))
 	}
 	adverseTxs := make([]*types.SandwichTx, 0, len(f.lastAdverseEntries))
 	for _, ae := range f.lastAdverseEntries {
-		adverseTxs = append(adverseTxs, f.makeSandwichTx(sandwichId, ae, "adverse", poolDex))
+		adverseTxs = append(adverseTxs, f.makeSandwichTx(sandwichId, ae, "adverse", poolDex, sandwichedDexProgram))
 	}
 	if len(frontTxs) > 0 {
 		lf := frontTxs[len(frontTxs)-1]
@@ -591,10 +604,14 @@ func (f *SandwichFinder) RecordSandwich() {
 			MultiFrontRun: len(f.lastFrontTxEntries) > 1,
 			MultiBackRun:  len(f.lastBackTxEntries) > 1,
 			MultiVictim:   len(f.lastVictimEntries) > 1,
-			FrontCount:    uint16(len(frontTxs)),
-			BackCount:     uint16(len(backTxs)),
-			VictimCount:   uint16(len(victimTxs)),
-			AdverseCount:  uint16(len(adverseTxs)),
+			// Count the SWAP legs only, not the appended inline-transfer evidence rows: an inline
+			// transfer shares its swap's signature (same transaction), so counting it would
+			// double-count one tx and disagree with MultiFrontRun/MultiBackRun. The transfer rows
+			// remain in sandwich_txs (type='transfer') and are surfaced by the HasTransfer flags.
+			FrontCount:   uint16(len(f.lastFrontTxEntries)),
+			BackCount:    uint16(len(f.lastBackTxEntries)),
+			VictimCount:  uint16(len(victimTxs)),
+			AdverseCount: uint16(len(adverseTxs)),
 			FrontRun:      frontTxs,
 			BackRun:       backTxs,
 			Victims:       victimTxs,
@@ -634,7 +651,7 @@ func (f *SandwichFinder) sandwichSlotSpan() (uint64, uint64) {
 }
 
 // makeSandwichTx builds a SandwichTx of the given kind ("frontRun"/"backRun"/"victim"/"adverse").
-func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind, poolDex string) *types.SandwichTx {
+func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind, poolDex, sandwichedDexProgram string) *types.SandwichTx {
 	orig := f.Txs[entry.TxIdx]
 	stx := &types.SandwichTx{
 		SandwichID:  sandwichId,
@@ -672,7 +689,7 @@ func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind
 			}
 		}
 	case "victim":
-		fillVictimSlippage(stx, orig, entry)
+		fillVictimSlippage(stx, orig, entry, sandwichedDexProgram)
 	}
 	return stx
 }

@@ -7,7 +7,13 @@ import (
 
 // fillVictimSlippage computes slippage utilization for a victim SandwichTx.
 // Used by the unified SandwichFinder for victim legs.
-func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry PoolEntry) {
+//
+// sandwichedDexProgram is the DEX program of the sandwiched pool (from the front-run's clean swap).
+// Slippage is scoped to THAT program's instructions so a multi-hop/aggregator victim's limit is read
+// off the sandwiched pool, never off some other pool its route happens to touch. When the sandwiched
+// pool's DEX has no decoder (sandwichedDexProgram == ""), the victim's protection on that pool is
+// unmeasurable → Unsupported, rather than borrowing a decodable leg from a different pool.
+func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry PoolEntry, sandwichedDexProgram string) {
 	if len(orig.DexInstructions) == 0 {
 		if orig.InnerInstructionsNil {
 			stx.SlippageUtilization = dex.SlippageMissingInner
@@ -16,9 +22,27 @@ func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry Po
 		}
 		return
 	}
-	refs := make([]dex.DexInstructionRef, len(orig.DexInstructions))
-	for i, inst := range orig.DexInstructions {
-		refs[i] = dex.DexInstructionRef{ProgramID: inst.ProgramID, Data: inst.Data}
+	if sandwichedDexProgram == "" {
+		// Sandwiched pool's DEX has no slippage decoder — cannot measure this victim's protection.
+		stx.SlippageUtilization = dex.SlippageUnsupported
+		return
+	}
+	refs := make([]dex.DexInstructionRef, 0, len(orig.DexInstructions))
+	for _, inst := range orig.DexInstructions {
+		if inst.ProgramID != sandwichedDexProgram {
+			continue // only the sandwiched pool's DEX; ignore other legs of a multi-hop route
+		}
+		refs = append(refs, dex.DexInstructionRef{ProgramID: inst.ProgramID, Data: inst.Data})
+	}
+	if len(refs) == 0 {
+		// The sandwiched pool's DEX is decodable in general, but this victim tx carries no visible
+		// instruction on it (e.g. the swap is inside an unavailable CPI) — treat as unmeasurable.
+		if orig.InnerInstructionsNil {
+			stx.SlippageUtilization = dex.SlippageMissingInner
+		} else {
+			stx.SlippageUtilization = dex.SlippageUnsupported
+		}
+		return
 	}
 	result := dex.ComputeVictimSlippage(
 		refs,
