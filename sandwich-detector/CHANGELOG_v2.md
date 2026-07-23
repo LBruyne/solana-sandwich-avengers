@@ -307,6 +307,12 @@ Full backfill of epoch 955 (431,213 slots) vs the v1 `solwich` dataset:
 - Covers all 25 labeled_dex programs incl. proprietary AMMs (solfi/bisonfi/tessera/...); a
   normalized-label fallback means a newly-added labeled DEX is never silently unclassified.
 - Verified on two epoch-955 windows (23,101 and 60,872 victims): **100% classified, 0 unclassified**
-  across every leg type; agrees with `slippageDexName` on all decodable victims; one poolDex per
-  sandwich. Distribution is Meteora DAMM v2-dominated (~77%), then pump.fun / pump.fun AMM, with a
-  long tail of Raydium variants and PropAMMs. Pinned by `sol/pool_dex_test.go`.
+  across every leg type; one poolDex per sandwich. Distribution is Meteora DAMM v2-dominated (~77%),
+  then pump.fun / pump.fun AMM, with a long tail of Raydium variants and PropAMMs. Pinned by
+  `sol/pool_dex_test.go`.
+- **`slippageDexName` merged into `poolDex` and removed.** The slippage-decoder's DEX name was
+  identical to poolDex on 99.96% of victims (differing only for ~0.04% multi-hop victims whose
+  decodable leg wasn't the sandwiched pool), was empty for undecodable/-2/-4 victims, and was never
+  read downstream. `poolDex` is now the single DEX field; the `sandwich_txs.slippageDexName` column
+  and `SandwichTx.SlippageDexName` are gone (`dex.SlippageInfo.DexName` stays as the decoder's
+  self-id, used by dex tests).
