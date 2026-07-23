@@ -27,6 +27,7 @@ var sandwichRPS int
 var notToStdout bool
 var jitoFetchBundleOnly bool
 var jitoSyncInBundle bool
+var jitoFetchAhead bool
 
 func init() {
 
@@ -66,6 +67,13 @@ func init() {
 		"sync-in-bundle",
 		false,
 		"Only sync sandwich inBundle marks",
+	)
+
+	jitoCmd.Flags().BoolVar(
+		&jitoFetchAhead,
+		"fetch-ahead",
+		false,
+		"backfill fetch only: fetch the whole [start,end-slot] range directly instead of trailing the sandwich-detection frontier. Safe for HISTORICAL slots (already Jito-indexed); use to pre-fetch bundles for an epoch range before sandwich detection reaches it. Never use in live mode.",
 	)
 
 	slotCmd.Flags().Uint64VarP(

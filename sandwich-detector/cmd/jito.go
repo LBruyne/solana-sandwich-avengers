@@ -41,14 +41,20 @@ var jitoCmd = cobra.Command{
 			runSyncInBundle = true
 		}
 
+		if jitoFetchAhead && (jitoEnd == 0 || !runFetchBundle) {
+			logger.JitoLogger.Error("--fetch-ahead requires --end-slot > 0 and a fetch task (not --sync-in-bundle)")
+			return
+		}
+
 		logger.JitoLogger.Info(
 			"Running cmd jito",
 			"start_slot", jitoStart,
 			"run_fetch_bundle", runFetchBundle,
 			"run_sync_in_bundle", runSyncInBundle,
+			"fetch_ahead", jitoFetchAhead,
 		)
 
-		if err := jito.RunJitoCmd(jitoStart, jitoEnd, runFetchBundle, runSyncInBundle); err != nil {
+		if err := jito.RunJitoCmd(jitoStart, jitoEnd, runFetchBundle, runSyncInBundle, jitoFetchAhead); err != nil {
 			logger.JitoLogger.Error("Error running Jito command", "error", err)
 		}
 	},

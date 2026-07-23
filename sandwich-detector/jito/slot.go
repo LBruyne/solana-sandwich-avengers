@@ -76,7 +76,7 @@ func fetchSlotsParallel(ch db.Database, slots []uint64, parallel int) (types.Jit
 // When endSlot > 0 the run is BOUNDED (backfill): the fetch task stops once past endSlot and the
 // mark task stops once everything up to endSlot is marked, so RunJitoCmd returns instead of blocking
 // forever. endSlot == 0 keeps the original unbounded (live) behavior.
-func RunJitoCmd(startSlot, endSlot uint64, runFetchBundle bool, runSyncInBundle bool) error {
+func RunJitoCmd(startSlot, endSlot uint64, runFetchBundle bool, runSyncInBundle bool, fetchAhead bool) error {
 	// Initialize db
 	ch := db.NewClickhouse()
 	defer ch.Close()
@@ -118,7 +118,12 @@ func RunJitoCmd(startSlot, endSlot uint64, runFetchBundle bool, runSyncInBundle 
 				}
 				// Refresh the ceiling from the sandwich frontier so we never fetch slots the Jito API
 				// hasn't indexed yet (and, in a bounded run, never past the detected range).
-				if s >= ceiling {
+				// fetch-ahead: for a bounded HISTORICAL range every slot is already Jito-indexed, so
+				// skip the frontier query and fetch straight through to endSlot (used to pre-fetch an
+				// epoch range before sandwich detection reaches it).
+				if fetchAhead {
+					ceiling = endSlot
+				} else if s >= ceiling {
 					maxSw, err := ch.QueryMaxSandwichCheckedSlot()
 					if err != nil {
 						logger.JitoLogger.Error("QueryMaxSandwichCheckedSlot failed", "err", err)
