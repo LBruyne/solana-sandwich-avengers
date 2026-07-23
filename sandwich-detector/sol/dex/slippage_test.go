@@ -249,3 +249,30 @@ func TestTruncatedData(t *testing.T) {
 		t.Error("expected nil for truncated data")
 	}
 }
+
+// TestSlippageOverLimitGuard: utilization is physically <= 1. A small excess (fee/rounding) clamps
+// to 1.0; a gross excess (decoded limit inconsistent with the realized swap, e.g. some pump.fun
+// buys whose max_sol_cost decodes ~100x below the SOL actually paid) reports unmeasured (-2)
+// instead of a spurious >1 value.
+func TestSlippageOverLimitGuard(t *testing.T) {
+	dec := map[string]int{"So11111111111111111111111111111111111111112": 9, "TOK": 6}
+	// input limit (max_sol_cost) = 0.000005 SOL (5000 lamports), actual paid = 0.000478 SOL: gross
+	// over-limit -> unmeasured. buildAnchorInstruction(buy, amount, max_sol_cost).
+	gross := buildAnchorInstruction(pumpFunBuyDiscriminator, 73809250, 5000)
+	if r := ComputeVictimSlippage([]DexInstructionRef{{PumpFunProgram, gross}}, dec,
+		0.000478, 73.8, "So11111111111111111111111111111111111111112", "TOK"); r == nil || r.Utilization != SlippageUnsupported {
+		t.Fatalf("gross over-limit input should be Unsupported, got %+v", r)
+	}
+	// input limit 1.0 SOL, actual 1.03 SOL: within 5% tolerance (fee noise) -> clamp to 1.0.
+	near := buildAnchorInstruction(pumpFunBuyDiscriminator, 1, 1_000_000_000)
+	if r := ComputeVictimSlippage([]DexInstructionRef{{PumpFunProgram, near}}, dec,
+		1.03, 100, "So11111111111111111111111111111111111111112", "TOK"); r == nil || r.Utilization != 1.0 {
+		t.Fatalf("near-boundary input should clamp to 1.0, got %+v", r)
+	}
+	// normal input limit 1.0 SOL, actual 0.9 SOL -> util 0.9 unchanged.
+	norm := buildAnchorInstruction(pumpFunBuyDiscriminator, 1, 1_000_000_000)
+	if r := ComputeVictimSlippage([]DexInstructionRef{{PumpFunProgram, norm}}, dec,
+		0.9, 100, "So11111111111111111111111111111111111111112", "TOK"); r == nil || r.Utilization < 0.89 || r.Utilization > 0.91 {
+		t.Fatalf("normal input util should be ~0.9, got %+v", r)
+	}
+}

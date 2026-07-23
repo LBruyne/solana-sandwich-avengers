@@ -27,6 +27,11 @@ const (
 	LimitTypeInput      = "input"     // max cost limit (e.g., max_sol_cost)
 	LimitTypeOutput     = "output"    // minimum output limit (e.g., minimum_amount_out)
 
+	// slippageOverLimitTolerance bounds how far a computed utilization may exceed 1.0 (fees,
+	// rounding) before the decoded limit is judged inconsistent with the realized swap and the
+	// victim is reported as unmeasured. Utilization is physically capped at 1.0 for a successful swap.
+	slippageOverLimitTolerance = 0.05
+
 	AnchorDiscriminatorLen = 8 // Anchor programs use 8-byte discriminators
 )
 

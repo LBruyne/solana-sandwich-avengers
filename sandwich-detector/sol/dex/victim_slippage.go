@@ -90,6 +90,26 @@ func ComputeVictimSlippage(
 		return nil
 	}
 
+	// Utilization is physically in [0,1]: a successful swap cannot spend more than its max input
+	// or receive less than its min output (the program reverts otherwise). A computed value above
+	// 1 therefore means the decoded limit does not correspond to the realized swap — a small excess
+	// is fee/rounding noise (clamp to the boundary), but a gross excess (seen on some pump.fun buys
+	// whose decoded max_sol_cost is ~100x below the SOL actually paid) is a limit we can't trust, so
+	// report it as unmeasured rather than emit a spurious >1 utilization that would poison
+	// maxSlippageUtilization.
+	if utilization > 1.0+slippageOverLimitTolerance {
+		return &VictimSlippageResult{
+			LimitType:    info.LimitType,
+			LimitAmount:  limitFloat,
+			ActualAmount: actualFloat,
+			Utilization:  SlippageUnsupported,
+			DexName:      info.DexName,
+		}
+	}
+	if utilization > 1.0 {
+		utilization = 1.0
+	}
+
 	return &VictimSlippageResult{
 		LimitType:    info.LimitType,
 		LimitAmount:  limitFloat,
