@@ -294,3 +294,19 @@ Full backfill of epoch 955 (431,213 slots) vs the v1 `solwich` dataset:
   excludes. v2 finds slightly MORE victims than v1 on shared sandwiches (305,199 vs 302,053).
 - **Slippage:** 30/30 victims reproduced from raw bytes to <1.5e-8; distribution 97.8% real,
   1.66% no-protection, 0.11% unsupported, 0.40% ambiguous, 0 anomalies after the >1 guard.
+
+## Phase 14 — poolDex: per-leg exchange classification
+- New `sandwich_txs.poolDex` (LowCardinality String) tags which exchange the sandwiched pool belongs
+  to, on every leg — so sandwich-by-pool distribution is queryable even for victims whose slippage
+  can't be decoded (PropAMM, multi-hop), which `slippageDexName` leaves empty.
+- **Classified from the front-run's DEX instruction**, not the pool account owner: the balance-delta
+  "pool" is often a shared vault authority (Meteora/Raydium pool authorities) whose owner is not a
+  DEX program, so a naive owner lookup left 78% of victims (all Meteora DAMM v2 + Raydium v4/cpmm)
+  unclassified. The front is a clean single swap on the sandwiched pool → exactly one exchange,
+  applied to all legs; owner lookup kept only as a fallback.
+- Covers all 25 labeled_dex programs incl. proprietary AMMs (solfi/bisonfi/tessera/...); a
+  normalized-label fallback means a newly-added labeled DEX is never silently unclassified.
+- Verified on two epoch-955 windows (23,101 and 60,872 victims): **100% classified, 0 unclassified**
+  across every leg type; agrees with `slippageDexName` on all decodable victims; one poolDex per
+  sandwich. Distribution is Meteora DAMM v2-dominated (~77%), then pump.fun / pump.fun AMM, with a
+  long tail of Raydium variants and PropAMMs. Pinned by `sol/pool_dex_test.go`.
