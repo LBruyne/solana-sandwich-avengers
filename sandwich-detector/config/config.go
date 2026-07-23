@@ -34,6 +34,14 @@ const (
 	// Jito bundles by slot
 	JITO_CHECK_SANDWICH_INTERVAL = 5 * time.Second
 	JITO_FETCH_BUNDLE_SAFE_LAG   = uint64(1000) // only fetch bundles for slots at least this far behind the sandwich detection frontier
+	// Jito bundle fetch is one small HTTP GET per slot; serial it manages only ~4 slots/s, so it is
+	// parallelized in batches. The bundles.jito.wtf endpoint is behind Cloudflare, which returns 403
+	// on bursts: measured ~16/s clean at 4 workers, ~32/s with occasional 403 at 8, fully blocked at
+	// 16. 8 keeps close to the sandwich backfill; occasional 403s are cleared by per-batch backoff.
+	JITO_FETCH_PARALLEL_NUM = 8
+	JITO_FETCH_BATCH_NUM    = 256
+	JITO_FETCH_MAX_ATTEMPTS = 6                      // per-batch attempts before a slot is deferred to the final retry pass
+	JITO_FETCH_RETRY_BACKOFF = 2 * time.Second       // initial per-batch backoff on 403/transient errors, doubled each attempt
 
 	SOL_FETCH_SLOT_LEADER_MAX_GAP        = 4000000 // the API can preserve slot-leader data ~0.5 month ago
 	SOL_FETCH_SLOT_LEADER_LIMIT          = 5000
