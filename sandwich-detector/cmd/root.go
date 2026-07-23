@@ -79,7 +79,7 @@ func init() {
 		"mode",
 		"m",
 		"live",
-		"detection mode: 'live' (self-hosted RPC, follows tip) or 'backfill' (Helius archival, bounded range)",
+		"detection mode: 'live' (follows the tip) or 'backfill' (bounded [start,end] range on archival RPC)",
 	)
 	sandwichCmd.Flags().Uint64VarP(
 		&sandwichEnd,

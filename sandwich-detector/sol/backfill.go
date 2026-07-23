@@ -79,7 +79,8 @@ func (tb *tokenBucket) close() {
 	}
 }
 
-// rpcLimiter throttles outbound RPC calls (see CallRpc). nil = unlimited (live self-hosted node).
+// rpcLimiter throttles outbound RPC calls (see CallRpc). nil = unlimited (the default; the paid
+// RPC absorbs the fetch concurrency, and CallRpc still backs off on 429).
 var rpcLimiter *tokenBucket
 
 // buildArchivalURL resolves the endpoint for historical backfill. It must serve blocks older than
@@ -105,8 +106,9 @@ func rpcHost(url string) string {
 	return url
 }
 
-// RunBackfillCmd scans a bounded [startSlot, endSlot] range against Helius archival RPC and
-// exits when done. Unlike the live command it does not follow the tip, resolves leaders from
+// RunBackfillCmd scans a bounded [startSlot, endSlot] range against an archival RPC (Chainstack by
+// default; see buildArchivalURL) and exits when done. Unlike the live command it uses the larger
+// BACKFILL_FETCH_* batch/worker counts, does not follow the tip, resolves leaders from
 // block rewards (so cross-block/cross-leader detection works on ranges the slot_leaders table
 // does not yet cover), rate-limits requests, and retries slots that failed on the first pass.
 func RunBackfillCmd(startSlot, endSlot uint64, rps int) error {
