@@ -209,7 +209,6 @@ func (d *ClickhouseDB) CreateTables() error {
 			slippageLimitAmount Float64 DEFAULT 0,
 			slippageActualAmount Float64 DEFAULT 0,
 			slippageUtilization Float64 DEFAULT -1,
-			slippageDexName String DEFAULT '',
 			poolDex LowCardinality(String) DEFAULT ''
 		)
 		ENGINE = MergeTree

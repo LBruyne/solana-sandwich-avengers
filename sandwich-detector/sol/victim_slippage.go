@@ -41,7 +41,7 @@ func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry Po
 	stx.SlippageLimitAmount = result.LimitAmount
 	stx.SlippageActualAmount = result.ActualAmount
 	stx.SlippageUtilization = result.Utilization
-	stx.SlippageDexName = result.DexName
+	// The DEX is recorded once per sandwich in PoolDex (set in makeSandwichTx), not here.
 }
 
 // computeMaxSlippageUtilization summarizes a sandwich by the slippage utilization of its

@@ -27,12 +27,13 @@ type SandwichTxTokenInfo struct {
 	SlippageLimitAmount  float64 `ch:"slippageLimitAmount"`  // decoded limit value, converted to float64 with decimals
 	SlippageActualAmount float64 `ch:"slippageActualAmount"` // actual cost or output from balance deltas
 	SlippageUtilization  float64 `ch:"slippageUtilization"`  // ratio 0-1 (closer to 1 = tighter fit), -1 = unavailable
-	SlippageDexName      string  `ch:"slippageDexName"`      // DEX name from slippage decode (empty for -2/-4 victims)
 
-	// PoolDex classifies the exchange the tx's pool belongs to, resolved from the pool account's
-	// owner program — set for every leg (front/back/victim/adverse) regardless of slippage
-	// decodability, so sandwich-by-pool distribution can be queried. "" only when the owner is
-	// unresolved. Includes proprietary AMMs (solfi/bisonfi/...) that have no slippage decoder.
+	// PoolDex classifies the exchange the tx's pool belongs to, resolved from the front-run's DEX
+	// instruction — set for every leg (front/back/victim/adverse) regardless of slippage
+	// decodability, so sandwich-by-pool distribution can be queried. It is the single DEX field
+	// (it subsumed the former slippage-decoder-derived slippageDexName, which was 99.96% identical
+	// but empty for undecodable/-2/-4 victims). "" only when the exchange can't be resolved.
+	// Includes proprietary AMMs (solfi/bisonfi/...) that have no slippage decoder.
 	PoolDex string `ch:"poolDex"`
 }
 
