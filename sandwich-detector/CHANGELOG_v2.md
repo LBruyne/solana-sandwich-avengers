@@ -42,7 +42,11 @@ v1 behaviors were bugs; v2 fixes them, which will shift some outputs.
 ## Phase 2 — swap identification / atomic-arbitrage FP defenses
 > **NOTE: (a) and (c) below were SUPERSEDED by Phase 9** — multi-swap txs are no longer dropped at
 > bucketing (that lost real multi-hop victims); instead they are kept as victim candidates but
-> barred from being front/back legs. Defense (b) remains.
+> barred from being front/back legs. Defense (b) remains. `utils.IsLabeledAggregator` (from (c)) is
+> still defined but has no call sites (the isAggregatorRouted annotation was removed in Phase 9), so
+> the `labeled_aggregators` list is currently unused — kept only as reference documentation of which
+> programs are routers/aggregators (relevant because they are deliberately NOT in `labeled_dex`, so
+> the poolDex/slippage classifiers see through them to the inner AMM swap).
 - **(a) Reject multi-swap txs.** A clean single swap decodes to exactly one swap instruction; a tx
   with >1 decodable swap is a multi-hop route or an atomic arbitrage (both legs in one tx) and is
   dropped at bucketing. This is the primary arb defense: an arb's second pool otherwise mimics a

@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
     `backLeader` String DEFAULT '',                         -- leader of the last back-run slot
     `windowStartSlot` UInt64 DEFAULT 0,                     -- detection window bounds
     `windowEndSlot` UInt64 DEFAULT 0,
-    `rpcSource` LowCardinality(String) DEFAULT 'live',      -- 'live' (self-hosted) or 'helius' (backfill)
+    `rpcSource` LowCardinality(String) DEFAULT 'live',      -- 'live' (live loop) or 'backfill' (backfill run)
     `slot` UInt64,
     `timestamp` DateTime,
 
