@@ -13,25 +13,37 @@ import (
 )
 
 // RunJitoCmd fetches Jito bundles by slot starting from startSlot, and stores them in the database. Also scan sandwichTxs to mark inBundle.
-func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) error {
+// When endSlot > 0 the run is BOUNDED (backfill): the fetch task stops once past endSlot and the
+// mark task stops once everything up to endSlot is marked, so RunJitoCmd returns instead of blocking
+// forever. endSlot == 0 keeps the original unbounded (live) behavior.
+func RunJitoCmd(startSlot, endSlot uint64, runFetchBundle bool, runSyncInBundle bool) error {
 	// Initialize db
 	ch := db.NewClickhouse()
 	defer ch.Close()
 
 	startSlot = utils.AlignSlotToStep(startSlot, config.PER_LEADER_SLOT)
 
-	logger.JitoLogger.Info("Starting Jito bundle fetcher", "start_slot", startSlot)
+	logger.JitoLogger.Info("Starting Jito bundle fetcher", "start_slot", startSlot, "end_slot", endSlot)
+
+	var runWg sync.WaitGroup
 
 	// Task 1: fetch bundles by slot, from startSlot
 	if runFetchBundle {
+		runWg.Add(1)
 		go func(start uint64) {
+			defer runWg.Done()
 			s := start
 			var ceiling uint64 // max slot we are allowed to fetch (sandwich frontier - safe lag)
 			for {
+				if endSlot > 0 && s > endSlot {
+					logger.JitoLogger.Info("Fetch reached end slot, stopping", "slot", s, "end_slot", endSlot)
+					return
+				}
 				// Check if slot s has already been fetched
 				n, err := ch.QuerySlotBundleBySlot(s)
 				if err != nil {
 					logger.JitoLogger.Error("QuerySlotBundleBySlot failed", "slot", s, "err", err)
+					time.Sleep(config.JITO_CHECK_SANDWICH_INTERVAL)
 					continue
 				}
 
@@ -64,6 +76,7 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 				bundles, err := GetBundlesBySlot(s)
 				if err != nil {
 					logger.JitoLogger.Error("GetBundlesBySlot failed", "slot", s, "err", err)
+					time.Sleep(config.JITO_CHECK_SANDWICH_INTERVAL)
 					continue
 				}
 
@@ -113,7 +126,28 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 
 	// Task 2: scan sandwich txs to mark inBundle
 	if runSyncInBundle {
+		runWg.Add(1)
 		go func() {
+			defer runWg.Done()
+			// delete-after-mark bookkeeping: highest epoch whose jito_bundles partition has been dropped.
+			epochOf := func(slot uint64) uint64 { return slot / 432000 }
+			lastDroppedEpoch := epochOf(startSlot) // epoch containing startSlot has not been dropped yet
+			if lastDroppedEpoch > 0 {
+				lastDroppedEpoch-- // so the first fully-marked epoch (>= start epoch) can be dropped
+			}
+			dropThrough := func(epoch uint64) { // drop all epoch partitions in (lastDroppedEpoch, epoch]
+				for e := lastDroppedEpoch + 1; e <= epoch; e++ {
+					if err := ch.DropJitoBundlesEpochPartition(e); err != nil {
+						logger.JitoLogger.Warn("DropJitoBundlesEpochPartition failed", "epoch", e, "err", err)
+					} else {
+						logger.JitoLogger.Info("Dropped jito_bundles epoch partition (delete-after-mark)", "epoch", e)
+					}
+				}
+				if epoch > lastDroppedEpoch {
+					lastDroppedEpoch = epoch
+				}
+			}
+
 			for {
 				// Find the first (oldest) slot in sandwich_txs, that has already checked sandwich, but not yet checked inBundle and bundles have been fetched.
 				slots, err := ch.QuerySlotsToCheckInBundle(config.JITO_MARK_IN_BUNDLE_SLOT_NUM, config.JITO_MARK_IN_BUNDLE_SAFE_LAG)
@@ -123,6 +157,17 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 					continue
 				}
 				if len(slots) == 0 || slots[0] < config.MIN_START_SLOT {
+					// Bounded run: terminate once the sandwich backfill has advanced past
+					// endSlot + mark safe-lag (so every slot <= endSlot is within the mark gate)
+					// and nothing is left to mark. Drop any remaining marked epochs first.
+					if endSlot > 0 {
+						maxSw, mErr := ch.QueryMaxSandwichCheckedSlot()
+						if mErr == nil && maxSw >= endSlot+config.JITO_MARK_IN_BUNDLE_SAFE_LAG {
+							dropThrough(epochOf(endSlot))
+							logger.JitoLogger.Info("Mark reached end slot, all marked, stopping", "end_slot", endSlot, "max_sandwich", maxSw)
+							return
+						}
+					}
 					logger.JitoLogger.Info("No slot needs sandwich check, sleep and retry", "sleep", config.JITO_MARK_IN_BUNDLE_SANDWICH_TX_INTERVAL.String())
 					time.Sleep(config.JITO_MARK_IN_BUNDLE_SANDWICH_TX_INTERVAL)
 					continue
@@ -189,11 +234,23 @@ func RunJitoCmd(startSlot uint64, runFetchBundle bool, runSyncInBundle bool) err
 					continue
 				}
 				logger.JitoLogger.Info("Finished batch check", "start_slot", slots[0], "end_slot", slots[len(slots)-1], "num_slots", len(slots))
+
+				// delete-after-mark: every epoch strictly below the one we just marked into is now
+				// fully checked (marking is ascending and gated behind the fetch frontier), so its
+				// raw bundles can be dropped. Fetch is always >= JITO_FETCH_BUNDLE_SAFE_LAG slots
+				// ahead, so this never races the fetch task writing higher epochs.
+				markedEpoch := epochOf(slots[len(slots)-1])
+				if markedEpoch > 0 {
+					dropThrough(markedEpoch - 1)
+				}
 			}
 		}()
 	}
 
-	select {}
+	// Bounded run (endSlot>0): return when both tasks finish. Unbounded (live, endSlot==0): the
+	// goroutines loop forever, so this blocks like the original select{}.
+	runWg.Wait()
+	return nil
 }
 
 func intersectTxs(txsA, txsB []string) []string {

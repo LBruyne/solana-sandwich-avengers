@@ -20,6 +20,7 @@ type Database interface {
 
 	// slot_bundles
 	InsertSlotBundles(statuses []*types.SlotBundlesStatus) error
+	DropJitoBundlesEpochPartition(epoch uint64) error // delete-after-mark: drop one epoch's jito_bundles partition
 	QuerySlotBundleBySlot(slot uint64) (uint64, error)
 	QueryEarliestAndLatestBundleSlot() (uint64, uint64, bool, error)
 

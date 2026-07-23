@@ -48,7 +48,7 @@ var jitoCmd = cobra.Command{
 			"run_sync_in_bundle", runSyncInBundle,
 		)
 
-		if err := jito.RunJitoCmd(jitoStart, runFetchBundle, runSyncInBundle); err != nil {
+		if err := jito.RunJitoCmd(jitoStart, jitoEnd, runFetchBundle, runSyncInBundle); err != nil {
 			logger.JitoLogger.Error("Error running Jito command", "error", err)
 		}
 	},

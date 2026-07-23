@@ -42,5 +42,6 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
     `maxSlippageUtilization` Float64 DEFAULT 0  -- Max slippage utilization across all victims (0-1)
 )
 ENGINE = MergeTree
+PARTITION BY intDiv(slot, 432000)   -- one partition per epoch (enables delete-after-mark DROP PARTITION + confines slot-keyed mutations)
 ORDER BY (slot, timestamp, sandwichId)
 SETTINGS index_granularity = 8192;

@@ -84,6 +84,7 @@ func (d *ClickhouseDB) CreateTables() error {
 			landedTipLamports UInt64
 		)
 		ENGINE = MergeTree
+		PARTITION BY intDiv(slot, 432000)
 		ORDER BY (slot, bundleId)
 		SETTINGS index_granularity = 8192`,
 
@@ -95,6 +96,7 @@ func (d *ClickhouseDB) CreateTables() error {
 			bundleTxCount UInt64
 		)
 		ENGINE = ReplacingMergeTree
+		PARTITION BY intDiv(slot, 432000)
 		PRIMARY KEY slot
 		ORDER BY slot
 		SETTINGS index_granularity = 8192`,
@@ -105,6 +107,7 @@ func (d *ClickhouseDB) CreateTables() error {
 			leader String
 		)
 		ENGINE = ReplacingMergeTree
+		PARTITION BY intDiv(slot, 432000)
 		PRIMARY KEY slot
 		ORDER BY slot
 		SETTINGS index_granularity = 8192`,
@@ -122,6 +125,7 @@ func (d *ClickhouseDB) CreateTables() error {
 			sandwichInBundleChecked Bool
 		)
 		ENGINE = ReplacingMergeTree
+		PARTITION BY intDiv(slot, 432000)
 		PRIMARY KEY slot
 		ORDER BY slot
 		SETTINGS index_granularity = 8192`,
@@ -170,6 +174,7 @@ func (d *ClickhouseDB) CreateTables() error {
 			maxSlippageUtilization Float64 DEFAULT 0
 		)
 		ENGINE = MergeTree
+		PARTITION BY intDiv(slot, 432000)
 		ORDER BY (slot, timestamp, sandwichId)
 		SETTINGS index_granularity = 8192`,
 
@@ -212,6 +217,7 @@ func (d *ClickhouseDB) CreateTables() error {
 			poolDex LowCardinality(String) DEFAULT ''
 		)
 		ENGINE = MergeTree
+		PARTITION BY intDiv(slot, 432000)
 		ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)
 		SETTINGS index_granularity = 8192`,
 	}
@@ -388,6 +394,20 @@ func (d *ClickhouseDB) InsertSlotBundles(statuses []*types.SlotBundlesStatus) er
 		}
 	}
 	return batch.Send()
+}
+
+// DropJitoBundlesEpochPartition removes one epoch's rows from jito_bundles by dropping its
+// partition (jito_bundles is PARTITION BY intDiv(slot, 432000)). This is the delete-after-mark
+// cleanup: once every slot in an epoch has had its sandwich txs inBundle-checked, the raw bundles
+// are no longer needed (the result lives in sandwich_txs.inBundle and the per-slot summary in
+// slot_bundles). A partition drop is metadata-only — far cheaper than row-level ALTER DELETE.
+func (d *ClickhouseDB) DropJitoBundlesEpochPartition(epoch uint64) error {
+	// Partition id is the intDiv(slot,432000) value = the epoch number.
+	q := fmt.Sprintf("ALTER TABLE jito_bundles DROP PARTITION %d", epoch)
+	if err := d.conn.Exec(context.Background(), q); err != nil {
+		return fmt.Errorf("failed to drop jito_bundles partition %d: %w", epoch, err)
+	}
+	return nil
 }
 
 func (d *ClickhouseDB) QuerySlotBundleBySlot(slot uint64) (uint64, error) {

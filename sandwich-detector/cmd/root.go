@@ -18,6 +18,7 @@ var RootCmd = &cobra.Command{
 
 // Flags
 var jitoStart uint64
+var jitoEnd uint64
 var slotStart uint64
 var sandwichStart uint64
 var sandwichEnd uint64
@@ -43,6 +44,14 @@ func init() {
 		"s",
 		0,
 		fmt.Sprintf("(Optional) starting slot number (>=%d)", config.MIN_START_SLOT),
+	)
+
+	jitoCmd.Flags().Uint64VarP(
+		&jitoEnd,
+		"end-slot",
+		"e",
+		0,
+		"(Optional) last slot to process; >0 bounds the run (backfill): fetch/mark stop and the process exits when done. 0 = run forever (live). Run the sandwich backfill to end-slot + JITO_MARK_IN_BUNDLE_SAFE_LAG so mark can reach end-slot.",
 	)
 
 	jitoCmd.Flags().BoolVar(

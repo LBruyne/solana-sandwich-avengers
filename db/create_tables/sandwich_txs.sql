@@ -43,5 +43,6 @@ CREATE TABLE IF NOT EXISTS solwich.sandwich_txs
     `poolDex` LowCardinality(String) DEFAULT ''
 )
 ENGINE = MergeTree
+PARTITION BY intDiv(slot, 432000)   -- one partition per epoch (enables delete-after-mark DROP PARTITION + confines slot-keyed mutations)
 ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)
 SETTINGS index_granularity = 8192;
