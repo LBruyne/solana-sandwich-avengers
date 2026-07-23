@@ -480,9 +480,14 @@ func (f *SandwichFinder) RecordSandwich() {
 
 	sandwichId := makeSandwichID(f.Txs[f.lastFrontTxEntries[0].TxIdx].Signature, f.Txs[f.lastBackTxEntries[0].TxIdx].Signature)
 
+	// The exchange the sandwiched pool belongs to, read from the front-run (a clean single swap on
+	// that pool). Shared by every leg so sandwich-by-pool distribution can be queried.
+	front0 := f.lastFrontTxEntries[0]
+	poolDex := classifySandwichDex(f.Txs[front0.TxIdx], front0.PoolAddress)
+
 	frontTxs := make([]*types.SandwichTx, 0, len(f.lastFrontTxEntries))
 	for _, fe := range f.lastFrontTxEntries {
-		frontTxs = append(frontTxs, f.makeSandwichTx(sandwichId, fe, "frontRun"))
+		frontTxs = append(frontTxs, f.makeSandwichTx(sandwichId, fe, "frontRun", poolDex))
 	}
 	frontTransferTxs := make([]*types.SandwichTx, 0, len(f.lastFrontTransfers))
 	for _, evidence := range f.lastFrontTransfers {
@@ -492,7 +497,7 @@ func (f *SandwichFinder) RecordSandwich() {
 	}
 	backTxs := make([]*types.SandwichTx, 0, len(f.lastBackTxEntries))
 	for _, be := range f.lastBackTxEntries {
-		backTxs = append(backTxs, f.makeSandwichTx(sandwichId, be, "backRun"))
+		backTxs = append(backTxs, f.makeSandwichTx(sandwichId, be, "backRun", poolDex))
 	}
 	backTransferTxs := make([]*types.SandwichTx, 0, len(f.lastBackTransfers))
 	for _, evidence := range f.lastBackTransfers {
@@ -502,11 +507,11 @@ func (f *SandwichFinder) RecordSandwich() {
 	}
 	victimTxs := make([]*types.SandwichTx, 0, len(f.lastVictimEntries))
 	for _, ve := range f.lastVictimEntries {
-		victimTxs = append(victimTxs, f.makeSandwichTx(sandwichId, ve, "victim"))
+		victimTxs = append(victimTxs, f.makeSandwichTx(sandwichId, ve, "victim", poolDex))
 	}
 	adverseTxs := make([]*types.SandwichTx, 0, len(f.lastAdverseEntries))
 	for _, ae := range f.lastAdverseEntries {
-		adverseTxs = append(adverseTxs, f.makeSandwichTx(sandwichId, ae, "adverse"))
+		adverseTxs = append(adverseTxs, f.makeSandwichTx(sandwichId, ae, "adverse", poolDex))
 	}
 	if len(frontTxs) > 0 {
 		lf := frontTxs[len(frontTxs)-1]
@@ -629,7 +634,7 @@ func (f *SandwichFinder) sandwichSlotSpan() (uint64, uint64) {
 }
 
 // makeSandwichTx builds a SandwichTx of the given kind ("frontRun"/"backRun"/"victim"/"adverse").
-func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind string) *types.SandwichTx {
+func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind, poolDex string) *types.SandwichTx {
 	orig := f.Txs[entry.TxIdx]
 	stx := &types.SandwichTx{
 		SandwichID:  sandwichId,
@@ -644,6 +649,7 @@ func (f *SandwichFinder) makeSandwichTx(sandwichId string, entry PoolEntry, kind
 			AttackerPostBalanceB: 0.0,
 			PoolPreBalanceB:      orig.GetOwnerPreBalance(entry.PoolAddress, f.lastTokenB),
 			PoolPostBalanceB:     orig.GetOwnerPostBalance(entry.PoolAddress, f.lastTokenB),
+			PoolDex:              poolDex,
 		},
 		InBundle: false,
 		Type:     kind,

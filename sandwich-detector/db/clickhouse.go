@@ -209,7 +209,8 @@ func (d *ClickhouseDB) CreateTables() error {
 			slippageLimitAmount Float64 DEFAULT 0,
 			slippageActualAmount Float64 DEFAULT 0,
 			slippageUtilization Float64 DEFAULT -1,
-			slippageDexName String DEFAULT ''
+			slippageDexName String DEFAULT '',
+			poolDex LowCardinality(String) DEFAULT ''
 		)
 		ENGINE = MergeTree
 		ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)
@@ -232,6 +233,7 @@ func (d *ClickhouseDB) CreateTables() error {
 		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS windowStartSlot UInt64 DEFAULT 0`,
 		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS windowEndSlot UInt64 DEFAULT 0`,
 		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS rpcSource LowCardinality(String) DEFAULT 'live'`,
+		`ALTER TABLE sandwich_txs ADD COLUMN IF NOT EXISTS poolDex LowCardinality(String) DEFAULT ''`,
 	}
 	for _, q := range alterQueries {
 		if err := d.conn.Exec(context.Background(), q); err != nil {
