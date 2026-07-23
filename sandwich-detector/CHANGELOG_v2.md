@@ -268,3 +268,29 @@ all deltas verified against an unchanged sandwich-id set (1,349 = 1,349 on every
   ambiguity (unrelated to cross-leader; the txs are still detected, just paired differently) — the
   inherent greedy limit from Phase 9. Pinned by `TestTwoTierSameLeaderWinsContestedBack` (which also
   asserts the single-pass path still exhibits the bug).
+
+## Phase 13b — slippage utilization capped at 1.0 (non-physical >1 guard)
+- A successful swap cannot spend more than its max input or receive less than its min output, so
+  victim slippage utilization is physically in [0,1]. An on-chain audit found 282 victims (0.008%)
+  with util > 1, up to **95x** — traced to 264 pump.fun `buy` victims whose decoded `max_sol_cost`
+  is ~100x below the SOL actually paid to the bonding curve (limit 5,015 lamports vs 477,964 paid,
+  on a tx that succeeded). The actual-amount measurement is correct; the decoded limit simply does
+  not bind the realized swap (a variant we don't fully model).
+- `ComputeVictimSlippage` now caps utilization: within 5% over 1.0 (fee/rounding) clamps to 1.0; a
+  gross excess returns `SlippageUnsupported` (-2) rather than a spurious value that would poison
+  `maxSlippageUtilization`. Post-fix the epoch-955 victim distribution has zero >1 values. Pinned by
+  `TestSlippageOverLimitGuard`.
+
+## Epoch-955 full-run audit (validation of Phases 12–13b)
+Full backfill of epoch 955 (431,213 slots) vs the v1 `solwich` dataset:
+- **Variants:** 495,057 sandwiches = 430,321 cross-leader (a NEW variant — 0 overlap with v1) +
+  64,736 same-leader (8,353 in-block + 56,383 same-leader cross-block); 2,191 multi-front/back.
+- **Transfer:** 7,934 hasTransfer, **all** with a signer change (0 same-signer, per Phase 12).
+- **CORE (302 high-intent attackers) retention: 4,270 / 4,288 = 99.58%** (was 97.7% before the
+  two-tier fix); **all 126 active CORE attackers keep sandwiches** (none fully lost). The 18 residual
+  are same-leader direction ambiguity — every leg is still detected, just paired differently.
+- **v1-only (15,595, all non-CORE):** avg 1.96 victims vs 4.7 for shared; spot-checked as multi-swap
+  route/arb txs paired as front/back by v1, which v2's clean-swap contract (Phase 9) correctly
+  excludes. v2 finds slightly MORE victims than v1 on shared sandwiches (305,199 vs 302,053).
+- **Slippage:** 30/30 victims reproduced from raw bytes to <1.5e-8; distribution 97.8% real,
+  1.66% no-protection, 0.11% unsupported, 0.40% ambiguous, 0 anomalies after the >1 guard.
