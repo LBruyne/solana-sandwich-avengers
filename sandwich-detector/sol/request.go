@@ -40,6 +40,27 @@ func GetSolanaRpcURL() string {
 	return buildHeliusURL()
 }
 
+// AccountRpcURL overrides the endpoint for current-state account queries (getMultipleAccounts).
+var AccountRpcURL string
+
+// GetAccountRpcURL resolves the endpoint for CURRENT-STATE account queries (getMultipleAccounts owner
+// lookups). getMultipleAccounts is slot-independent, so it does NOT need the archival endpoint; it
+// uses the self-hosted node (sol.rpc) — fast, free, unmetered — falling back to Helius, then the main
+// archival URL. This avoids the archival provider's getMultipleAccounts method-throttling that stalls
+// a sustained backfill.
+func GetAccountRpcURL() string {
+	if AccountRpcURL != "" {
+		return AccountRpcURL
+	}
+	if rpc := viper.GetString("sol.rpc"); rpc != "" {
+		return rpc
+	}
+	if u := buildHeliusURL(); u != "" {
+		return u
+	}
+	return GetSolanaRpcURL()
+}
+
 // buildChainstackURL joins the Chainstack base URL (config sol.rpc-chainstack) with the API key
 // from the environment (.env CHAINSTACK_API_KEY) — the key is the URL path segment, so it lives in
 // .env rather than config.yaml. Returns "" when either half is missing.
@@ -104,8 +125,14 @@ func RpcCallCountSnapshot() map[string]uint64 {
 }
 
 func CallRpc(method string, params []interface{}) (interface{}, error) {
-	url := GetSolanaRpcURL()
+	return callRpcOnURL(GetSolanaRpcURL(), method, params)
+}
 
+// callRpcOnURL is CallRpc against an explicit endpoint. Lets slot-independent, current-state methods
+// (getMultipleAccounts owner lookups) target the self-hosted node while archival getBlock stays on
+// the paid archival endpoint — needed because the archival provider method-throttles
+// getMultipleAccounts under sustained backfill load (getBlock is unaffected).
+func callRpcOnURL(url string, method string, params []interface{}) (interface{}, error) {
 	req := SolanaRpcRequest{
 		Jsonrpc: "2.0",
 		ID:      "1",
@@ -820,7 +847,9 @@ func GetMultipleAccountOwners(addresses []string) (map[string]string, error) {
 			},
 		}
 
-		raw, err := CallRpc("getMultipleAccounts", params)
+		// Route to the current-state account endpoint (self-hosted), not the archival URL: the
+		// archival provider method-throttles getMultipleAccounts under sustained load.
+		raw, err := callRpcOnURL(GetAccountRpcURL(), "getMultipleAccounts", params)
 		if err != nil {
 			return result, fmt.Errorf("getMultipleAccounts failed: %w", err)
 		}
