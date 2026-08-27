@@ -6,14 +6,16 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"sort"
-	"strconv"
-	"sync"
-	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -23,15 +25,66 @@ import (
 
 var SolanaRpcURL string
 
+// GetSolanaRpcURL resolves the RPC endpoint: an explicit override (backfill sets it), then
+// Chainstack (the paid archival default), then the self-hosted node, then Helius.
 func GetSolanaRpcURL() string {
 	if SolanaRpcURL != "" {
 		return SolanaRpcURL
 	}
-	rpc := viper.GetString("sol.rpc")
-	if rpc != "" {
+	if u := buildChainstackURL(); u != "" {
+		return u
+	}
+	if rpc := viper.GetString("sol.rpc"); rpc != "" {
 		return rpc
 	}
-	return viper.GetString("sol.rpc-helius")
+	return buildHeliusURL()
+}
+
+// AccountRpcURL overrides the endpoint for current-state account queries (getMultipleAccounts).
+var AccountRpcURL string
+
+// GetAccountRpcURL resolves the endpoint for CURRENT-STATE account queries (getMultipleAccounts owner
+// lookups). getMultipleAccounts is slot-independent, so it does NOT need the archival endpoint; it
+// uses the self-hosted node (sol.rpc) — fast, free, unmetered — falling back to Helius, then the main
+// archival URL. This avoids the archival provider's getMultipleAccounts method-throttling that stalls
+// a sustained backfill.
+func GetAccountRpcURL() string {
+	if AccountRpcURL != "" {
+		return AccountRpcURL
+	}
+	if rpc := viper.GetString("sol.rpc"); rpc != "" {
+		return rpc
+	}
+	if u := buildHeliusURL(); u != "" {
+		return u
+	}
+	return GetSolanaRpcURL()
+}
+
+// buildChainstackURL joins the Chainstack base URL (config sol.rpc-chainstack) with the API key
+// from the environment (.env CHAINSTACK_API_KEY) — the key is the URL path segment, so it lives in
+// .env rather than config.yaml. Returns "" when either half is missing.
+func buildChainstackURL() string {
+	base := viper.GetString("sol.rpc-chainstack")
+	key := viper.GetString("CHAINSTACK_API_KEY")
+	if base == "" || key == "" || key == "YOUR-API-KEY" {
+		return ""
+	}
+	return strings.TrimRight(base, "/") + "/" + key
+}
+
+// buildHeliusURL joins the Helius base URL (config sol.rpc-helius) with the API key from the
+// environment (.env HELIUS_RPC_API_KEY). Returns "" when no key is configured.
+func buildHeliusURL() string {
+	key := viper.GetString("HELIUS_RPC_API_KEY")
+	if key == "" || key == "YOUR-API-KEY" {
+		return ""
+	}
+	base := viper.GetString("sol.rpc-helius")
+	if base == "" {
+		base = "https://mainnet.helius-rpc.com"
+	}
+	return strings.TrimRight(base, "/") + "/?api-key=" + key
 }
 
 type SolanaRpcRequest struct {
@@ -51,9 +104,35 @@ type SolanaRpcResponse struct {
 	} `json:"error,omitempty"`
 }
 
-func CallRpc(method string, params []interface{}) (interface{}, error) {
-	url := GetSolanaRpcURL()
+// rpcCallCounts tracks requests per RPC method since process start (one count per
+// send-attempt group; internal transport retries on failure are not counted). Lets a
+// long backfill report its actual RPC usage for quota accounting.
+var rpcCallCounts sync.Map // method -> *atomic.Uint64
 
+func countRpcCall(method string) {
+	c, _ := rpcCallCounts.LoadOrStore(method, new(atomic.Uint64))
+	c.(*atomic.Uint64).Add(1)
+}
+
+// RpcCallCountSnapshot returns the accumulated per-method RPC request counts.
+func RpcCallCountSnapshot() map[string]uint64 {
+	snap := make(map[string]uint64)
+	rpcCallCounts.Range(func(k, v any) bool {
+		snap[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	return snap
+}
+
+func CallRpc(method string, params []interface{}) (interface{}, error) {
+	return callRpcOnURL(GetSolanaRpcURL(), method, params)
+}
+
+// callRpcOnURL is CallRpc against an explicit endpoint. Lets slot-independent, current-state methods
+// (getMultipleAccounts owner lookups) target the self-hosted node while archival getBlock stays on
+// the paid archival endpoint — needed because the archival provider method-throttles
+// getMultipleAccounts under sustained backfill load (getBlock is unaffected).
+func callRpcOnURL(url string, method string, params []interface{}) (interface{}, error) {
 	req := SolanaRpcRequest{
 		Jsonrpc: "2.0",
 		ID:      "1",
@@ -61,17 +140,33 @@ func CallRpc(method string, params []interface{}) (interface{}, error) {
 		Params:  params,
 	}
 
-	var resp SolanaRpcResponse
-	err := utils.PostUrlResponseWithRetry(url, req, &resp, config.DefaultRetryTimes, logger.SolLogger)
-	if err != nil {
-		return nil, fmt.Errorf("RPC %s failed: %w", method, err)
-	}
+	backoff := config.RPC_RATE_LIMIT_BACKOFF
+	for {
+		rpcLimiter.acquire() // throttle to the configured RPS in backfill; no-op in live mode
+		countRpcCall(method)
 
-	if resp.Error != nil {
-		return nil, fmt.Errorf("RPC %s returned error: %d %s", method, resp.Error.Code, resp.Error.Message)
+		var resp SolanaRpcResponse
+		err := utils.PostUrlResponseWithRetry(url, req, &resp, config.DefaultRetryTimes, logger.SolLogger)
+		if err != nil {
+			// Throttling (HTTP 429): wait and retry with exponential backoff up to the cap.
+			if isRateLimited(err) && backoff <= config.RPC_RATE_LIMIT_BACKOFF_MAX {
+				logger.SolLogger.Warn("RPC throttled, backing off", "method", method, "backoff", backoff.String())
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return nil, fmt.Errorf("RPC %s failed: %w", method, err)
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("RPC %s returned error: %d %s", method, resp.Error.Code, resp.Error.Message)
+		}
+		return resp.Result, nil
 	}
+}
 
-	return resp.Result, nil
+// isRateLimited reports whether an RPC error was an HTTP 429 (too many requests).
+func isRateLimited(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "status 429")
 }
 
 func GetSlotLeaders(start, limit uint64) (types.SlotLeaders, error) {
@@ -120,7 +215,7 @@ func GetBlocks(startSlot, count uint64) types.Blocks {
 	}
 	endSlot := startSlot + count - 1
 
-	parallel := config.SOL_FETCH_SLOT_DATA_PARALLEL_NUM
+	parallel := FetchParallelism
 	if parallel <= 0 {
 		parallel = 1
 	}
@@ -187,6 +282,15 @@ func GetBlocks(startSlot, count uint64) types.Blocks {
 	return blocks
 }
 
+// FetchRewards, when set, requests block rewards so GetBlock can resolve the slot leader
+// (the Fee reward recipient). Backfill turns this on to populate leaders for ranges where the
+// slot_leaders table is empty; live mode leaves it off since getSlotLeaders feeds that table.
+var FetchRewards bool
+
+// FetchParallelism is the worker count GetBlocks uses. Backfill raises it to
+// BACKFILL_FETCH_PARALLEL_NUM (the paid archival RPC absorbs it); live keeps the default.
+var FetchParallelism = config.SOL_FETCH_SLOT_DATA_PARALLEL_NUM
+
 func GetBlock(slot uint64) (*types.Block, error) {
 	params := []interface{}{
 		slot,
@@ -194,7 +298,7 @@ func GetBlock(slot uint64) (*types.Block, error) {
 			"encoding":                       "base64",
 			"maxSupportedTransactionVersion": 0,
 			"transactionDetails":             "full", // include full txs
-			"rewards":                        false,  // rewards not needed here
+			"rewards":                        FetchRewards,
 			"commitment":                     "finalized",
 		},
 	}
@@ -203,9 +307,11 @@ func GetBlock(slot uint64) (*types.Block, error) {
 	if err != nil {
 		// Normalize well-known error patterns so caller can branch on them
 		msg := err.Error()
-		// e.g. "Slot 123 was skipped, or missing due to ledger jump to recent snapshot"
-		if regexp.MustCompile(`^RPC getBlock returned error: \d+ Slot \d+ was skipped, or missing due to ledger jump to recent snapshot$`).MatchString(msg) ||
-			regexp.MustCompile(`Slot \d+ was skipped, or missing due to ledger jump to recent snapshot`).MatchString(msg) {
+		// Skipped/missing slot. Self-hosted nodes report "...ledger jump to recent snapshot";
+		// archival RPCs (Helius) report code -32009 "...missing in long-term storage". Both mean
+		// the slot has no block and must not be retried.
+		if regexp.MustCompile(`Slot \d+ was skipped, or missing due to ledger jump to recent snapshot`).MatchString(msg) ||
+			regexp.MustCompile(`Slot \d+ was skipped, or missing in long-term storage`).MatchString(msg) {
 			return nil, fmt.Errorf(utils.SKIPPED_BLOCK)
 		}
 		// e.g. "Block 123 cleaned up, does not exist on node. First available block: 456"
@@ -271,6 +377,7 @@ func GetBlock(slot uint64) (*types.Block, error) {
 		BlockHeight:  height,
 		ValidTxCount: 0,
 		Txs:          make([]*types.Transaction, 0, len(txsData)),
+		Leader:       parseLeaderFromRewards(obj),
 	}
 	// Parse transactions (each item has meta + transaction{ message{...}, signatures... }; message is base64 per our request)
 	for i, txData := range txsData {
@@ -440,7 +547,10 @@ func parseDexInstructions(topLevelInsts []solana.CompiledInstruction, programs [
 		})
 	}
 
-	// Inner instructions from meta
+	// Inner (CPI) instructions from meta. Under encoding=base64 these arrive compiled
+	// ({programIdIndex, accounts:[indices], data:<base58>}); under jsonParsed they carry
+	// resolved {programId, accounts:[addresses]}. Handle both so the same path works
+	// regardless of the RPC encoding, resolving indices against combinedAccounts.
 	innerInsts, _ := meta["innerInstructions"].([]any)
 	for _, group := range innerInsts {
 		groupMap, ok := group.(map[string]any)
@@ -454,14 +564,21 @@ func parseDexInstructions(topLevelInsts []solana.CompiledInstruction, programs [
 			if !ok {
 				continue
 			}
-			// Skip parsed instructions (token transfers, etc.) — they don't have raw data
+			// Fully-parsed instructions (SPL transfers, etc.) carry no raw data to decode.
 			if _, hasParsed := instMap["parsed"]; hasParsed {
 				continue
 			}
+
 			programID, _ := instMap["programId"].(string)
+			if programID == "" {
+				if idx, ok := instMap["programIdIndex"].(float64); ok && int(idx) < len(combinedAccounts) {
+					programID = combinedAccounts[int(idx)]
+				}
+			}
 			if !utils.IsLabeledDexPrograms(programID) {
 				continue
 			}
+
 			dataStr, _ := instMap["data"].(string)
 			if dataStr == "" {
 				continue
@@ -470,14 +587,21 @@ func parseDexInstructions(topLevelInsts []solana.CompiledInstruction, programs [
 			if err != nil {
 				continue
 			}
-			// Resolve account addresses
+
+			// Accounts are either resolved addresses (jsonParsed) or indices (base64).
 			rawAccounts, _ := instMap["accounts"].([]any)
 			accounts := make([]string, 0, len(rawAccounts))
 			for _, a := range rawAccounts {
-				if addr, ok := a.(string); ok {
-					accounts = append(accounts, addr)
+				switch v := a.(type) {
+				case string:
+					accounts = append(accounts, v)
+				case float64:
+					if int(v) < len(combinedAccounts) {
+						accounts = append(accounts, combinedAccounts[int(v)])
+					}
 				}
 			}
+
 			result = append(result, types.DexInstruction{
 				ProgramID: programID,
 				Data:      dataBytes,
@@ -617,8 +741,8 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		uiTokenAmount, _ := tokenBalance["uiTokenAmount"].(map[string]any)
 		amount, _ := uiTokenAmount["amount"].(string)
 		decimals := int(uiTokenAmount["decimals"].(float64))
-		amountInt, _ := strconv.Atoi(amount)
-		preb := float64(amountInt) / math.Pow10(decimals)
+		amountRaw, _ := strconv.ParseUint(amount, 10, 64) // SPL raw amounts are u64; Atoi overflows high-supply tokens to 0
+		preb := float64(amountRaw) / math.Pow10(decimals)
 
 		tokenDecimals[tokenAddr] = decimals
 		// Record ATA owner
@@ -660,8 +784,13 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 		uiTokenAmount := tokenBalance["uiTokenAmount"].(map[string]any)
 		amount, _ := uiTokenAmount["amount"].(string)
 		decimals := int(uiTokenAmount["decimals"].(float64))
-		amountInt, _ := strconv.Atoi(amount)
-		postb := float64(amountInt) / math.Pow10(decimals)
+		amountRaw, _ := strconv.ParseUint(amount, 10, 64)
+		postb := float64(amountRaw) / math.Pow10(decimals)
+
+		// Record decimals here too: a token first appearing in postTokenBalances (e.g. a freshly
+		// created ATA receiving a memecoin) is absent from the pre loop, and would otherwise
+		// fall back to the 9-decimal default when its slippage limit is converted.
+		tokenDecimals[tokenAddr] = decimals
 
 		// Record ATA owner
 		ataOwner[ataAddr] = owner
@@ -685,99 +814,6 @@ func parseBalancesDelta(meta map[string]any, accountKeys []string) (map[string]m
 
 	return ownerBalanceChanges, ownerPreBalances, ownerPostBalances, ataOwner, tokenDecimals, nil
 }
-
-// parseTransaction parses a single transaction item from `getBlock` when encoding is JSON (not base64).
-// func parseTransaction(result map[string]interface{}) *Transaction {
-// 	transactionAttr, _ := safeMap(result["transaction"])
-// 	message, _ := safeMap(transactionAttr["message"])
-// 	accountKeysInterface, _ := safeSlice(message["accountKeys"])
-// 	signaturesAny, _ := safeSlice(transactionAttr["signatures"])
-// 	instructionsAny, _ := safeSlice(message["instructions"])
-// 	meta, _ := safeMap(result["meta"])
-
-// 	accountKeys := make([]string, len(accountKeysInterface))
-// 	for i, v := range accountKeysInterface {
-// 		accountKeys[i], _ = v.(string)
-// 	}
-
-// 	programs := make([]string, len(instructionsAny))
-// 	for i, v := range instructionsAny {
-// 		mi, _ := v.(map[string]any)
-// 		idx := asInt(mi["programIdIndex"])
-// 		if 0 <= idx && idx < len(accountKeys) {
-// 			programs[i] = accountKeys[idx]
-// 		}
-// 	}
-
-// 	// Slot/time
-// 	var slot uint64
-// 	var timestamp time.Time
-// 	if v, ok := result["slot"]; ok {
-// 		switch t := v.(type) {
-// 		case float64:
-// 			slot = uint64(t)
-// 		case json.Number:
-// 			if n, e := t.Int64(); e == nil {
-// 				slot = uint64(n)
-// 			}
-// 		}
-// 	}
-// 	if v, ok := result["blockTime"]; ok && v != nil {
-// 		switch t := v.(type) {
-// 		case float64:
-// 			timestamp = time.Unix(int64(t), 0)
-// 		case json.Number:
-// 			if n, e := t.Int64(); e == nil {
-// 				timestamp = time.Unix(n, 0)
-// 			}
-// 		}
-// 	}
-
-// 	// Combined keys for v0
-// 	combined := expandCombinedKeys(accountKeys, meta)
-
-// 	// Related addresses
-// 	related := utils.NewUnionFind[string]()
-// 	for _, k := range accountKeys {
-// 		related.Add(k)
-// 	}
-// 	for _, k := range combined {
-// 		related.Add(k)
-// 	}
-
-// 	// Strong decode is not available in JSON mode without re-encoding; use index heuristics
-// 	for _, v := range instructionsAny {
-// 		mi, _ := v.(map[string]any)
-// 		inst := liteInstruction{
-// 			ProgramIDIndex: asInt(mi["programIdIndex"]),
-// 			Accounts:       asIntSlice(mi["accounts"]),
-// 			DataB64:        strOrEmpty(mi["data"]),
-// 		}
-// 		collectByIndexHeuristicsFromLite(inst, accountKeys, combined, related)
-// 	}
-
-// 	signature := ""
-// 	if len(signaturesAny) > 0 {
-// 		signature, _ = signaturesAny[0].(string)
-// 	}
-// 	signers := accountKeys[:min(len(accountKeys), len(signaturesAny))]
-
-// 	balanceChange, ataOwner := parseAtaBalanceChangeSafe(meta, accountKeys)
-// 	out := &Transaction{
-// 		Slot:          slot,
-// 		Timestamp:     timestamp,
-// 		Signature:     signature,
-// 		Signer:        firstOrEmpty(signers),
-// 		Signers:       signers,
-// 		IsFailed:      meta != nil && meta["err"] != nil,
-// 		Programs:      FilterPrograms(programs),
-// 		AccountKeys:   accountKeys,
-// 		BalanceChange: balanceChange,
-// 		AtaOwner:      ataOwner,
-// 		RelatedAddrs:  related,
-// 	}
-// 	return out
-// }
 
 // GetMultipleAccountOwners queries the on-chain owner program for a batch of
 // addresses using the getMultipleAccounts RPC method. Returns a map from
@@ -811,14 +847,18 @@ func GetMultipleAccountOwners(addresses []string) (map[string]string, error) {
 			},
 		}
 
-		raw, err := CallRpc("getMultipleAccounts", params)
+		// Route to the current-state account endpoint (self-hosted), not the archival URL: the
+		// archival provider method-throttles getMultipleAccounts under sustained load.
+		raw, err := callRpcOnURL(GetAccountRpcURL(), "getMultipleAccounts", params)
 		if err != nil {
 			return result, fmt.Errorf("getMultipleAccounts failed: %w", err)
 		}
+		// A malformed-but-200 response (nil result, short value array) must be an ERROR, not
+		// silence: the caller negative-caches addresses missing from the result, so treating a
+		// bad response as authoritative absence would poison the owner cache for a whole batch.
 		if raw == nil {
-			continue
+			return result, fmt.Errorf("getMultipleAccounts returned no result for %d addresses", len(batch))
 		}
-
 		obj, ok := raw.(map[string]any)
 		if !ok {
 			return result, fmt.Errorf("unexpected getMultipleAccounts result type: %T", raw)
@@ -826,6 +866,9 @@ func GetMultipleAccountOwners(addresses []string) (map[string]string, error) {
 		values, ok := obj["value"].([]any)
 		if !ok {
 			return result, fmt.Errorf("unexpected value type: %T", obj["value"])
+		}
+		if len(values) != len(batch) {
+			return result, fmt.Errorf("getMultipleAccounts returned %d values for %d addresses", len(values), len(batch))
 		}
 
 		for i, v := range values {

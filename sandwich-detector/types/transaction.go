@@ -3,9 +3,9 @@ package types
 import (
 	"fmt"
 	"math"
+	"sandwich-detector/utils"
 	"strings"
 	"time"
-	"sandwich-detector/utils"
 
 	MapSet "github.com/deckarep/golang-set/v2"
 )
@@ -16,6 +16,7 @@ type Block struct {
 	Timestamp    time.Time
 	Txs          []*Transaction
 	ValidTxCount uint64
+	Leader       string // block producer, resolved from the Fee reward when rewards are fetched (backfill)
 }
 
 type Blocks []*Block
@@ -28,12 +29,12 @@ type Transaction struct {
 	IsFailed  bool
 	IsVote    bool
 
-	Signature       string           `json:"signature" ch:"signature"`     // The identifier of this transaction, which is the first signature in Signatures field. A 64 bytes Ed25519 signature, encoded as a base-58 string.
-	Signers         []string         `json:"signers" ch:"signers"`         // All signers extracted from the transaction message. Used by all detection logic.
-	AccountKeys     []string         `json:"accountKeys" ch:"accountKeys"` // All accounts accessed in this transaction
-	Programs        []string         `json:"programs" ch:"programs"`       // All programs invoked in this transaction
-	DexInstructions      []DexInstruction `json:"-" ch:"-"` // DEX-related instruction data extracted from top-level and inner instructions
-	InnerInstructionsNil bool              `json:"-" ch:"-"` // true if RPC returned null for meta.innerInstructions
+	Signature            string           `json:"signature" ch:"signature"`     // The identifier of this transaction, which is the first signature in Signatures field. A 64 bytes Ed25519 signature, encoded as a base-58 string.
+	Signers              []string         `json:"signers" ch:"signers"`         // All signers extracted from the transaction message. Used by all detection logic.
+	AccountKeys          []string         `json:"accountKeys" ch:"accountKeys"` // All accounts accessed in this transaction
+	Programs             []string         `json:"programs" ch:"programs"`       // All programs invoked in this transaction
+	DexInstructions      []DexInstruction `json:"-" ch:"-"`                     // DEX-related instruction data extracted from top-level and inner instructions
+	InnerInstructionsNil bool             `json:"-" ch:"-"`                     // true if RPC returned null for meta.innerInstructions
 
 	// Account-balance related information
 	// In Solana, for each token/WSOL, each user has an Associated Token Account, ATA, which is controlled by the address of the holder (owner).

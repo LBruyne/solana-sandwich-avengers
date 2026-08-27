@@ -26,8 +26,15 @@ type SandwichTxTokenInfo struct {
 	SlippageLimitType    string  `ch:"slippageLimitType"`    // "input" (max cost) / "output" (min output) / "" (unavailable)
 	SlippageLimitAmount  float64 `ch:"slippageLimitAmount"`  // decoded limit value, converted to float64 with decimals
 	SlippageActualAmount float64 `ch:"slippageActualAmount"` // actual cost or output from balance deltas
-	SlippageUtilization  float64 `ch:"slippageUtilization"`  // ratio 0-1 (closer to 1 = tighter fit), -1 = unavailable
-	SlippageDexName      string  `ch:"slippageDexName"`      // DEX name (e.g., "pumpfun", "raydium_v4")
+	SlippageUtilization  float64 `ch:"slippageUtilization"`  // ratio in [0,1] (1 = squeezed to the victim's own floor, 0 = it set no real bound); negative = anomaly: -2 unsupported, -3 missing inner, -4 ambiguous, -5 decode contradicts the swap. -1 is legacy: rows written before 2026-08 used it for "no protection", which is now the real value 0
+
+	// PoolDex classifies the exchange the tx's pool belongs to, resolved from the front-run's DEX
+	// instruction — set for every leg (front/back/victim/adverse) regardless of slippage
+	// decodability, so sandwich-by-pool distribution can be queried. It is the single DEX field
+	// (it subsumed the former slippage-decoder-derived slippageDexName, which was 99.96% identical
+	// but empty for undecodable/-2/-4 victims). "" only when the exchange can't be resolved.
+	// Includes proprietary AMMs (solfi/bisonfi/...) that have no slippage decoder.
+	PoolDex string `ch:"poolDex"`
 }
 
 type SandwichTx struct {
@@ -44,7 +51,13 @@ type Sandwich struct {
 	SandwichID        string `ch:"sandwichId"`
 	TokenA            string `ch:"tokenA"`
 	TokenB            string `ch:"tokenB"`
-	CrossBlock        bool   `ch:"crossBlock"`        // whether the sandwich spans multiple blocks
+	CrossBlock        bool   `ch:"crossBlock"`        // whether the sandwich spans multiple slots
+	CrossLeader       bool   `ch:"crossLeader"`       // whether front and back fall under different slot leaders (implies CrossBlock)
+	FrontLeader       string `ch:"frontLeader"`       // leader of the first front-run slot ("" if unknown)
+	BackLeader        string `ch:"backLeader"`        // leader of the last back-run slot ("" if unknown)
+	WindowStartSlot   uint64 `ch:"windowStartSlot"`   // first slot of the detection window this sandwich was found in
+	WindowEndSlot     uint64 `ch:"windowEndSlot"`     // last slot of the detection window this sandwich was found in
+	RpcSource         string `ch:"rpcSource"`         // data source: "live" (self-hosted) or "helius" (archival backfill)
 	Consecutive       bool   `ch:"consecutive"`       // whether the sandwich txs are consecutive in the block, i.e., F_last + 1 == V_first and V_last + 1 == B_first
 	FrontConsecutive  bool   `ch:"frontConsecutive"`  // whether the front-run txs are consecutive in the block, i.e., F_1 + 1 == F_2, F_2 + 1 == F_3, ...
 	BackConsecutive   bool   `ch:"backConsecutive"`   // whether the back-run txs are consecutive in the block, i.e., B_1 + 1 == B_2, B_2 + 1 == B_3, ...
@@ -61,14 +74,16 @@ type Sandwich struct {
 	HasBackInlineTransfer  bool `ch:"hasBackInlineTransfer"`  // back tx contains inline transfer (source != sink within same tx)
 
 	OwnerSame bool `ch:"ownerSame"` // whether front-run and back-run have the same owner, i.e., the owner of ATA that holds the toToken in front-run and the fromToken in back-run
-	ATASame   bool `ch:"ataSame"`   // whether front-run and back-run have the same ATA that holds the toToken in front-run and the fromToken in back-run
+	// ATASame is reserved and always false: the detector links legs by signer and by
+	// token-account owner (SignerSame / OwnerSame), not at the ATA level.
+	ATASame bool `ch:"ataSame"`
 
 	Perfect       bool    `ch:"perfect"`       // whether the sandwich is perfect, i.e., the amount diff of tokeb Bis exactly the same
 	RelativeDiffB float64 `ch:"relativeDiffB"` // The relative amount diff = |backTxs.fromTotalAmount - frontTxs.toTotalAmount| / max(frontTxs.toTotalAmount, backTxs.fromTotalAmount).
 	ProfitA       float64 `ch:"profitA"`       // The profit of the sandwich = backTx.toToTalAmount - frontTx.fromTotalAmount
 
 	IntentScore            float64 `ch:"intentScore"`            // Intent score for sandwich attack (0-1, higher = more likely intentional)
-	MaxSlippageUtilization float64 `ch:"maxSlippageUtilization"` // Max slippage utilization across all victims (0-1), 0 if unavailable
+	MaxSlippageUtilization float64 `ch:"maxSlippageUtilization"` // Max slippage utilization across all victims, in [0,1]; a negative sentinel if ANY victim is anomalous (see computeMaxSlippageUtilization)
 
 	AdverseCount uint16        `ch:"adverseCount"`
 	FrontCount   uint16        `ch:"frontCount"`
@@ -80,13 +95,10 @@ type Sandwich struct {
 	Adverse      []*SandwichTx `ch:"adverseTx" json:"adverseTx"`
 }
 
-// InBlockSandwich is a detected sandwich transaction, that front-run, victim(s) and back-run are all in the same block
-type InBlockSandwich struct {
-	Sandwich
-	Slot      uint64    `ch:"slot" json:"slot"`
-	Timestamp time.Time `ch:"timestamp" json:"timestamp"`
-}
-
+// CrossBlockSandwich is the persisted form of a detected sandwich: the shared Sandwich shape
+// plus the slot/timestamp of its front-run. The name is historical — it now carries every
+// variant (in-block, same-leader cross-block and cross-leader), distinguished by the
+// CrossBlock/CrossLeader fields.
 type CrossBlockSandwich struct {
 	Sandwich
 	Slot      uint64    `ch:"slot" json:"slot"`
@@ -138,27 +150,6 @@ func ppSandwichTxs(kind string, txs []*SandwichTx) {
 			// No extra info for adverse txs
 		}
 	}
-}
-
-// Pretty print an in-block sandwich
-func PPInBlockSandwich(i int, s *InBlockSandwich) {
-	fmt.Printf("==== Sandwich #%d ====\n", i)
-	fmt.Printf("slot=%d time=%s\n", s.Slot, s.Timestamp.Format(time.RFC3339))
-	fmt.Printf("pair: A=%s  B=%s\n", s.TokenA, s.TokenB)
-	fmt.Printf("flags: CrossBlock=%v Consecutive=%v FrontConsec=%v BackConsec=%v VictimConsec=%v\n",
-		s.CrossBlock, s.Consecutive, s.FrontConsecutive, s.BackConsecutive, s.VictimConsecutive)
-	fmt.Printf("multi: Front=%v Back=%v Victim=%v  SignerSame=%v OwnerSame=%v ATASame=%v HasTransfer=%v\n",
-		s.MultiFrontRun, s.MultiBackRun, s.MultiVictim, s.SignerSame, s.OwnerSame, s.ATASame, s.HasTransfer)
-	fmt.Printf("quality: Perfect=%v RelativeDiffB=%.9f ProfitA=%.9f\n",
-		s.Perfect, s.RelativeDiffB, s.ProfitA)
-
-	ppSandwichTxs("FrontRun", s.FrontRun)
-	ppSandwichTxs("Victims", s.Victims)
-	if len(s.Adverse) > 0 {
-		ppSandwichTxs("Adverse", s.Adverse)
-	}
-	ppSandwichTxs("BackRun", s.BackRun)
-	fmt.Println()
 }
 
 func summarizeCrossBlockSpan(s *CrossBlockSandwich) (minSlot, maxSlot uint64, minTime, maxTime time.Time) {

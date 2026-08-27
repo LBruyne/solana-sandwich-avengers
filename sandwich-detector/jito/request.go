@@ -2,11 +2,11 @@ package jito
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
 	"sandwich-detector/utils"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -67,8 +67,10 @@ func GetBundlesBySlot(slot uint64) ([]SlotBundle, error) {
 	params := map[string]string{}
 
 	var result []SlotBundle
-	// This endpoint is link .../bundles/slot/100000000
-	err := utils.GetUrlResponseWithRetry(GetJitoBundleURL()+"/slot/"+strconv.FormatUint(slot, 10), params, &result, config.DefaultRetryTimes, logger.JitoLogger)
+	// This endpoint is like .../bundles/slot/100000000. Use a single attempt: a 404 "Bundle not
+	// found" (the common case for ~4% of slots) is definitive, so retrying it just triples the Jito
+	// API load; genuine transient errors are retried by the caller's failed-slot ledger instead.
+	err := utils.GetUrlResponseWithRetry(GetJitoBundleURL()+"/slot/"+strconv.FormatUint(slot, 10), params, &result, 1, logger.JitoLogger)
 	if err != nil {
 		if strings.Contains(err.Error(), utils.NO_BUNDLE) {
 			return []SlotBundle{}, nil // No bundles for this slot

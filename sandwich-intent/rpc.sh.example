@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Solana JSON-RPC helper.
+#
+#   ./rpc.sh <method> <params-json>   ->   the raw JSON-RPC response on stdout
+#
+# The endpoint is composed HERE, from a key held in ../sandwich-detector/.env, so
+# the key never reaches a Python process, an argv list or a log line. Copy this
+# file to rpc.sh, adjust the endpoint for whichever provider you use, and
+# `chmod +x rpc.sh`. Point SOLANA_RPC_CMD elsewhere if you keep it somewhere else.
+#
+# Callers: utils/check_owner_accounts.py, tests/build_audit_bundles.py.
+# Both need an ARCHIVAL endpoint if you are working on a historical window.
+set -euo pipefail
+
+method="${1:?usage: rpc.sh <method> <params-json>}"
+params="${2:?usage: rpc.sh <method> <params-json>}"
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+env_file="$here/../sandwich-detector/.env"
+[[ -f "$env_file" ]] || { echo "missing $env_file" >&2; exit 1; }
+# shellcheck disable=SC1090
+set -a; source "$env_file"; set +a
+
+# Same composition rule as sandwich-detector/sol/request.go: base URL + key as
+# the path segment. Swap in your provider's rule if it differs.
+url="${SOL_RPC_BASE:-https://solana-mainnet.core.chainstack.com}/${CHAINSTACK_API_KEY:?CHAINSTACK_API_KEY not set in $env_file}"
+
+curl -sS "$url" \
+  -X POST -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}"

@@ -6,14 +6,14 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sandwich-detector/sol/dex"
+	"sandwich-detector/types"
+	"sandwich-detector/utils"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-	"sandwich-detector/sol/dex"
-	"sandwich-detector/types"
-	"sandwich-detector/utils"
 
 	"github.com/mr-tron/base58"
 	"github.com/spf13/viper"
@@ -303,7 +303,27 @@ func loadTxsFromJSONFile(path string) ([]*types.Transaction, error) {
 //  1. Place a JSON array of getTransaction responses in sol/testdata/txs.json
 //     (each element should have "transaction", "meta", "slot", "blockTime", "txIdx")
 //  2. Run:  go test -v -run TestSandwichFromJSON -timeout 30s ./sol/
+//
+// seedAccountOwners preloads the account -> owner-program mappings that a handful of fixtures
+// need to identify their AMM pool. On-chain these come from getMultipleAccounts; freezing them
+// here is what makes the fixture suite runnable with no RPC at all, which is the point of a
+// regression suite. Regenerate by deleting the file and re-running with a reachable RPC.
+func seedAccountOwners(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "account_owners.json"))
+	if err != nil {
+		t.Fatalf("read account_owners.json: %v", err)
+	}
+	var owners map[string]string
+	if err := json.Unmarshal(raw, &owners); err != nil {
+		t.Fatalf("parse account_owners.json: %v", err)
+	}
+	for addr, owner := range owners {
+		accountOwnerCache.Put(addr, owner)
+	}
+}
+
 func TestSandwichFromJSON(t *testing.T) {
+	seedAccountOwners(t)
 	jsonFiles, err := filepath.Glob(filepath.Join("testdata", "sandwiches", "*.json"))
 	if err != nil {
 		t.Fatalf("glob testdata json files: %v", err)
@@ -344,7 +364,7 @@ func TestSandwichFromJSON(t *testing.T) {
 				t.Logf("file=%s expected=%d got=%d", jsonFile, expected, len(res))
 				if len(res) > 0 {
 					for i, s := range res {
-						types.PPInBlockSandwich(i+1, s)
+						types.PPCrossBlockSandwich(i+1, s)
 					}
 				} else {
 					dumpBucketDebug(txs)
@@ -389,8 +409,19 @@ func TestSandwichFromJSON(t *testing.T) {
 // extracts slippage info from DEX instructions, and validates the computed
 // utilization against the expected value encoded in the filename.
 //
-// Filename convention: victim_{n}_{utilization_pct}.json
+// Filename convention: victim_{n}_{utilization_pct}[_oor].json
 // e.g., victim_1_43.json → expected utilization ≈ 43%
+//
+//	victim_12_pumpfun_sell_0.json → the victim's decoded limit is 0, so it set no real protection
+//	and consumed none of a tolerance it never had. That is a measurement of 0, not a failure: the
+//	leg competes in the sandwich's maximum like any other. Before 2026-08 these fixtures were named
+//	_-1 and expected the SlippageNoProtection sentinel.
+//
+//	_oor marks a fixture whose ratio exceeds 1, meaning the decoded limit cannot be the one that
+//	bound the swap; ComputeVictimSlippage must report SlippageOutOfRange while still populating
+//	LimitAmount/ActualAmount. Keeping the percentage in the name is deliberate — the measured ratio
+//	is the regression guard on the ratio DIRECTION, which a band change must not touch. No fixture
+//	is currently _oor; TestSlippageAdmissibleBand covers that path synthetically.
 //
 // Usage:
 //
@@ -409,8 +440,8 @@ func TestVictimSlippage(t *testing.T) {
 	for _, jsonFile := range jsonFiles {
 		base := filepath.Base(jsonFile)
 		t.Run(base, func(t *testing.T) {
-			// Parse expected utilization from filename: victim_{n}_{pct}.json
-			expectedPct := parseExpectedUtilizationPct(t, base)
+			// Parse expected utilization from filename: victim_{n}_{pct}[_oor].json
+			expectedPct, expectOOR := parseExpectedUtilizationPct(t, base)
 
 			// Load the single victim tx
 			txs, err := loadTxsFromJSONFile(jsonFile)
@@ -457,16 +488,34 @@ func TestVictimSlippage(t *testing.T) {
 			t.Logf("  result: dex=%s limitType=%s limit=%.9f actual=%.9f utilization=%.2f%% expected=%.0f%%",
 				result.DexName, result.LimitType, result.LimitAmount, result.ActualAmount, gotPct, expectedPct)
 
-			// NoProtection: expectedPct=-1 means utilization should be SlippageNoProtection (-1)
-			if expectedPct == -1 {
-				if result.Utilization != dex.SlippageNoProtection {
-					t.Fatalf("expected NoProtection (utilization=-1) for %s, got %.4f", jsonFile, result.Utilization)
+			// Allow ±2% tolerance for rounding differences
+			const tolerancePct = 2.0
+
+			if result.Utilization == dex.SlippageNoProtection {
+				t.Fatalf("%s: the -1 sentinel is legacy and must no longer be produced; a victim "+
+					"with no real bound carries consumption 0", jsonFile)
+			}
+
+			if expectOOR {
+				if result.Utilization != dex.SlippageOutOfRange {
+					t.Fatalf("expected OutOfRange (utilization=%.0f) for %s, got %.4f",
+						dex.SlippageOutOfRange, jsonFile, result.Utilization)
+				}
+				// The sentinel path must still carry the raw amounts: the Python pipeline
+				// recomputes consumption from exactly these two stored columns, so zeroing them
+				// here would make the two codebases disagree about which victims are anomalous.
+				ratio := reconstructRatio(t, result)
+				if math.Abs(ratio*100-expectedPct) > tolerancePct {
+					t.Fatalf("raw amounts do not reconstruct the recorded ratio for %s: got %.4f%%, expected %.0f%% (±%.0f%%)",
+						jsonFile, ratio*100, expectedPct, tolerancePct)
 				}
 				return
 			}
 
-			// Allow ±2% tolerance for rounding differences
-			const tolerancePct = 2.0
+			if result.Utilization < dex.SlippageMinAdmissible || result.Utilization > dex.SlippageMaxAdmissible {
+				t.Fatalf("%s is expected to be admissible (%.0f%%) but utilization %.6f is outside [%.2f, %.2f]",
+					jsonFile, expectedPct, result.Utilization, dex.SlippageMinAdmissible, dex.SlippageMaxAdmissible)
+			}
 			if math.Abs(gotPct-expectedPct) > tolerancePct {
 				t.Fatalf("utilization mismatch for %s: got %.2f%%, expected %.0f%% (±%.0f%%)",
 					jsonFile, gotPct, expectedPct, tolerancePct)
@@ -475,21 +524,49 @@ func TestVictimSlippage(t *testing.T) {
 	}
 }
 
-// parseExpectedUtilizationPct extracts the expected utilization percentage from the last
-// segment of the filename. e.g. "victim_01_pumpfun_buy_43.json" → 43.0, "victim_12_pumpfun_sell_-1.json" → -1.0 (no protection).
-func parseExpectedUtilizationPct(t *testing.T, filename string) float64 {
+// reconstructRatio recomputes the consumption ratio from the result's raw limit/actual amounts,
+// using the same direction as ComputeVictimSlippage (and as the Python pipeline).
+func reconstructRatio(t *testing.T, r *dex.VictimSlippageResult) float64 {
+	t.Helper()
+	switch r.LimitType {
+	case dex.LimitTypeInput:
+		if r.LimitAmount <= 0 {
+			t.Fatalf("input-limited result has no usable LimitAmount: %+v", r)
+		}
+		return r.ActualAmount / r.LimitAmount
+	case dex.LimitTypeOutput:
+		if r.ActualAmount <= 0 {
+			t.Fatalf("output-limited result has no usable ActualAmount: %+v", r)
+		}
+		return r.LimitAmount / r.ActualAmount
+	default:
+		t.Fatalf("unexpected limit type %q", r.LimitType)
+		return 0
+	}
+}
+
+// parseExpectedUtilizationPct extracts the expected utilization percentage from the filename, plus
+// whether the fixture is expected to fall outside the admissible band.
+// e.g. "victim_01_pumpfun_buy_43.json" → (43.0, false); "victim_12_pumpfun_sell_0.json" → (0.0,
+// false), a victim that set no real bound; "victim_x_140_oor.json" → (140.0, true).
+func parseExpectedUtilizationPct(t *testing.T, filename string) (float64, bool) {
 	t.Helper()
 	name := strings.TrimSuffix(filename, ".json")
 	parts := strings.Split(name, "_")
+	oor := false
+	if len(parts) > 0 && parts[len(parts)-1] == "oor" {
+		oor = true
+		parts = parts[:len(parts)-1]
+	}
 	if len(parts) < 3 {
-		t.Fatalf("invalid victim filename format %q: expected victim_{n}_{pct}.json", filename)
+		t.Fatalf("invalid victim filename format %q: expected victim_{n}_{pct}[_oor].json", filename)
 	}
 	tag := parts[len(parts)-1]
 	pct, err := strconv.ParseFloat(tag, 64)
 	if err != nil {
 		t.Fatalf("cannot parse utilization pct from %q: %v", filename, err)
 	}
-	return pct
+	return pct, oor
 }
 
 // extractSwapAmounts finds the AMM pool in a transaction and returns the swap

@@ -3,11 +3,11 @@ package dex
 // Anchor discriminators for Pump.fun instructions (sha256("global:{method}")[:8])
 // Both Pump.fun Bonding Curve and Pump.fun AMM share the same buy/sell discriminators.
 var (
-	pumpFunBuyDiscriminator          = [8]byte{102, 6, 61, 18, 1, 218, 235, 234}   // buy
-	pumpFunSellDiscriminator         = [8]byte{51, 230, 133, 164, 1, 127, 131, 173} // sell
-	pumpFunBuyExactSolInDiscriminator = [8]byte{56, 252, 116, 8, 158, 223, 205, 95} // buy_exact_sol_in (bonding curve)
-	pumpFunAMMBuyExactQuoteIn        = [8]byte{198, 46, 21, 82, 180, 217, 232, 112} // buy_exact_quote_in (AMM)
-	pumpFunAMMSellExactQuoteOut      = [8]byte{152, 146, 222, 158, 98, 137, 248, 152} // sell_exact_quote_out (AMM)
+	pumpFunBuyDiscriminator           = [8]byte{102, 6, 61, 18, 1, 218, 235, 234}      // buy
+	pumpFunSellDiscriminator          = [8]byte{51, 230, 133, 164, 1, 127, 131, 173}   // sell
+	pumpFunBuyExactSolInDiscriminator = [8]byte{56, 252, 116, 8, 158, 223, 205, 95}    // buy_exact_sol_in (bonding curve)
+	pumpFunAMMBuyExactQuoteIn         = [8]byte{198, 46, 21, 82, 180, 217, 232, 112}   // buy_exact_quote_in (AMM)
+	pumpFunAMMSellExactQuoteOut       = [8]byte{152, 146, 222, 158, 98, 137, 248, 152} // sell_exact_quote_out (AMM)
 )
 
 // decodePumpFun decodes Pump.fun Bonding Curve instructions.

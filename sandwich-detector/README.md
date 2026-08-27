@@ -1,8 +1,8 @@
 # sandwich-detector
 
 A Go service that ingests Solana blocks in near real time, detects sandwich
-attacks (in-block and cross-block), enriches them with Jito bundle metadata,
-and writes everything to ClickHouse.
+attacks (in-block, same-leader cross-block, and cross-leader), enriches them
+with Jito bundle metadata, and writes everything to ClickHouse.
 
 The service is split into four CLI subcommands that are intended to run as
 long-lived background processes against a single ClickHouse database. Each
@@ -25,8 +25,42 @@ Jito API ──► jito ────────────┴──► jito_bu
 | `jito`     | Jito API + DB      | `jito_bundles`, `slot_bundles`, `sandwich_txs.inBundle`      |
 | `reset`    | (none)             | drops all tables                                             |
 
-The database schema is in [`../db/create_tables/`](../db/create_tables/).
-Tables are created automatically on the first run.
+The database schema is in [`../db/create_tables/`](../db/create_tables/); the
+authoritative copy is `CreateTables` in [`db/clickhouse.go`](db/clickhouse.go).
+Both the database and its tables are created automatically on the first run.
+
+One column is reserved rather than populated: `sandwiches.ataSame` is always
+`false`. The detector links a sandwich's two legs by signer and by token-account
+owner (`signerSame`, `ownerSame`), and computes no ATA-level comparison.
+
+## Quick start
+
+From a clean machine to a running detector:
+
+```bash
+# 0. Prerequisites: Go 1.24 and a running ClickHouse server (see below).
+cd sandwich-detector
+
+# 1. Configuration. Both files are gitignored; fill in your own endpoints and keys.
+cp .env.example .env                 # ClickHouse credentials + RPC API keys
+cp config.example.yaml config.yaml   # RPC and Jito base URLs
+
+# 2. Build.
+./scripts/build.sh                   # produces ./sandwich-detector
+
+# 3. Verify the build without touching the network.
+go test ./...                        # the whole suite is offline
+
+# 4. Run. The database and all tables are created automatically on first start.
+./scripts/leader.sh   400000000      # slot leaders (cheap, run continuously)
+./scripts/sandwich.sh 400000000      # detection (the main worker)
+./scripts/jito.sh     400000000      # Jito enrichment, once detection has output
+```
+
+The binary reads `config.yaml`, `.env` and `programs.yaml` from its **working
+directory**, so run it from `sandwich-detector/` (the `scripts/` wrappers `cd`
+there for you). It exits immediately with an actionable message if either
+config file is missing or ClickHouse is unreachable.
 
 ## Requirements
 
@@ -53,7 +87,9 @@ sudo apt-get update && sudo apt-get install -y clickhouse-server clickhouse-clie
 sudo service clickhouse-server start
 ```
 
-Create the database used by the detector (default name `solwich`):
+Create the database used by the detector (default name `solwich`; set via
+`CLICKHOUSE_DATABASE` in `.env`). The detector also bootstraps it automatically
+on startup, so this step is optional:
 
 ```sql
 clickhouse-client -q "CREATE DATABASE solwich"
@@ -71,7 +107,7 @@ cp .env.example .env
 cp config.example.yaml config.yaml
 ```
 
-`.env` holds ClickHouse credentials:
+`.env` holds ClickHouse credentials and RPC API keys:
 
 ```
 CLICKHOUSE_ADDR=localhost:9000
@@ -80,6 +116,9 @@ CLICKHOUSE_PORT=8123
 CLICKHOUSE_DATABASE=solwich
 CLICKHOUSE_USERNAME=default
 CLICKHOUSE_PASSWORD=
+
+CHAINSTACK_API_KEY=YOUR-API-KEY   # joins sol.rpc-chainstack (default RPC, live + backfill)
+HELIUS_RPC_API_KEY=YOUR-API-KEY   # joins sol.rpc-helius (backfill fallback)
 ```
 
 `config.yaml` holds RPC and Jito endpoints:
@@ -88,12 +127,16 @@ CLICKHOUSE_PASSWORD=
 jito:
   bundles-url: https://bundles.jito.wtf/api/v1/bundles
 sol:
-  rpc-helius: https://api.mainnet-beta.solana.com   # fallback
-  rpc:                                              # primary; required for production
+  rpc-chainstack: https://solana-mainnet.core.chainstack.com  # default (live + backfill)
+  rpc-helius: https://mainnet.helius-rpc.com                  # backfill fallback
+  rpc:                                                        # optional self-hosted node, live fallback
 ```
 
-`sol.rpc` is the primary endpoint. `sol.rpc-helius` is the fallback used when
-`sol.rpc` is empty. Detection throughput is bounded by RPC quality.
+config.yaml holds **base URLs only** — the API keys live in `.env` (`CHAINSTACK_API_KEY`
+joins `rpc-chainstack` as the URL path; `HELIUS_RPC_API_KEY` joins `rpc-helius` as
+`?api-key=`), so no keyed URL is ever written to config or logs. Resolution order —
+live: Chainstack → self-hosted → Helius; backfill: Chainstack → Helius (the self-hosted
+node keeps only ~6h of ledger and is never used for backfill).
 
 Detection thresholds, parallelism, and timing intervals are compile-time
 constants in [`config/config.go`](config/config.go); see the [Tuning](#tuning)
@@ -108,8 +151,8 @@ section.
 
 ## Subcommands
 
-All subcommands accept `-s <slot>` to set the starting slot and `-t` to
-silence stdout (logs still go to `./logs/`). The starting slot must be
+All subcommands except `reset` accept `-s <slot>` to set the starting slot;
+`-t` silences stdout on every subcommand (logs still go to `./logs/`). The starting slot must be
 `>= MIN_START_SLOT` (currently 400000000 in
 [`config/config.go`](config/config.go)). The ceiling is the most recent slot
 that public RPC and Jito APIs still expose (about 3 hours of block history,
@@ -128,21 +171,32 @@ tip, it skips forward to the tip rather than backfilling forever.
 
 ### `sandwich`
 
-The detection loop. Each iteration:
+Sandwich detection. It has two modes via `--mode` (default `live`):
 
-1. Fetches `SOL_FETCH_SLOT_DATA_SLOT_NUM` blocks via `getBlock`.
-2. Runs in-block detection in parallel, one finder per block.
-3. Runs cross-block detection over a sliding cache of
-   `CROSS_BLOCK_CACHE_SIZE` blocks, restricted to leader-contiguous runs.
+**live** — the streaming loop. Each iteration:
+
+1. Fetches a batch of blocks via `getBlock` (`SOL_FETCH_SLOT_DATA_SLOT_NUM`).
+2. Builds sliding **double-rotation** windows (each leader rotation paired with its
+   slot-adjacent successor) over a `CROSS_BLOCK_CACHE_SIZE`-block cache.
+3. Runs one **unified** finder per window — in-block, same-leader cross-block, and
+   cross-leader all come out of the same pass (two tiers: same-leader claims legs first).
 4. Inserts results into `sandwiches`, `sandwich_txs`, and `slot_txs`.
 
 ```bash
-./sandwich-detector sandwich -s 400000000
+./sandwich-detector sandwich -s 400000000                    # live, follows the tip
 ```
 
-The loop runs forever. If `-s` is older than
-`SOL_FETCH_SLOT_DATA_MAX_GAP` slots, it is bumped forward to the oldest
-slot the RPC still serves.
+**backfill** — scans a bounded `[start, end]` range on an archival RPC (Chainstack by
+default) and exits when done, using larger batch/worker counts (`BACKFILL_FETCH_*`) and
+resolving leaders from block rewards:
+
+```bash
+./sandwich-detector sandwich --mode backfill -s <start> -e <end> [--rps <n>]
+# --rps 0 (default) = no throttle (fine for paid RPC); set e.g. 10 for Helius free tier
+```
+
+The live loop runs forever; if `-s` is older than `SOL_FETCH_SLOT_DATA_MAX_GAP` slots it is
+bumped forward to the oldest slot the RPC still serves.
 
 ### `jito`
 
@@ -169,12 +223,14 @@ to use them.
 
 ### `reset`
 
-Drops every table the detector creates. Tables are recreated on the next
-run. Destructive; there is no confirmation prompt on the binary itself
-(the wrapper script `scripts/reset.sh` adds one).
+Drops every table the detector creates; they are recreated empty on the next
+run, so this discards every detection result. It asks for confirmation and
+accepts only the database name typed back. Pass `--yes` to skip the prompt in
+scripts.
 
 ```bash
-./sandwich-detector reset
+./sandwich-detector reset          # prompts for the database name
+./sandwich-detector reset --yes    # non-interactive
 ```
 
 ## Recommended startup sequence
@@ -208,26 +264,42 @@ All knobs live in [`config/config.go`](config/config.go). Notable ones:
 | `SOL_PROCESS_IN_BLOCK_SANDWICH_PARALLEL_NUM` |       8 | Parallel in-block finders                        |
 | `CROSS_BLOCK_CACHE_SIZE`                     |      64 | Sliding window for cross-block detection         |
 | `INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD`     |      10 | % tolerance between front-run and back-run sizes |
-| `SANDWICH_AMOUNT_SOL_TOLERANCE`              |     0.1 | SOL fee/dust tolerance (lamports)                |
+| `SANDWICH_AMOUNT_SOL_TOLERANCE`              |     0.1 | SOL-tokenB `perfect`-match tolerance (used as %) |
 | `SANDWICH_FRONTRUN_MAX_GAP`                  |     500 | Max position gap for multi-front sandwiches      |
 | `SANDWICH_BACKRUN_MAX_GAP`                   |     500 | Same, back-run side                              |
 | `JITO_MARK_IN_BUNDLE_SAFE_LAG`               |    2000 | Lag behind sandwich frontier before marking      |
 
-Detection precision is sensitive to the amount-diff threshold and SOL
-tolerance; the defaults are calibrated against the comparison sets in
-`sandwich-intent/`.
+`INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD` and `SANDWICH_AMOUNT_SOL_TOLERANCE`
+are the two that move the detected set most.
 
 ## Tests
 
-Tests are integration-style and require a live Solana RPC.
+The default suite runs with **no network access at all**. Every test that needs
+a live endpoint is gated behind an environment variable and skips when it is
+unset, so `go test ./...` is reproducible on a machine with no RPC credentials.
 
 ```bash
-go test ./...
-go test ./sol -run TestFindInBlockSandwichesBySlot -v
+go test ./...                              # offline suite (live tests auto-skip)
+go test ./sol -run TestSandwichFromJSON -v # deterministic fixture regression test
 ```
 
-`sol/testdata/` contains JSON fixtures (sandwiches and victim swaps) used by
-the deterministic regression tests in `sol/sandbox_test.go`.
+`sol/testdata/` holds the fixtures: `sandwiches/*.json` and `victims/*.json` drive
+the regression tests in `sol/sandbox_test.go` (`TestSandwichFromJSON`,
+`TestVictimSlippage`), and `account_owners.json` freezes the account -> owner-program
+mappings that a few fixtures would otherwise resolve through `getMultipleAccounts`.
+Delete that file and re-run with `SOL_TEST_RPC=<url>` to regenerate it.
+
+Environment variables that unlock live tests, all optional:
+
+| Variable                    | Unlocks                                              |
+|-----------------------------|------------------------------------------------------|
+| `SOL_TEST_RPC=<url>`        | pool-owner lookups instead of the frozen fixture      |
+| `SOL_REAL_TEST=1` + `SOL_REAL_RPC=<url>` | live Solana RPC tests                    |
+| `PARITY_RPC=<url>` (+ `PARITY_SLOT`)     | finder determinism on a real slot        |
+| `WINDOW_TEST=1` + `PARITY_RPC=<url>`     | end-to-end windowed detection            |
+| `SCAN_RPC=<url>`            | the ad-hoc slot-scan helpers                          |
+| `JITO_REAL_TEST=1`          | live Jito bundles API                                 |
+| `PERF_TEST=1`               | detection throughput benchmark                        |
 
 ## Logs
 
@@ -243,12 +315,13 @@ detector_<timestamp>_<cmd>_jito.log    jito API + bundle marking
 ## Layout
 
 ```
-cmd/        Cobra subcommand definitions (sandwich, jito, slot, reset)
+cmd/        Cobra subcommand definitions (sandwich, jito, leader, reset)
 config/     compile-time constants
 db/         ClickHouse adapter + Database interface
 jito/       Jito API client + RunJitoCmd (fetch + mark inBundle)
 logger/     rotating slog handlers per subsystem
-sol/        block fetcher, in-block + cross-block detection, victim slippage
+sol/        block fetcher, unified windowed sandwich detection
+            (in-block / cross-block / cross-leader), victim slippage, poolDex
 sol/dex/    DEX-specific instruction decoders (Raydium, Whirlpool, Meteora,
             PumpFun, PancakeSwap) used for slippage extraction
 types/      shared types (Block, Transaction, Sandwich, JitoBundle, Slot*)

@@ -1,44 +1,40 @@
-"""
-Phase 4: Validator Association Analysis (Pooled Mode)
-=====================================================
-Detect validator-signer collusion among the unified 302 attackers identified
-in Step 3 (jito ∪ signal across the three sandwich categories, excluding
-oneshot tier), restricted by default to those with sandwich count >= 10
-(the 282 attackers reported in the paper §7.1).
+"""Phase 4: validator association analysis.
 
-Pipeline:
-  1. Pool bot_attackers and bot_sandwiches across {standard, multi_split,
-     diff_signer_owner}, restrict to tier in {jito_only, jito_and_signal,
-     signal} (excludes oneshot/signal_and_oneshot), then to CNT >= cnt_min.
-  2. For each (attacker, validator) pair, count how often the validator
-     appears in ±k leader rotations around the attacker's sandwich slots.
-  3. Compute the enrichment ratio:
+Measures how often each attacker's sandwiches fall near each validator's leader rotations,
+against that validator's own share of the chain.
 
-        eta_{a,v} = N_{a,v} * N / ((2k+1) * N_v * |S_a|)
+SCOPE
 
-     where N_{a,v} = total appearances of v in ±k window, N_v = v's leader
-     rotation share (slot-weighted), N = total leader slots, |S_a| = a's
-     sandwich count. The code's slot-weighted form `(N_{a,v}/|S_a|) /
-     sum_off slot_freq[off][v]` is mathematically equivalent to the paper
-     formula under the standard 4-slot leader rotation assumption; the
-     emitted CSV includes both forms.
-  4. Flag pairs with eta >= min_enrichment (default 5x) AND near_cnt >=
-     min_near_cnt (default 5).
-  5. Two cluster mechanisms identify collusion structure:
-       - shared-validator clustering (>=cohort_min_shared shared validators)
-       - single-validator groups (one validator flagged by >=2 attackers)
-     Both feed into the same Union-Find; clusters of >=2 attackers form a
-     reported cohort.
+  SIGNAL BOTS ONLY. Jito Bots are excluded: their ordering comes from a bundle, so the
+  leader they land under is set by Jito's routing.
 
-Outputs (all under data/4_validator_association/all_attackers/):
-  flagged_pairs_<tag>.csv      every (attacker, validator) pair with eta>=5
-  untrusted_pairs_<tag>.csv    same but excludes the trusted-top-N stake set
-  signer_leader_summary_<tag>.csv  per-attacker windowed top-validator
-  cohort_members_<tag>.csv     attackers grouped into cohorts
-  charts/*.png
+  ATTACKER-FILTER OUTPUT ONLY. The population is `bot_attackers` from phase 3, minus the
+  entities carrying `expert_verdict == "no"`. No further count or profit threshold.
+
+  SINGLE-LEADER SANDWICHES ONLY. A sandwich is placed at its front-run's slot, so a
+  cross-leader sandwich has its back-run in a later rotation by construction.
+  `--include-cross-leader` keeps them.
+
+  BOTH CROSS-LEADER VARIANTS are run, into separate directories.
+
+WINDOW: +-2 leader rotations -- the rotation holding the sandwich, two before and two
+after, 5 positions. Solana rotations are 4 slots, so this spans roughly 20 slots.
+
+ENRICHMENT, per (attacker a, validator v):
+
+    eta = observed_rate / expected_rate
+        = (N_av / |S_a|) / sum_off P(v is leader at offset `off`)
+
+  N_av      times v appears anywhere in a's windows
+  |S_a|     a's sandwich count
+  P(...)    v's slot-weighted share of that offset across the whole range, measured from
+            `slot_leaders` over the same slot range
+
+eta = 1 is chance; eta = 10 is ten times what v's share of the chain predicts.
 
 Usage:
-    python 4_validator_association.py --start-epoch 946 --end-epoch 960
+    python 4_validator_association.py --database solwich \\
+        --start-epoch 946 --end-epoch 990
 """
 
 import argparse
@@ -54,177 +50,228 @@ import pandas as pd
 from utils.db import get_client
 
 SLOTS_PER_EPOCH = 432_000
-OFFSET_MAX = 4
+CATEGORIES = ["standard", "multi_split", "diff_signer_owner"]
+
+# +-2 leader rotations around the sandwich's own rotation.
+OFFSET_MAX = 2
 OFFSETS = list(range(-OFFSET_MAX, OFFSET_MAX + 1))
 
+# ── Style ────────────────────────────────────────────────────────────────────
+# Same palette and slot assignment as phase 2, so a reader moving between the two
+# steps does not have to re-learn which colour means which cross-leader variant.
+SURFACE = "#fcfcfb"
+SERIES = {"include": "#2a78d6", "exclude": "#eb6834"}
+INK = "#1c1c1a"
+INK_MUTED = "#6b6b66"
+GRID = "#e4e4e0"
 
-# diff_signer_transfer is excluded: empirically 0 reliable attackers
-# (6,920 sandwiches, $-46 net, $1.78 positive-USD total; the only 3
-# Signal-Bot matches all hit CNT=5 with $0 USD). See
-# docs/evaluator_design.md.
-CATEGORIES = ["standard", "multi_split", "diff_signer_owner"]
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+    "axes.edgecolor": GRID, "axes.labelcolor": INK, "axes.titlecolor": INK,
+    "xtick.color": INK_MUTED, "ytick.color": INK_MUTED,
+    "text.color": INK, "font.size": 9.5,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "grid.color": GRID, "grid.linewidth": 0.8,
+})
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Phase 4: validator association")
+    p = argparse.ArgumentParser(description="Phase 4: validator association (Signal Bots)")
+    p.add_argument("--database", default="solwich")
     p.add_argument("--start-epoch", type=int, default=946)
-    p.add_argument("--end-epoch", type=int, default=960)
-    p.add_argument("--cnt-min", type=int, default=10,
-                   help="Minimum sandwich count to include an attacker in the "
-                        "pooled set (paper §7.1 uses 10).")
+    p.add_argument("--end-epoch", type=int, default=990)
     p.add_argument("--min-enrichment", type=float, default=10.0,
-                   help="Min enrichment to flag a (signer, validator) pair "
-                        "(paper §7.1 strong-association threshold)")
+                   help="Flag a pair at eta >= this. 10 means ten times the validator's own "
+                        "share of the chain (default 10)")
     p.add_argument("--min-near-cnt", type=int, default=5,
-                   help="Min nearby count to consider a pair")
-    p.add_argument("--signer-peak-pct", type=float, default=0.0,
-                   help="Signer retention: at least one pair must have near_pct >= this. "
-                        "Default 0 keeps all enriched signers.")
+                   help="Minimum appearances in the window before a pair can be flagged; stops a "
+                        "1-of-1 coincidence scoring as a 100x relationship (default 5)")
     p.add_argument("--cohort-min-shared", type=int, default=3,
-                   help="Min shared flagged validators to link two signers")
+                   help="Two attackers are linked when they share this many flagged validators")
     p.add_argument("--trusted-top-n", type=int, default=15,
-                   help="Top-N named validators by stake treated as trusted")
-    p.add_argument("--exclude-tiers", type=str, default="oneshot,signal_and_oneshot",
-                   help="Comma-separated tier names to exclude from pooled set. "
-                        "Default excludes Oneshot Bots; pass empty string to keep them.")
+                   help="Also emit a variant excluding the N largest validators by slot share: a "
+                        "big validator is met often by everyone, and its enrichment is the least "
+                        "informative kind (default 15)")
+    p.add_argument("--include-cross-leader", action="store_true",
+                   help="Keep cross-leader sandwiches. Off by default: their back-run sits in a "
+                        "later rotation by construction, which credits that rotation's leader at "
+                        "offset +1 for free")
+    p.add_argument("--out-root", default="data/4_validator_association")
     return p.parse_args()
 
 
-# ── Leader Block Construction ────────────────────────────────────────────────
+# ── Population ───────────────────────────────────────────────────────────────
+
+class MissingVerdict(RuntimeError):
+    """Phase-3 output predates the expert-review column, so the paper's population
+    cannot be reconstructed for that variant. Loud skip, never a silent fallback to
+    the unreviewed set."""
+
+
+def load_signal_bots(database, tag, variant):
+    """Signal Bots and their sandwiches, pooled over the three categories.
+
+    Reads phase 3's output as-is, selecting on its own `bot_type` label.
+    """
+    sf_frames, ps_frames, breakdown = [], [], []
+    for cat in CATEGORIES:
+        d = f"data/3_attacker_filter/{cat}/{database}/{variant}"
+        sf_path = os.path.join(d, f"bot_attackers_{tag}.parquet")
+        ps_path = os.path.join(d, f"bot_sandwiches_{tag}.parquet")
+        if not (os.path.exists(sf_path) and os.path.exists(ps_path)):
+            print(f"    {cat}: no phase-3 output at {d}, skipped")
+            continue
+        sf = pd.read_parquet(sf_path)
+        if "bot_type" not in sf.columns:
+            raise SystemExit(
+                f"{sf_path} has no `bot_type` column -- it predates the two-track labelling. "
+                f"Re-run 3_attacker_filter.py before this step.")
+        sf = sf[sf["bot_type"] == "Signal Bot"]
+        # Drop the entities the expert panel overturned. Phase 3 annotates rather than
+        # filters, so each consumer applies the verdict itself.
+        if "expert_verdict" in sf.columns:
+            sf = sf[sf["expert_verdict"] != "no"]
+        else:
+            raise MissingVerdict(sf_path)
+        ps = pd.read_parquet(ps_path)
+        ps = ps[ps["signer"].isin(sf.index)]
+        breakdown.append(f"{cat}={len(sf)}")
+        # phase 3 names the index `attacker`; everything downstream here keys on
+        # `signer`, which is also what bot_sandwiches uses. Normalise once, at the
+        # boundary, rather than carrying two names for one thing.
+        sf = sf.reset_index().rename(columns={sf.index.name or "index": "signer"})
+        sf_frames.append(sf.assign(origin_category=cat))
+        ps_frames.append(ps.assign(origin_category=cat))
+    if not sf_frames:
+        raise SystemExit(f"no phase-3 output found for {database}/{variant}/{tag}")
+    sf = pd.concat(sf_frames, ignore_index=True)
+    # A signer classified in two categories would otherwise be counted twice in the
+    # denominator |S_a|; its sandwiches are pooled, so its row must be too.
+    sf = sf.drop_duplicates("signer", keep="first").set_index("signer")
+    ps = pd.concat(ps_frames, ignore_index=True)
+    return sf, ps, ", ".join(breakdown)
+
+
+# ── Leader blocks ────────────────────────────────────────────────────────────
 
 def load_leader_blocks(client, start_slot, end_slot):
-    """Build leader blocks: consecutive slots by the same leader."""
+    """Consecutive same-leader slot runs, in slot order.
+
+    A "rotation" is one run. Runs are built from the data rather than assumed to be
+    4 slots long, because skipped slots make real runs shorter and hard-coding 4
+    would misalign every offset after the first gap.
+    """
     df = client.query_df(f"""
         SELECT slot, leader FROM slot_leaders
-        WHERE slot >= {start_slot} AND slot < {end_slot}
-        ORDER BY slot
-    """)
-    slots = df["slot"].values.astype(int)
-    ldrs = df["leader"].values
-
-    blocks = []
-    cur_leader = ldrs[0]
-    cur_start = slots[0]
+        WHERE slot >= {start_slot} AND slot < {end_slot} ORDER BY slot""")
+    if df.empty:
+        raise SystemExit(f"slot_leaders is empty over [{start_slot}, {end_slot})")
+    slots = df["slot"].to_numpy(dtype=np.int64)
+    leaders = df["leader"].to_numpy()
+    blocks, cur_leader, cur_start = [], leaders[0], slots[0]
     for i in range(1, len(slots)):
-        if ldrs[i] != cur_leader or slots[i] != slots[i - 1] + 1:
+        if leaders[i] != cur_leader or slots[i] != slots[i - 1] + 1:
             blocks.append((cur_start, slots[i - 1], cur_leader))
-            cur_leader = ldrs[i]
-            cur_start = slots[i]
+            cur_leader, cur_start = leaders[i], slots[i]
     blocks.append((cur_start, slots[-1], cur_leader))
     return blocks
 
 
 def build_slot_to_block_idx(blocks):
-    """Map each slot to its leader-block index."""
-    mapping = {}
+    m = {}
     for idx, (s, e, _) in enumerate(blocks):
-        for sl in range(s, e + 1):
-            mapping[sl] = idx
-    return mapping
+        for sl in range(int(s), int(e) + 1):
+            m[sl] = idx
+    return m
 
 
 def compute_global_offset_freq(blocks):
-    """For each (offset, validator), compute baseline fraction of slots."""
+    """Baseline: each validator's slot-weighted share at each offset.
+
+    Slot-weighted rather than rotation-weighted, so a validator holding longer runs
+    is credited for them; that is the share an attacker would meet by chance.
+    """
     freq = {off: defaultdict(float) for off in OFFSETS}
-    total_slots = sum(e - s + 1 for s, e, _ in blocks)
+    total = sum(int(e) - int(s) + 1 for s, e, _ in blocks)
     for idx, (s, e, _) in enumerate(blocks):
-        size = e - s + 1
+        size = int(e) - int(s) + 1
         for off in OFFSETS:
-            ni = idx + off
-            if 0 <= ni < len(blocks):
-                freq[off][blocks[ni][2]] += size
+            j = idx + off
+            if 0 <= j < len(blocks):
+                freq[off][blocks[j][2]] += size
     for off in OFFSETS:
-        for l in freq[off]:
-            freq[off][l] /= total_slots
+        for v in freq[off]:
+            freq[off][v] /= total
     return freq
 
 
-# ── Per-Signer Offset Counts ────────────────────────────────────────────────
-
-def compute_signer_validator_counts(bot_ps, slot_to_block, blocks):
-    """For each (signer, validator, offset), count sandwich occurrences."""
+def compute_signer_validator_counts(ps, slot_to_block, blocks):
     per_signer = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    signers = bot_ps["signer"].values
-    slots = bot_ps["slot"].astype(int).values
-
-    for i in range(len(bot_ps)):
+    signers = ps["signer"].to_numpy()
+    slots = ps["slot"].to_numpy(dtype=np.int64)
+    missed = 0
+    for i in range(len(signers)):
         bidx = slot_to_block.get(int(slots[i]))
         if bidx is None:
+            missed += 1
             continue
         for off in OFFSETS:
-            ni = bidx + off
-            if 0 <= ni < len(blocks):
-                per_signer[signers[i]][blocks[ni][2]][off] += 1
-    return per_signer
+            j = bidx + off
+            if 0 <= j < len(blocks):
+                per_signer[signers[i]][blocks[j][2]][off] += 1
+    return per_signer, missed
 
 
-# ── Scoring & Flagging ───────────────────────────────────────────────────────
+# ── Scoring ──────────────────────────────────────────────────────────────────
+
+BASE_COLS = (["signer", "validator", "signer_total", "near_cnt", "near_pct",
+              "expected_pct", "enrichment", "peak_offset", "peak_count"]
+             + [f"off_{o}" for o in OFFSETS])
+
 
 def score_pairs(per_signer, signer_totals, global_freq, min_enrichment, min_near_cnt):
-    """Score each (signer, validator) pair by enrichment."""
     rows = []
     for signer, vmap in per_signer.items():
         total = signer_totals.get(signer, 0)
-        if total == 0:
+        if not total:
             continue
         for validator, offset_cnts in vmap.items():
             near_cnt = sum(offset_cnts.values())
-            near_pct = near_cnt / total
-            expected_pct = sum(global_freq[off].get(validator, 0) for off in OFFSETS)
-            enrichment = near_pct / expected_pct if expected_pct > 0 else 0
-            if enrichment < min_enrichment or near_cnt < min_near_cnt:
+            expected = sum(global_freq[o].get(validator, 0.0) for o in OFFSETS)
+            if expected <= 0:
                 continue
-
-            offset_dist = {off: offset_cnts.get(off, 0) for off in OFFSETS}
-            peak_off = max(offset_dist, key=offset_dist.get)
-
-            rows.append({
-                "signer": signer,
-                "validator": validator,
-                "signer_total": total,
-                "near_cnt": near_cnt,
-                "near_pct": near_pct,
-                "expected_pct": expected_pct,
-                "enrichment": enrichment,
-                "peak_offset": peak_off,
-                "peak_count": offset_dist[peak_off],
-                **{f"off_{off}": offset_dist[off] for off in OFFSETS},
-            })
-    # Emit a fixed-schema empty frame when nothing qualifies so downstream code
-    # can safely index expected columns (near_pct, enrichment, ...).
-    base_cols = [
-        "signer", "validator", "signer_total", "near_cnt", "near_pct",
-        "expected_pct", "enrichment", "peak_offset", "peak_count",
-    ] + [f"off_{off}" for off in OFFSETS]
-    if not rows:
-        return pd.DataFrame(columns=base_cols)
-    return pd.DataFrame(rows)
+            near_pct = near_cnt / total
+            eta = near_pct / expected
+            if eta < min_enrichment or near_cnt < min_near_cnt:
+                continue
+            dist = {o: offset_cnts.get(o, 0) for o in OFFSETS}
+            peak = max(dist, key=dist.get)
+            rows.append({"signer": signer, "validator": validator, "signer_total": total,
+                         "near_cnt": near_cnt, "near_pct": near_pct,
+                         "expected_pct": expected, "enrichment": eta,
+                         "peak_offset": peak, "peak_count": dist[peak],
+                         **{f"off_{o}": dist[o] for o in OFFSETS}})
+    # Fixed schema even when empty, so downstream indexing does not depend on luck.
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=BASE_COLS)
 
 
-# ── Cohort Clustering ────────────────────────────────────────────────────────
+# ── Cohorts ──────────────────────────────────────────────────────────────────
 
-def cluster_cohorts(flagged_df, cohort_min_shared):
-    """Cluster signers into cohorts via two mechanisms:
+def cluster_cohorts(flagged, cohort_min_shared):
+    """Group attackers that answer to the same validators.
 
-    1. Shared-validator clustering (Union-Find): two signers are linked if they
-       share >= cohort_min_shared enriched validators. Discovers multi-signer
-       entities that rotate across multiple validators.
-
-    2. Single-validator groups: a validator with >= 2 enriched signers forms a
-       cohort even if those signers don't share other validators. Discovers
-       validator-controlled signer pools.
-
-    Both mechanisms are merged: if signer A is linked to B via shared validators,
-    and B is linked to C via a single-validator group, all three form one cohort.
+    Two mechanisms into one union-find, because they catch different shapes:
+      shared-validator   two attackers flagged on >= cohort_min_shared of the same
+                         validators -- one operator spreading across a validator set
+      single-validator   one validator flagged by >= 2 attackers -- a validator with
+                         a pool of signers
     """
-    signer_to_vals = defaultdict(set)
-    val_to_signers = defaultdict(set)
-    for _, r in flagged_df.iterrows():
-        signer_to_vals[r["signer"]].add(r["validator"])
-        val_to_signers[r["validator"]].add(r["signer"])
-
-    signers_list = sorted(signer_to_vals.keys())
-    parent = {s: s for s in signers_list}
+    signer_to_vals, val_to_signers = defaultdict(set), defaultdict(set)
+    for r in flagged.itertuples():
+        signer_to_vals[r.signer].add(r.validator)
+        val_to_signers[r.validator].add(r.signer)
+    signers = sorted(signer_to_vals)
+    parent = {s: s for s in signers}
 
     def find(x):
         while parent[x] != x:
@@ -237,529 +284,205 @@ def cluster_cohorts(flagged_df, cohort_min_shared):
         if rx != ry:
             parent[rx] = ry
 
-    # Mechanism 1: shared-validator linking
-    for i, s1 in enumerate(signers_list):
-        for s2 in signers_list[i + 1:]:
-            shared = signer_to_vals[s1] & signer_to_vals[s2]
-            if len(shared) >= cohort_min_shared:
-                union(s1, s2)
-
-    # Mechanism 2: single-validator groups (>= 2 signers on same validator)
-    for val, sigs in val_to_signers.items():
-        if len(sigs) >= 2:
-            sigs_list = list(sigs)
-            for i in range(1, len(sigs_list)):
-                union(sigs_list[0], sigs_list[i])
+    for i, a in enumerate(signers):
+        for b in signers[i + 1:]:
+            if len(signer_to_vals[a] & signer_to_vals[b]) >= cohort_min_shared:
+                union(a, b)
+    for _, sigs in val_to_signers.items():
+        sl = sorted(sigs)
+        for s in sl[1:]:
+            union(sl[0], s)
 
     clusters = defaultdict(list)
-    for s in signers_list:
+    for s in signers:
         clusters[find(s)].append(s)
-
-    cohorts = [m for m in clusters.values() if len(m) >= 2]
-    cohorts.sort(key=lambda c: -len(c))
+    cohorts = sorted((m for m in clusters.values() if len(m) >= 2), key=lambda c: -len(c))
     return cohorts, signer_to_vals, val_to_signers
 
 
 # ── Charts ───────────────────────────────────────────────────────────────────
 
-def plot_enrichment_overview(signer_summary, chart_dir, tag):
-    """Leader concentration scatter and enrichment distribution."""
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+def chart_enrichment(var, flagged, sf, chart_dir, subtitle):
+    """Where the flagged pairs sit: enrichment distribution, and which offset peaks.
 
-    # Left: top-1 share vs count
-    ax = axes[0]
-    ax.scatter(signer_summary["sandwich_count"],
-               signer_summary["w0_top_pct"] * 100,
-               s=20, alpha=0.6, c="steelblue")
-    ax.set_xlabel("Sandwich Count", fontsize=12)
-    ax.set_ylabel("Top-1 Leader Share at Slot (%)", fontsize=12)
-    ax.set_title("Leader Concentration at Sandwich Slot (offset=0)", fontsize=13)
-    ax.set_xscale("log")
-    ax.axhline(5, color="red", linestyle="--", alpha=0.5, label="5%")
-    ax.legend()
-
-    # Right: enrichment at ±4 window
-    ax = axes[1]
-    enr = signer_summary["w4_top_enrich"].clip(0, 30)
-    ax.hist(enr, bins=40, edgecolor="black", alpha=0.7, color="steelblue")
-    ax.set_xlabel("Top-1 Enrichment (±4 window)", fontsize=12)
-    ax.set_ylabel("Number of Signers", fontsize=12)
-    ax.set_title("Distribution of Top-1 Leader Enrichment (±4)", fontsize=13)
-    ax.axvline(5, color="red", linestyle="--", alpha=0.7, label="Threshold=5x")
-    ax.legend()
-
+    The offset panel is the one that carries the argument. A relationship with the
+    validator that ORDERS the sandwich peaks at offset 0; a peak at -1 or +1 says
+    the attacker is timing its submission around that validator's turn instead.
+    """
+    colour = SERIES[var]
+    fig, ax = plt.subplots(1, 2, figsize=(11.5, 4.4))
+    if len(flagged):
+        ax[0].hist(flagged.enrichment, bins=30, color=colour,
+                   edgecolor=SURFACE, linewidth=1.2)
+        ax[0].set_xlabel("enrichment $\\eta$ (x the validator's own share)")
+        ax[0].set_ylabel("flagged pairs")
+        counts = flagged.peak_offset.value_counts().reindex(OFFSETS).fillna(0)
+        ax[1].bar(range(len(OFFSETS)), counts.to_numpy(), 0.68,
+                  color=colour, edgecolor=SURFACE, linewidth=2)
+        ax[1].set_xticks(range(len(OFFSETS)))
+        ax[1].set_xticklabels([f"{o:+d}" if o else "0\n(own rotation)" for o in OFFSETS])
+        ax[1].set_xlabel("leader rotation offset of the pair's peak")
+        ax[1].set_ylabel("flagged pairs")
+        for i, v in enumerate(counts.to_numpy()):
+            if v:
+                ax[1].annotate(f"{int(v)}", (i, v), xytext=(0, 4),
+                               textcoords="offset points", ha="center", fontsize=9, color=INK)
+    else:
+        for a in ax:
+            a.text(0.5, 0.5, "no pair cleared the thresholds",
+                   ha="center", va="center", color=INK_MUTED, transform=a.transAxes)
+    ax[0].set_title("Enrichment of flagged pairs", loc="left", fontsize=10.5, pad=8)
+    ax[1].set_title("Which rotation the relationship peaks in", loc="left", fontsize=10.5, pad=8)
+    for a in ax:
+        a.grid(axis="y", alpha=0.55)
+        a.set_axisbelow(True)
+    fig.suptitle(f"Validator association, Signal Bots only · {subtitle}",
+                 x=0.005, ha="left", fontsize=11, y=1.03)
     plt.tight_layout()
-    plt.savefig(os.path.join(chart_dir, f"leader_concentration_{tag}.png"), dpi=150)
+    out = os.path.join(chart_dir, "enrichment_overview.png")
+    plt.savefig(out, dpi=160, bbox_inches="tight")
     plt.close()
+    return out
 
 
-def plot_cohort_detail(cohorts, signer_to_vals, bot_sf, per_signer, signer_totals,
-                       global_freq, v_info, chart_dir, tag):
-    """Heatmap for top cohorts showing signer × validator enrichment."""
-    if not cohorts:
-        return
-
-    # Take top 3 cohorts (or fewer)
-    top_cohorts = cohorts[:3]
-    n_plots = len(top_cohorts)
-    fig, axes = plt.subplots(1, n_plots, figsize=(7 * n_plots, max(6, max(len(c) for c in top_cohorts) * 0.5 + 2)))
-
-    if n_plots == 1:
-        axes = [axes]
-
-    for ax, (cidx, members) in zip(axes, enumerate(top_cohorts, 1)):
-        # Get shared validators (union)
-        shared_vals = set()
-        for s in members:
-            shared_vals.update(signer_to_vals.get(s, set()))
-
-        # Sort validators by how many members flag them
-        val_member_count = {}
-        for v in shared_vals:
-            val_member_count[v] = sum(1 for s in members if v in signer_to_vals.get(s, set()))
-        sorted_vals = sorted(shared_vals, key=lambda v: -val_member_count[v])[:15]
-
-        # Build enrichment matrix
-        matrix = np.zeros((len(members), len(sorted_vals)))
-        for i, sig in enumerate(members):
-            for j, val in enumerate(sorted_vals):
-                near_cnt = sum(per_signer.get(sig, {}).get(val, {}).values())
-                total = signer_totals.get(sig, 1)
-                pct = near_cnt / total
-                exp = sum(global_freq[off].get(val, 0) for off in OFFSETS)
-                matrix[i, j] = pct / exp if exp > 0 else 0
-
-        im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd", vmin=0, vmax=20)
-        ax.set_xticks(range(len(sorted_vals)))
-        v_labels = []
-        for v in sorted_vals:
-            name = str(v_info.get(v, {}).get("name", ""))
-            name = name.strip() if name and name != "nan" else ""
-            v_labels.append(f"{v[:8]}({name[:10]})" if name else v[:10])
-        ax.set_xticklabels(v_labels, rotation=90, fontsize=7)
-        ax.set_yticks(range(len(members)))
-        sig_labels = [f"{s[:10]}({signer_totals.get(s,0)})" for s in members]
-        ax.set_yticklabels(sig_labels, fontsize=8)
-        ax.set_title(f"Cohort {cidx}: {len(members)} signers, {len(shared_vals)} validators",
-                     fontsize=11)
-
-    fig.suptitle("Signer-Validator Enrichment Heatmaps (top cohorts)", fontsize=13, y=1.02)
+def chart_top_pairs(var, flagged, chart_dir, subtitle, top_n=20):
+    """The strongest relationships, one bar each, so they can be named and checked."""
+    if not len(flagged):
+        return None
+    d = flagged.nlargest(min(top_n, len(flagged)), "enrichment").iloc[::-1]
+    labels = [f"{r.signer[:8]}… / {r.validator[:8]}…" for r in d.itertuples()]
+    fig, ax = plt.subplots(figsize=(10, max(3.2, 0.34 * len(d))))
+    y = np.arange(len(d))
+    ax.barh(y, d.enrichment, 0.68, color=SERIES[var], edgecolor=SURFACE, linewidth=1.6)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8.5)
+    ax.set_xlabel("enrichment $\\eta$")
+    ax.axvline(1.0, color=INK_MUTED, linewidth=1.0, linestyle="--")
+    ax.annotate("chance", (1.0, len(d) - 0.5), xytext=(4, 0),
+                textcoords="offset points", fontsize=8.5, color=INK_MUTED)
+    for i, r in enumerate(d.itertuples()):
+        ax.annotate(f"{r.enrichment:.0f}x  n={r.near_cnt:,}", (r.enrichment, i),
+                    xytext=(4, 0), textcoords="offset points", va="center",
+                    fontsize=8.5, color=INK)
+    ax.set_title(f"Strongest attacker-validator pairs\n{subtitle}",
+                 loc="left", fontsize=11, pad=10)
+    ax.grid(axis="x", alpha=0.55)
+    ax.set_axisbelow(True)
     plt.tight_layout()
-    plt.savefig(os.path.join(chart_dir, f"cohort_heatmaps_{tag}.png"), dpi=150,
-                bbox_inches="tight")
+    out = os.path.join(chart_dir, "top_pairs.png")
+    plt.savefig(out, dpi=160, bbox_inches="tight")
     plt.close()
+    return out
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def _load_pooled_attackers(tag, exclude_tiers, cnt_min):
-    """Pool bot_attackers and bot_sandwiches across the three classifier
-    categories, exclude the specified tiers, and restrict to attackers
-    with sandwich_count >= cnt_min.
+def run_variant(client, a, variant, tag, blocks, slot_to_block, global_freq, stake_share):
+    label = "include" if variant == "include" else "exclude"
+    out_dir = os.path.join(a.out_root, a.database, f"{label}_XL")
+    chart_dir = os.path.join(out_dir, "charts")
+    data_dir = os.path.join(out_dir, "data")
+    for p in (chart_dir, data_dir):
+        os.makedirs(p, exist_ok=True)
 
-    Returns (bot_sf, bot_ps, breakdown_string).
-    """
-    bot_frames = []
-    sw_frames = []
-    breakdown = []
-    for cat in CATEGORIES:
-        sf_path = f"data/3_attacker_filter/{cat}/bot_attackers_{tag}.parquet"
-        sw_path = f"data/3_attacker_filter/{cat}/bot_sandwiches_{tag}.parquet"
-        if not (os.path.exists(sf_path) and os.path.exists(sw_path)):
-            print(f"  WARN: missing {cat} outputs, skipping")
-            continue
-        sf = pd.read_parquet(sf_path)
-        sw = pd.read_parquet(sw_path)
-        if exclude_tiers:
-            sf = sf[~sf["tier"].isin(exclude_tiers)]
-            sw = sw[sw["signer"].isin(sf.index)]
-        sf = sf.assign(origin_category=cat).reset_index()
-        sw = sw.assign(origin_category=cat)
-        bot_frames.append(sf)
-        sw_frames.append(sw)
-        breakdown.append(f"{cat}={len(sf)}")
-    bot_sf_all = pd.concat(bot_frames, ignore_index=True)
-    bot_ps_all = pd.concat(sw_frames, ignore_index=True)
+    print(f"\n{'=' * 96}\ncross-leader {label}d")
+    try:
+        sf, ps, breakdown = load_signal_bots(a.database, tag, label)
+    except MissingVerdict as e:
+        print(f"  SKIPPED: {e} has no `expert_verdict` column. Re-run 3_attacker_filter.py "
+              f"for this variant; proceeding without it would use the unreviewed population.")
+        return []
+    print(f"  Signal Bots: {len(sf):,} ({breakdown}) · {len(ps):,} sandwiches")
 
-    # Apply CNT >= cnt_min on POOLED sandwich count per signer (since a
-    # signer's sandwiches may straddle categories — though by design the 302
-    # tier-filtered set has no signer-level overlap, the pooled groupby is
-    # the safest aggregation).
-    cnt_per_signer = bot_ps_all.groupby("signer").size()
-    keep = set(cnt_per_signer[cnt_per_signer >= cnt_min].index)
-    bot_sf = bot_sf_all[bot_sf_all["signer"].isin(keep)].copy()
-    # Dedup signer-level rows: a signer should only appear once. Keep the
-    # row from whichever category it was originally classified in.
-    bot_sf = bot_sf.drop_duplicates("signer", keep="first").set_index("signer")
-    bot_ps = bot_ps_all[bot_ps_all["signer"].isin(keep)].reset_index(drop=True)
+    if not a.include_cross_leader:
+        if "cross_leader" not in ps.columns:
+            raise SystemExit("bot_sandwiches has no `cross_leader` column -- re-run phase 3")
+        n_all = len(ps)
+        ps = ps[~ps["cross_leader"].astype(bool)]
+        print(f"  single-leader only: {len(ps):,} kept, "
+              f"{n_all - len(ps):,} cross-leader dropped ({(n_all - len(ps)) / n_all:.2%})")
+        # |S_a| is recomputed from `ps` below, so the denominator follows the filter.
+        sf = sf[sf.index.isin(ps["signer"].unique())]
+        if ps.empty:
+            raise SystemExit("no single-leader sandwiches left")
 
-    return bot_sf, bot_ps, breakdown
+    per_signer, missed = compute_signer_validator_counts(ps, slot_to_block, blocks)
+    if missed:
+        print(f"  {missed:,} sandwiches ({missed/len(ps):.2%}) sit at slots with no "
+              f"slot_leaders row and are dropped from the denominator")
+    totals = ps.groupby("signer").size().to_dict()
+
+    flagged = score_pairs(per_signer, totals, global_freq, a.min_enrichment, a.min_near_cnt)
+    print(f"  flagged pairs (eta >= {a.min_enrichment:g}, n >= {a.min_near_cnt}): {len(flagged):,}"
+          f" · {flagged.signer.nunique() if len(flagged) else 0} attackers"
+          f" · {flagged.validator.nunique() if len(flagged) else 0} validators")
+
+    # The largest validators are met often by everyone; their enrichment is the least
+    # informative kind, so the same table is emitted with them removed.
+    trusted = set(stake_share.nlargest(a.trusted_top_n).index)
+    untrusted = flagged[~flagged.validator.isin(trusted)] if len(flagged) else flagged
+    print(f"  after removing the top {a.trusted_top_n} validators by slot share: "
+          f"{len(untrusted):,} pairs")
+
+    cohorts, signer_to_vals, val_to_signers = cluster_cohorts(flagged, a.cohort_min_shared)
+    print(f"  cohorts (>=2 attackers): {len(cohorts)} covering "
+          f"{sum(len(c) for c in cohorts)} attackers")
+    for i, c in enumerate(cohorts[:5], 1):
+        vals = set().union(*(signer_to_vals[s] for s in c))
+        print(f"    cohort {i}: {len(c)} attackers · {len(vals)} validators")
+
+    flagged.to_csv(os.path.join(data_dir, f"flagged_pairs_{tag}.csv"), index=False)
+    untrusted.to_csv(os.path.join(data_dir, f"untrusted_pairs_{tag}.csv"), index=False)
+    pd.DataFrame([{"cohort": i, "signer": s,
+                   "n_validators": len(signer_to_vals[s]),
+                   "sandwich_count": totals.get(s, 0)}
+                  for i, c in enumerate(cohorts, 1) for s in c]
+                 ).to_csv(os.path.join(data_dir, f"cohort_members_{tag}.csv"), index=False)
+    if len(flagged):
+        (flagged.sort_values("enrichment", ascending=False)
+                .groupby("signer").head(1)
+                .to_csv(os.path.join(data_dir, f"signer_top_validator_{tag}.csv"), index=False))
+
+    sub = (f"epochs {a.start_epoch}–{a.end_epoch} · cross-leader {label}d · "
+           f"{len(sf):,} Signal Bots · window ±{OFFSET_MAX} rotations")
+    written = [chart_enrichment(label, flagged, sf, chart_dir, sub)]
+    tp = chart_top_pairs(label, flagged, chart_dir, sub)
+    if tp:
+        written.append(tp)
+    return written
 
 
 def main():
-    args = parse_args()
-    tag = f"{args.start_epoch}_{args.end_epoch}"
-    start_slot = args.start_epoch * SLOTS_PER_EPOCH
-    end_slot = (args.end_epoch + 1) * SLOTS_PER_EPOCH
+    a = parse_args()
+    tag = f"{a.start_epoch}_{a.end_epoch}"
+    lo, hi = a.start_epoch * SLOTS_PER_EPOCH, (a.end_epoch + 1) * SLOTS_PER_EPOCH
+    print("=== Phase 4: validator association (Signal Bots only) ===")
+    print(f"Database {a.database} · epochs {a.start_epoch}-{a.end_epoch} · "
+          f"window ±{OFFSET_MAX} rotations ({len(OFFSETS)} positions)")
+    print(f"Flag at eta >= {a.min_enrichment:g} with >= {a.min_near_cnt} appearances")
 
-    out_dir = "data/4_validator_association/all_attackers"
-    chart_dir = os.path.join(out_dir, "charts")
-    os.makedirs(chart_dir, exist_ok=True)
-
-    exclude_tiers = [t.strip() for t in args.exclude_tiers.split(",") if t.strip()]
-    print("=== Phase 4: Validator Association Analysis (Pooled) ===")
-    print(f"Epoch range: {args.start_epoch}-{args.end_epoch}")
-    print(f"Pooling 3 categories, excluding tiers: {exclude_tiers}")
-    print(f"Parameters: cnt_min={args.cnt_min}, min_enrichment={args.min_enrichment}, "
-          f"min_near_cnt={args.min_near_cnt}, "
-          f"signer_peak_pct={args.signer_peak_pct}, "
-          f"cohort_min_shared={args.cohort_min_shared}")
-
-    # Pool attackers across categories
-    print("\nLoading data...")
-    bot_sf, bot_ps, breakdown = _load_pooled_attackers(
-        tag, exclude_tiers, args.cnt_min)
-    print(f"  Per-category contribution (after tier filter): {', '.join(breakdown)}")
-    print(f"  Pooled attackers (CNT>={args.cnt_min}): {len(bot_sf):,}")
-    print(f"  Pooled sandwiches: {len(bot_ps):,}")
-
-    # Load validator info
-    v_info = {}
-    vpath = os.path.join(os.path.dirname(__file__), "data", "stakewiz", "validators.csv")
-    if os.path.exists(vpath):
-        vdf = pd.read_csv(vpath)
-        v_info = {r["identity"]: r.to_dict() for _, r in vdf.iterrows()}
-        # Trusted set
-        named = vdf[vdf["name"].notna() & (vdf["name"].str.strip() != "")]
-        trusted = set(named.nlargest(args.trusted_top_n, "activated_stake")["identity"])
-        print(f"  Validator info: {len(v_info)} validators, "
-              f"{args.trusted_top_n} trusted")
-    else:
-        trusted = set()
-        print("  No validator info file found")
-
-    # Load leader schedule
-    print("\nLoading leader schedule...")
-    client = get_client()
-    blocks = load_leader_blocks(client, start_slot, end_slot)
+    client = get_client(a.database)
+    print("\nBuilding leader rotations from slot_leaders ...")
+    blocks = load_leader_blocks(client, lo, hi)
     slot_to_block = build_slot_to_block_idx(blocks)
-    print(f"  {len(blocks):,} leader blocks")
-
     global_freq = compute_global_offset_freq(blocks)
+    sizes = np.array([int(e) - int(s) + 1 for s, e, _ in blocks])
+    print(f"  {len(blocks):,} rotations · {sizes.sum():,} slots · "
+          f"mean run {sizes.mean():.2f} slots · {len({b[2] for b in blocks}):,} validators")
 
-    # Per-signer counts
-    print("\nComputing per-signer per-validator offset counts...")
-    per_signer = compute_signer_validator_counts(bot_ps, slot_to_block, blocks)
-    signer_totals = bot_ps.groupby("signer").size().to_dict()
+    stake = defaultdict(int)
+    for s, e, v in blocks:
+        stake[v] += int(e) - int(s) + 1
+    stake_share = pd.Series(stake, dtype=float) / sizes.sum()
 
-    # Compute signer profiles for enrichment output
-    token_prices = {}
-    tp_path = os.path.join(os.path.dirname(__file__), "data", "token_prices", "prices.csv")
-    if os.path.exists(tp_path):
-        tpdf = pd.read_csv(tp_path)
-        for _, r in tpdf.iterrows():
-            if pd.notna(r.get("usd_price")):
-                token_prices[r["token"]] = r["usd_price"]
-    if "SOL" not in token_prices:
-        token_prices["SOL"] = 86.0
-
-    bot_ps_copy = bot_ps.copy()
-    bot_ps_copy["usd_profit"] = bot_ps_copy["profit"] * bot_ps_copy["token_a"].map(token_prices)
-    signer_usd = bot_ps_copy.groupby("signer")["usd_profit"].sum()
-
-    # Score pairs
-    print(f"\nScoring (signer, validator) pairs...")
-    pairs = score_pairs(per_signer, signer_totals, global_freq,
-                        args.min_enrichment, args.min_near_cnt)
-    print(f"  Flagged pairs: {len(pairs):,}")
-
-    no_flagged = (len(pairs) == 0)
-    if no_flagged:
-        print("No suspicious pairs found — will still emit empty output files "
-              "so downstream analyst scripts see an explicit 'ran, zero enriched' "
-              "signal rather than a missing directory.")
-
-    # Enrich with validator info
-    def _vi(v, key, default=""):
-        return v_info[v].get(key, default) if v in v_info else default
-
-    def vfmt(v, max_addr=10):
-        """Format validator as 'addr(name)' or 'addr' if no name."""
-        name = str(_vi(v, "name", ""))
-        name = name.strip() if name and name != "nan" else ""
-        addr = v[:max_addr]
-        return f"{addr}({name})" if name else addr
-
-    # Validator-level baselines: N_v (slot count led by v) and N (total slots).
-    # These let the CSV reproduce the paper formula
-    #   eta_paper = N_av * N / ((2k+1) * N_v * |S_a|)
-    # alongside the code's slot-weighted form.
-    N_total = sum(e - s + 1 for s, e, _ in blocks)
-    Nv_by_validator = defaultdict(int)
-    for s_, e_, ld_ in blocks:
-        Nv_by_validator[ld_] += (e_ - s_ + 1)
-    window_size = 2 * OFFSET_MAX + 1   # = 9
-
-    if not no_flagged:
-        # Validator metadata
-        pairs["v_name"] = pairs["validator"].map(lambda v: str(_vi(v, "name", "")))
-        pairs["v_stake"] = pairs["validator"].map(lambda v: _vi(v, "activated_stake", 0))
-        pairs["v_ip_org"] = pairs["validator"].map(lambda v: str(_vi(v, "ip_org", "")))
-        pairs["v_ip_city"] = pairs["validator"].map(lambda v: str(_vi(v, "ip_city", "")))
-        pairs["v_ip_asn"] = pairs["validator"].map(lambda v: str(_vi(v, "ip_asn", "")))
-        pairs["trusted"] = pairs["validator"].isin(trusted)
-
-        # Signer profile (from pooled bot_sf)
-        def _sig(col, default=np.nan):
-            ser = bot_sf[col] if col in bot_sf.columns else pd.Series(dtype=float)
-            return pairs["signer"].map(ser).fillna(default)
-        pairs["signer_origin_category"] = _sig("origin_category", "")
-        pairs["signer_tier"] = _sig("tier", "")
-        pairs["signer_wr"] = _sig("win_rate")
-        pairs["signer_slip"] = _sig("mean_slippage")
-        pairs["signer_fg100"] = _sig("fg100_ratio")
-        pairs["signer_jito_count"] = _sig("jito_count", 0).astype(int)
-        pairs["signer_sol_total_profit"] = _sig("sol_total_profit", 0.0)
-        pairs["signer_usd_total_profit"] = _sig("usd_total_profit", 0.0)
-        pairs["signer_usd_pooled"] = pairs["signer"].map(signer_usd)
-
-        # Formula variables (explicit, for paper/code cross-check)
-        pairs["N_av_near_cnt"] = pairs["near_cnt"]
-        pairs["N_sa_signer_total"] = pairs["signer_total"]
-        pairs["N_v_validator_slots"] = pairs["validator"].map(
-            lambda v: Nv_by_validator.get(v, 0))
-        pairs["N_total_slots"] = N_total
-        pairs["window_size_2kp1"] = window_size
-        # Paper denominator: (2k+1) * N_v / N
-        pairs["expected_per_window_paper"] = (
-            window_size * pairs["N_v_validator_slots"] / N_total)
-        pairs["expected_per_window_code"] = pairs["expected_pct"]
-        # Paper closed-form
-        denom = (window_size * pairs["N_v_validator_slots"] *
-                 pairs["N_sa_signer_total"]).replace(0, np.nan)
-        pairs["enrichment_paper"] = (
-            pairs["N_av_near_cnt"] * N_total / denom)
-        pairs["enrichment_code"] = pairs["enrichment"]
-
-        # Optional signer peak filter (default 0 keeps everything)
-        if args.signer_peak_pct > 0:
-            peak_per_signer = pairs.groupby("signer")["near_pct"].max()
-            qualified = set(peak_per_signer[peak_per_signer >=
-                                            args.signer_peak_pct].index)
-            before = len(pairs)
-            pairs = pairs[pairs["signer"].isin(qualified)]
-            print(f"  After signer peak filter (>={args.signer_peak_pct:.0%}): "
-                  f"{len(qualified)} signers, {len(pairs)} pairs "
-                  f"(dropped {before - len(pairs)})")
-
-        # Exclude trusted for cohort analysis
-        untrusted_pairs = pairs[~pairs["trusted"]]
-        print(f"  Non-trusted pairs: {len(untrusted_pairs)}")
-    else:
-        # No pairs passed the enrichment threshold. Keep pairs/untrusted_pairs as
-        # empty frames with the full expected schema so the on-disk CSVs have
-        # stable headers and the downstream analyst sees "ran, zero enriched".
-        extra = ["signer_origin_category","signer_tier","signer_wr","signer_slip",
-                 "signer_fg100","signer_jito_count","signer_sol_total_profit",
-                 "signer_usd_total_profit","signer_usd_pooled",
-                 "N_av_near_cnt","N_sa_signer_total","N_v_validator_slots",
-                 "N_total_slots","window_size_2kp1","expected_per_window_paper",
-                 "expected_per_window_code","enrichment_paper","enrichment_code"]
-        empty_cols = list(pairs.columns) + [
-            "v_name", "v_stake", "v_ip_org", "v_ip_city", "v_ip_asn",
-            "trusted",
-        ] + extra
-        pairs = pd.DataFrame(columns=empty_cols)
-        untrusted_pairs = pairs.copy()
-
-    # ── Per-signer windowed summary ──────────────────────────────────────
-    print("\nBuilding per-signer windowed summaries...")
-    summary_rows = []
-    for signer in sorted(per_signer.keys()):
-        total = signer_totals.get(signer, 0)
-        if total == 0:
-            continue
-        vmap = per_signer[signer]
-        row = {"signer": signer, "sandwich_count": total}
-
-        for k in range(OFFSET_MAX + 1):
-            offs = [o for o in OFFSETS if abs(o) <= k]
-            win_counts = defaultdict(int)
-            for val, offset_cnts in vmap.items():
-                c = sum(offset_cnts.get(o, 0) for o in offs)
-                if c > 0:
-                    win_counts[val] = c
-
-            if not win_counts:
-                row[f"w{k}_top_val"] = ""
-                row[f"w{k}_top_pct"] = 0
-                row[f"w{k}_top_enrich"] = 0
-                continue
-
-            ranked = sorted(win_counts.items(), key=lambda x: -x[1])
-            top_v, top_c = ranked[0]
-            top_pct = top_c / total
-            top_exp = sum(global_freq[o].get(top_v, 0) for o in offs)
-            top_enrich = top_pct / top_exp if top_exp > 0 else 0
-
-            row[f"w{k}_top_val"] = top_v
-            row[f"w{k}_top_pct"] = top_pct
-            row[f"w{k}_top_enrich"] = top_enrich
-
-        summary_rows.append(row)
-
-    signer_summary = pd.DataFrame(summary_rows)
-
-    # ── Cohort clustering ────────────────────────────────────────────────
-    print(f"\nClustering cohorts (min_shared={args.cohort_min_shared})...")
-    cohorts, signer_to_vals, val_to_signers = cluster_cohorts(
-        untrusted_pairs, args.cohort_min_shared)
-    print(f"  Cohorts with >= 2 signers: {len(cohorts)}")
-
-    # ── Reports ──────────────────────────────────────────────────────────
-    print(f"\n{'='*80}")
-    print(f"  RESULTS")
-    print(f"{'='*80}")
-
-    # Highlight: KKK + HwGq type (self-operated validator)
-    self_op = pairs[pairs["near_pct"] >= 0.5].sort_values("near_pct", ascending=False)
-    if len(self_op) > 0:
-        print(f"\n  --- Self-operated validator candidates (near_pct >= 50%) ---")
-        for _, r in self_op.iterrows():
-            print(f"    {r['signer'][:14]} [wr={r['signer_wr']:.2f} slip={r['signer_slip']:.3f} "
-                  f"USD=${r['signer_usd_pooled']:,.0f}]")
-            print(f"      -> {vfmt(r['validator'], 14)} "
-                  f"near={int(r['near_cnt'])}/{int(r['signer_total'])} "
-                  f"({r['near_pct']*100:.1f}%) enrich={r['enrichment']:.0f}x")
-
-    # Multi-signer validators
-    multi_val = untrusted_pairs.groupby("validator").agg(
-        n_signers=("signer", "nunique"),
-        sum_near=("near_cnt", "sum"),
-        max_enrich=("enrichment", "max"),
-        v_name=("v_name", "first"),
-        v_ip_org=("v_ip_org", "first"),
-    ).sort_values("n_signers", ascending=False)
-    multi_val = multi_val[multi_val["n_signers"] >= 2]
-
-    if len(multi_val) > 0:
-        print(f"\n  --- Validators controlling >= 2 signers (non-trusted) ---")
-        for val, r in multi_val.head(20).iterrows():
-            sigs = untrusted_pairs[untrusted_pairs["validator"] == val]["signer"].unique()
-            sig_str = ", ".join(s[:10] for s in sorted(sigs)[:6])
-            if len(sigs) > 6:
-                sig_str += f" +{len(sigs)-6}"
-            org = r['v_ip_org'][:20] if pd.notna(r['v_ip_org']) else ""
-            print(f"    {vfmt(val, 14)} ({org}) "
-                  f"-> {int(r['n_signers'])} signers: {sig_str}")
-
-    # Cohort details
-    if cohorts:
-        print(f"\n  --- Signer Cohorts ---")
-        cohort_rows = []
-        for cidx, members in enumerate(cohorts, 1):
-            shared_union = set()
-            for s in members:
-                shared_union.update(signer_to_vals.get(s, set()))
-            total_sw = sum(signer_totals.get(s, 0) for s in members)
-
-            # Validator ASN fingerprint
-            orgs = defaultdict(int)
-            for v in shared_union:
-                org = str(_vi(v, "ip_org", ""))
-                if org:
-                    orgs[org] += 1
-            top_org = ", ".join(f"{o}({c})" for o, c in sorted(orgs.items(), key=lambda x: -x[1])[:3])
-
-            print(f"\n    Cohort {cidx}: {len(members)} signers, "
-                  f"{len(shared_union)} validators, {total_sw:,} sandwiches")
-            print(f"      Top orgs: {top_org}")
-
-            for sig in sorted(members, key=lambda s: -signer_totals.get(s, 0)):
-                n = signer_totals.get(sig, 0)
-                n_vals = len(signer_to_vals.get(sig, set()))
-                wr = bot_sf.loc[sig, "win_rate"] if sig in bot_sf.index else float("nan")
-                slip = bot_sf.loc[sig, "mean_slippage"] if sig in bot_sf.index else float("nan")
-                fg100 = bot_sf.loc[sig, "fg100_ratio"] if sig in bot_sf.index and "fg100_ratio" in bot_sf.columns else float("nan")
-                usd = signer_usd.get(sig, 0)
-                # Top 3 enriched validators for this signer
-                sig_pairs = untrusted_pairs[untrusted_pairs["signer"] == sig].nlargest(3, "enrichment")
-                top_strs = []
-                for _, pr in sig_pairs.iterrows():
-                    top_strs.append(f"{vfmt(pr['validator'])}"
-                                   f"={pr['near_pct']*100:.1f}%({pr['enrichment']:.0f}x)")
-                print(f"      {sig[:16]}... cnt={n:>5} wr={wr:.2f} slip={slip:.3f} "
-                      f"fg100={fg100:.2f} USD=${usd:>8,.0f}  {' '.join(top_strs)}")
-
-                cohort_rows.append({
-                    "cohort": cidx,
-                    "signer": sig,
-                    "sandwich_count": n,
-                    "win_rate": wr,
-                    "mean_slippage": slip,
-                    "fg100_ratio": fg100,
-                    "usd_profit": usd,
-                    "n_enriched_validators": n_vals,
-                })
-
-        cohort_df = pd.DataFrame(cohort_rows)
-    else:
-        cohort_df = pd.DataFrame()
-
-    # ── Summary stats ────────────────────────────────────────────────────
-    n_total = len(signer_summary)
-    n_baseline = len(signer_summary[signer_summary["w4_top_enrich"] < 2])
-    n_moderate = len(signer_summary[(signer_summary["w4_top_enrich"] >= 2) &
-                                    (signer_summary["w4_top_enrich"] < 5)])
-    n_high = len(signer_summary[signer_summary["w4_top_enrich"] >= 5])
-    print(f"\n  --- Enrichment Summary (±4 window) ---")
-    print(f"    Baseline-like (<2x):  {n_baseline} signers ({n_baseline/n_total*100:.0f}%)")
-    print(f"    Moderate (2-5x):      {n_moderate} signers ({n_moderate/n_total*100:.0f}%)")
-    print(f"    High (>=5x):          {n_high} signers ({n_high/n_total*100:.0f}%)")
-
-    # ── Save outputs ─────────────────────────────────────────────────────
-    print(f"\nSaving outputs to {out_dir}/...")
-
-    # Reorder columns: attacker info → validator info → formula vars → offsets
-    preferred = [
-        "signer", "signer_origin_category", "signer_tier",
-        "N_sa_signer_total",
-        "signer_wr", "signer_slip", "signer_fg100", "signer_jito_count",
-        "signer_sol_total_profit", "signer_usd_total_profit", "signer_usd_pooled",
-        "validator", "v_name", "v_ip_org", "v_ip_city", "v_ip_asn",
-        "v_stake", "trusted",
-        "N_av_near_cnt", "N_v_validator_slots", "N_total_slots",
-        "window_size_2kp1",
-        "expected_per_window_paper", "expected_per_window_code",
-        "enrichment_paper", "enrichment_code",
-        "near_pct", "peak_offset", "peak_count",
-    ] + [f"off_{o}" for o in OFFSETS]
-    final_cols = [c for c in preferred if c in pairs.columns] + [
-        c for c in pairs.columns if c not in preferred
-    ]
-    pairs_out = pairs[final_cols] if len(pairs) > 0 else pairs
-    untrusted_out = untrusted_pairs[final_cols] if len(untrusted_pairs) > 0 else untrusted_pairs
-
-    pairs_out.to_csv(f"{out_dir}/flagged_pairs_{tag}.csv", index=False)
-    untrusted_out.to_csv(f"{out_dir}/untrusted_pairs_{tag}.csv", index=False)
-    signer_summary.to_csv(f"{out_dir}/signer_leader_summary_{tag}.csv", index=False)
-    if len(cohort_df) > 0:
-        cohort_df.to_csv(f"{out_dir}/cohort_members_{tag}.csv", index=False)
-
-    print(f"  flagged_pairs_{tag}.csv ({len(pairs):,} pairs)")
-    print(f"  untrusted_pairs_{tag}.csv ({len(untrusted_pairs):,} pairs)")
-    print(f"  signer_leader_summary_{tag}.csv ({len(signer_summary):,} signers)")
-    if len(cohort_df) > 0:
-        print(f"  cohort_members_{tag}.csv ({len(cohort_df):,} rows)")
-
-    # ── Charts ───────────────────────────────────────────────────────────
-    print(f"\nGenerating charts...")
-    plot_enrichment_overview(signer_summary, chart_dir, tag)
-    plot_cohort_detail(cohorts, signer_to_vals, bot_sf, per_signer,
-                       signer_totals, global_freq, v_info, chart_dir, tag)
-    print(f"  Charts saved to {chart_dir}/")
-
-    print(f"\n=== Done ===")
+    written = []
+    for variant in ("include", "exclude"):
+        v_tag = f"{tag}_cl-include" if variant == "include" else tag
+        written += run_variant(client, a, variant, v_tag, blocks, slot_to_block,
+                               global_freq, stake_share)
+    print(f"\nSaved under {a.out_root}/{a.database}/")
+    for w in written:
+        print(f"  {w}")
 
 
 if __name__ == "__main__":

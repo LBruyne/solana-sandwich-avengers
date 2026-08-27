@@ -92,7 +92,7 @@ func decodeMeteoraDBC(data []byte) *SlippageInfo {
 
 // Meteora DLMM additional discriminators
 var (
-	meteoraDLMMSwapExactOut  = [8]byte{194, 203, 142, 150, 137, 110, 81, 94}  // sha256("global:swap_exact_out")[:8]
+	meteoraDLMMSwapExactOut  = [8]byte{250, 73, 101, 33, 38, 207, 75, 184}    // sha256("global:swap_exact_out")[:8]
 	meteoraDLMMSwapExactOut2 = [8]byte{43, 215, 247, 132, 137, 60, 243, 81}   // sha256("global:swap_exact_out2")[:8]
 	meteoraDLMMSwapPriceImp  = [8]byte{56, 173, 230, 208, 173, 228, 156, 205} // sha256("global:swap_with_price_impact")[:8]
 	meteoraDLMMSwapPriceImp2 = [8]byte{74, 98, 192, 214, 177, 51, 75, 51}     // sha256("global:swap_with_price_impact2")[:8]
@@ -103,16 +103,19 @@ var (
 // All DLMM swap variants (no swap_mode byte — direction is implicit in instruction name):
 //
 // ExactIn (OUTPUT-limited):
-//   swap:   [disc 8][amount_in u64][min_amount_out u64]
-//   swap2:  [disc 8][amount_in u64][min_amount_out u64][remaining_accounts_info...]
+//
+//	swap:   [disc 8][amount_in u64][min_amount_out u64]
+//	swap2:  [disc 8][amount_in u64][min_amount_out u64][remaining_accounts_info...]
 //
 // ExactOut (INPUT-limited):
-//   swap_exact_out:  [disc 8][max_in_amount u64][out_amount u64]
-//   swap_exact_out2: [disc 8][max_in_amount u64][out_amount u64][remaining_accounts_info...]
+//
+//	swap_exact_out:  [disc 8][max_in_amount u64][out_amount u64]
+//	swap_exact_out2: [disc 8][max_in_amount u64][out_amount u64][remaining_accounts_info...]
 //
 // Price impact (uses BPS, not amount — cannot compute utilization):
-//   swap_with_price_impact:  [disc 8][amount_in u64][active_id Option<i32>][max_price_impact_bps u16]
-//   swap_with_price_impact2: same + remaining_accounts_info
+//
+//	swap_with_price_impact:  [disc 8][amount_in u64][active_id Option<i32>][max_price_impact_bps u16]
+//	swap_with_price_impact2: same + remaining_accounts_info
 //
 // Note: DLMM swap2 does NOT have a swap_mode byte like DAMM v2.
 // The "2" suffix means Token-2022 transfer hook support, not a different swap mode.

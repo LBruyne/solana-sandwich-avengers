@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
-	"time"
 	"sandwich-detector/logger"
 	"sandwich-detector/types"
+	"strings"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -16,13 +16,20 @@ import (
 
 type ClickhouseDB struct {
 	conn driver.Conn
+	db   string              // target database name; all table refs resolve against it as the connection default
+	opts *clickhouse.Options // retained to open a bootstrap connection for CREATE DATABASE
 }
 
 func NewClickhouse() Database {
+	dbName := viper.GetString("CLICKHOUSE_DATABASE")
+	if dbName == "" {
+		dbName = "solwich"
+	}
+
 	opts := &clickhouse.Options{
 		Addr: []string{viper.GetString("CLICKHOUSE_ADDR")},
 		Auth: clickhouse.Auth{
-			Database: viper.GetString("CLICKHOUSE_DATABASE"),
+			Database: dbName,
 			Username: viper.GetString("CLICKHOUSE_USERNAME"),
 			Password: viper.GetString("CLICKHOUSE_PASSWORD"),
 		},
@@ -36,11 +43,7 @@ func NewClickhouse() Database {
 		slog.Error("Failed to connect to ClickHouse", "error", err)
 	}
 
-	db := &ClickhouseDB{conn: conn}
-	// if err := db.CreateTables(); err != nil {
-	// 	panic(fmt.Sprintf("failed to create tables: %v", err))
-	// }
-	return db
+	return &ClickhouseDB{conn: conn, db: dbName, opts: opts}
 }
 
 // Database interface implementation
@@ -48,18 +51,34 @@ func (d *ClickhouseDB) Close() error {
 	return d.conn.Close()
 }
 
+func (d *ClickhouseDB) DatabaseName() string {
+	return d.db
+}
+
 func (d *ClickhouseDB) EnsureDatabaseExists() error {
-	query := `CREATE DATABASE IF NOT EXISTS solwich`
-	if err := d.conn.Exec(context.Background(), query); err != nil {
+	// The main connection's default database is d.db, which the native protocol validates at
+	// handshake — so it can't be used to create d.db when it doesn't exist yet (server returns
+	// code 81). Run CREATE DATABASE over a short-lived connection against the always-present
+	// "default" database instead.
+	bootOpts := *d.opts
+	bootOpts.Auth.Database = "default"
+	boot, err := clickhouse.Open(&bootOpts)
+	if err != nil {
+		return fmt.Errorf("open bootstrap connection: %w", err)
+	}
+	defer boot.Close()
+
+	query := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", d.db)
+	if err := boot.Exec(context.Background(), query); err != nil {
 		return fmt.Errorf("failed to ensure database exists: %w", err)
 	}
-	logger.GlobalLogger.Info("Database ensured to exist", "database", "solwich")
+	logger.GlobalLogger.Info("Database ensured to exist", "database", d.db)
 	return nil
 }
 
 func (d *ClickhouseDB) CreateTables() error {
 	queries := []string{
-		`CREATE TABLE IF NOT EXISTS solwich.jito_bundles
+		`CREATE TABLE IF NOT EXISTS jito_bundles
 		(
 			bundleId String,
 			slot UInt64,
@@ -69,10 +88,11 @@ func (d *ClickhouseDB) CreateTables() error {
 			landedTipLamports UInt64
 		)
 		ENGINE = MergeTree
-		ORDER BY timestamp
+		PARTITION BY intDiv(slot, 432000)
+		ORDER BY (slot, bundleId)
 		SETTINGS index_granularity = 8192`,
 
-		`CREATE TABLE IF NOT EXISTS solwich.slot_bundles
+		`CREATE TABLE IF NOT EXISTS slot_bundles
 		(
 			slot UInt64,
 			bundleFetched Bool,
@@ -80,21 +100,23 @@ func (d *ClickhouseDB) CreateTables() error {
 			bundleTxCount UInt64
 		)
 		ENGINE = ReplacingMergeTree
+		PARTITION BY intDiv(slot, 432000)
 		PRIMARY KEY slot
 		ORDER BY slot
 		SETTINGS index_granularity = 8192`,
 
-		`CREATE TABLE IF NOT EXISTS solwich.slot_leaders
+		`CREATE TABLE IF NOT EXISTS slot_leaders
 		(
 			slot UInt64,
 			leader String
 		)
 		ENGINE = ReplacingMergeTree
+		PARTITION BY intDiv(slot, 432000)
 		PRIMARY KEY slot
 		ORDER BY slot
 		SETTINGS index_granularity = 8192`,
 
-		`CREATE TABLE IF NOT EXISTS solwich.slot_txs
+		`CREATE TABLE IF NOT EXISTS slot_txs
 		(
 			slot UInt64,
 			txFetched Bool,
@@ -107,14 +129,21 @@ func (d *ClickhouseDB) CreateTables() error {
 			sandwichInBundleChecked Bool
 		)
 		ENGINE = ReplacingMergeTree
+		PARTITION BY intDiv(slot, 432000)
 		PRIMARY KEY slot
 		ORDER BY slot
 		SETTINGS index_granularity = 8192`,
 
-		`CREATE TABLE IF NOT EXISTS solwich.sandwiches
+		`CREATE TABLE IF NOT EXISTS sandwiches
 		(
 			sandwichId String,
 			crossBlock Bool,
+			crossLeader Bool DEFAULT false,
+			frontLeader String DEFAULT '',
+			backLeader String DEFAULT '',
+			windowStartSlot UInt64 DEFAULT 0,
+			windowEndSlot UInt64 DEFAULT 0,
+			rpcSource LowCardinality(String) DEFAULT 'live',
 			slot UInt64,
 			timestamp DateTime,
 
@@ -149,10 +178,11 @@ func (d *ClickhouseDB) CreateTables() error {
 			maxSlippageUtilization Float64 DEFAULT 0
 		)
 		ENGINE = MergeTree
+		PARTITION BY intDiv(slot, 432000)
 		ORDER BY (slot, timestamp, sandwichId)
 		SETTINGS index_granularity = 8192`,
 
-		`CREATE TABLE IF NOT EXISTS solwich.sandwich_txs
+		`CREATE TABLE IF NOT EXISTS sandwich_txs
 		(
 			sandwichId String,
 			sandwichTimestamp DateTime,
@@ -188,9 +218,10 @@ func (d *ClickhouseDB) CreateTables() error {
 			slippageLimitAmount Float64 DEFAULT 0,
 			slippageActualAmount Float64 DEFAULT 0,
 			slippageUtilization Float64 DEFAULT -1,
-			slippageDexName String DEFAULT ''
+			poolDex LowCardinality(String) DEFAULT ''
 		)
 		ENGINE = MergeTree
+		PARTITION BY intDiv(slot, 432000)
 		ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)
 		SETTINGS index_granularity = 8192`,
 	}
@@ -199,28 +230,23 @@ func (d *ClickhouseDB) CreateTables() error {
 		if err := d.conn.Exec(context.Background(), q); err != nil {
 			return err
 		}
-		logger.GlobalLogger.Info("Check or create table in DB", "query", q)
+		logger.GlobalLogger.Debug("Check or create table in DB", "query", q)
 	}
 
-	// Add new columns to existing tables for backward compatibility
+	// Keep an existing v2 table in sync when new columns are added to the CREATE above.
+	// ADD COLUMN ... DEFAULT is metadata-only in ClickHouse, so this is instant regardless of row count.
 	alterQueries := []string{
-		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS intentScore Float64 DEFAULT 0`,
-
-		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS maxSlippageUtilization Float64 DEFAULT 0`,
-		
-		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageLimitType String DEFAULT ''`,
-		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageLimitAmount Float64 DEFAULT 0`,
-		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageActualAmount Float64 DEFAULT 0`,
-		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageUtilization Float64 DEFAULT -1`,
-		`ALTER TABLE solwich.sandwich_txs ADD COLUMN IF NOT EXISTS slippageDexName String DEFAULT ''`,
-
-		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS hasFrontInlineTransfer Bool DEFAULT false`,
-		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS hasDirectTransfer Bool DEFAULT false`,
-		`ALTER TABLE solwich.sandwiches ADD COLUMN IF NOT EXISTS hasBackInlineTransfer Bool DEFAULT false`,
+		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS crossLeader Bool DEFAULT false`,
+		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS frontLeader String DEFAULT ''`,
+		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS backLeader String DEFAULT ''`,
+		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS windowStartSlot UInt64 DEFAULT 0`,
+		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS windowEndSlot UInt64 DEFAULT 0`,
+		`ALTER TABLE sandwiches ADD COLUMN IF NOT EXISTS rpcSource LowCardinality(String) DEFAULT 'live'`,
+		`ALTER TABLE sandwich_txs ADD COLUMN IF NOT EXISTS poolDex LowCardinality(String) DEFAULT ''`,
 	}
 	for _, q := range alterQueries {
 		if err := d.conn.Exec(context.Background(), q); err != nil {
-			logger.GlobalLogger.Warn("ALTER TABLE failed (may already exist)", "query", q, "err", err)
+			logger.GlobalLogger.Warn("ALTER TABLE ADD COLUMN failed", "query", q, "err", err)
 		}
 	}
 
@@ -271,7 +297,7 @@ func (d *ClickhouseDB) InsertJitoBundles(bundles types.JitoBundles) error {
 		return nil
 	}
 
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO solwich.jito_bundles")
+	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO jito_bundles")
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch: %w", err)
 	}
@@ -285,7 +311,7 @@ func (d *ClickhouseDB) InsertJitoBundles(bundles types.JitoBundles) error {
 
 func (d *ClickhouseDB) QueryLatestBundleIds(limit uint) ([]string, error) {
 	rows, err := d.conn.Query(context.Background(),
-		fmt.Sprintf(`SELECT bundleId FROM solwich.jito_bundles ORDER BY timestamp DESC LIMIT %d`, limit))
+		fmt.Sprintf(`SELECT bundleId FROM jito_bundles ORDER BY timestamp DESC LIMIT %d`, limit))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query latest bundle ids: %w", err)
 	}
@@ -308,7 +334,7 @@ func (d *ClickhouseDB) QueryLatestBundleIds(limit uint) ([]string, error) {
 }
 
 func (d *ClickhouseDB) QueryBundleTxsBySlot(slot uint64) ([]string, error) {
-	rows, err := d.conn.Query(context.Background(), `SELECT DISTINCT arrayJoin(transactions) FROM solwich.jito_bundles WHERE slot = ?`, slot)
+	rows, err := d.conn.Query(context.Background(), `SELECT DISTINCT arrayJoin(transactions) FROM jito_bundles WHERE slot = ?`, slot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query bundle txs by slot: %w", err)
 	}
@@ -331,7 +357,7 @@ func (d *ClickhouseDB) QueryBundleTxsBySlots(slots []uint64) (map[uint64][]strin
 	}
 	q := fmt.Sprintf(`
 		SELECT slot, arrayJoin(transactions) AS tx
-		FROM solwich.jito_bundles
+		FROM jito_bundles
 		WHERE slot IN (%s)
 	`, placeholders(len(slots)))
 
@@ -362,7 +388,7 @@ func (d *ClickhouseDB) InsertSlotBundles(statuses []*types.SlotBundlesStatus) er
 	if len(statuses) == 0 {
 		return nil
 	}
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO solwich.slot_bundles")
+	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO slot_bundles")
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch: %w", err)
 	}
@@ -374,9 +400,23 @@ func (d *ClickhouseDB) InsertSlotBundles(statuses []*types.SlotBundlesStatus) er
 	return batch.Send()
 }
 
+// DropJitoBundlesEpochPartition removes one epoch's rows from jito_bundles by dropping its
+// partition (jito_bundles is PARTITION BY intDiv(slot, 432000)). This is the delete-after-mark
+// cleanup: once every slot in an epoch has had its sandwich txs inBundle-checked, the raw bundles
+// are no longer needed (the result lives in sandwich_txs.inBundle and the per-slot summary in
+// slot_bundles). A partition drop is metadata-only — far cheaper than row-level ALTER DELETE.
+func (d *ClickhouseDB) DropJitoBundlesEpochPartition(epoch uint64) error {
+	// Partition id is the intDiv(slot,432000) value = the epoch number.
+	q := fmt.Sprintf("ALTER TABLE jito_bundles DROP PARTITION %d", epoch)
+	if err := d.conn.Exec(context.Background(), q); err != nil {
+		return fmt.Errorf("failed to drop jito_bundles partition %d: %w", epoch, err)
+	}
+	return nil
+}
+
 func (d *ClickhouseDB) QuerySlotBundleBySlot(slot uint64) (uint64, error) {
 	// Query by slot
-	row := d.conn.QueryRow(context.Background(), `SELECT ifNull(max(slot), toUInt64(0)) FROM solwich.slot_bundles WHERE slot = ? and bundleFetched = 1 and bundleCount > 0`, slot)
+	row := d.conn.QueryRow(context.Background(), `SELECT ifNull(max(slot), toUInt64(0)) FROM slot_bundles WHERE slot = ? and bundleFetched = 1 and bundleCount > 0`, slot)
 	var this uint64
 	if err := row.Scan(&this); err != nil {
 		return 0, fmt.Errorf("failed to query slot bundle by slot: %w", err)
@@ -385,7 +425,7 @@ func (d *ClickhouseDB) QuerySlotBundleBySlot(slot uint64) (uint64, error) {
 }
 
 func (d *ClickhouseDB) QueryEarliestAndLatestBundleSlot() (uint64, uint64, bool, error) {
-	row := d.conn.QueryRow(context.Background(), `SELECT min(slot), max(slot) FROM solwich.slot_bundles WHERE bundleFetched = 1`)
+	row := d.conn.QueryRow(context.Background(), `SELECT min(slot), max(slot) FROM slot_bundles WHERE bundleFetched = 1`)
 	var earliestSlot, latestSlot *uint64
 	if err := row.Scan(&earliestSlot, &latestSlot); err != nil {
 		return 0, 0, false, fmt.Errorf("failed to query queried earliest and latest bundle slot: %w", err)
@@ -400,7 +440,7 @@ func (d *ClickhouseDB) InsertSlotTxs(statuses []*types.SlotTxsStatus) error {
 	if len(statuses) == 0 {
 		return nil
 	}
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO solwich.slot_txs")
+	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO slot_txs")
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch: %w", err)
 	}
@@ -422,7 +462,7 @@ func (d *ClickhouseDB) UpdateSlotTxsCheckInBundle(slots []uint64, check bool) er
 	}))
 
 	q := fmt.Sprintf(`
-		ALTER TABLE solwich.slot_txs
+		ALTER TABLE slot_txs
 		UPDATE sandwichInBundleChecked = ?
 		WHERE slot IN (%s)
 	`, placeholders(len(slots)))
@@ -439,7 +479,7 @@ func (d *ClickhouseDB) InsertSlotLeaders(leaders types.SlotLeaders) error {
 	if len(leaders) == 0 {
 		return nil
 	}
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO solwich.slot_leaders")
+	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO slot_leaders")
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch: %w", err)
 	}
@@ -452,7 +492,7 @@ func (d *ClickhouseDB) InsertSlotLeaders(leaders types.SlotLeaders) error {
 }
 
 func (d *ClickhouseDB) QueryLastSlotLeader() (uint64, error) {
-	row := d.conn.QueryRow(context.Background(), "SELECT MAX(slot) from solwich.slot_leaders")
+	row := d.conn.QueryRow(context.Background(), "SELECT MAX(slot) from slot_leaders")
 	var slot uint64
 	if err := row.Scan(&slot); err != nil {
 		return 0, fmt.Errorf("failed to query last slot leader: %w", err)
@@ -461,7 +501,7 @@ func (d *ClickhouseDB) QueryLastSlotLeader() (uint64, error) {
 }
 
 func (d *ClickhouseDB) QuerySlotLeader(slot uint64) (string, error) {
-	row := d.conn.QueryRow(context.Background(), "SELECT leader from solwich.slot_leaders WHERE slot = ?", slot)
+	row := d.conn.QueryRow(context.Background(), "SELECT leader from slot_leaders WHERE slot = ?", slot)
 	var leader string
 	if err := row.Scan(&leader); err != nil {
 		return "", fmt.Errorf("failed to query slot leader: %w", err)
@@ -469,27 +509,11 @@ func (d *ClickhouseDB) QuerySlotLeader(slot uint64) (string, error) {
 	return leader, nil
 }
 
-func (d *ClickhouseDB) InsertInBlockSandwiches(rows []*types.InBlockSandwich) error {
+func (d *ClickhouseDB) InsertSandwiches(rows []*types.CrossBlockSandwich) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO solwich.sandwiches")
-	if err != nil {
-		return fmt.Errorf("failed to prepare batch: %w", err)
-	}
-	for _, s := range rows {
-		if err := batch.AppendStruct(s); err != nil {
-			return fmt.Errorf("failed to append struct: %w", err)
-		}
-	}
-	return batch.Send()
-}
-
-func (d *ClickhouseDB) InsertCrossBlockSandwiches(rows []*types.CrossBlockSandwich) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO solwich.sandwiches")
+	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO sandwiches")
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch: %w", err)
 	}
@@ -505,7 +529,7 @@ func (d *ClickhouseDB) InsertSandwichTxs(sandwichTxs []*types.SandwichTx) error 
 	if len(sandwichTxs) == 0 {
 		return nil
 	}
-	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO solwich.sandwich_txs")
+	batch, err := d.conn.PrepareBatch(context.Background(), "INSERT INTO sandwich_txs")
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch: %w", err)
 	}
@@ -553,7 +577,7 @@ func (d *ClickhouseDB) UpdateSandwichTxsInBundle(results []types.JitoBundleMarkR
 		}
 
 		q := fmt.Sprintf(`
-			ALTER TABLE solwich.sandwich_txs
+			ALTER TABLE sandwich_txs
 			UPDATE inBundle = 1
 			WHERE (slot, signature) IN (%s)
 		`, strings.Join(pairs, ", "))
@@ -568,7 +592,7 @@ func (d *ClickhouseDB) UpdateSandwichTxsInBundle(results []types.JitoBundleMarkR
 
 func (d *ClickhouseDB) QuerySandwichTxsBySlot(slot uint64) ([]string, error) {
 	rows, err := d.conn.Query(context.Background(),
-		`SELECT DISTINCT signature FROM solwich.sandwich_txs WHERE slot = ?`, slot)
+		`SELECT DISTINCT signature FROM sandwich_txs WHERE slot = ?`, slot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query sandwich txs by slot: %w", err)
 	}
@@ -591,7 +615,7 @@ func (d *ClickhouseDB) QuerySandwichTxsBySlots(slots []uint64) (map[uint64][]str
 	}
 	q := fmt.Sprintf(`
 		SELECT slot, signature
-		FROM solwich.sandwich_txs
+		FROM sandwich_txs
 		WHERE slot IN (%s)
 	`, placeholders(len(slots)))
 
@@ -621,7 +645,7 @@ func (d *ClickhouseDB) QuerySandwichTxsBySlots(slots []uint64) (map[uint64][]str
 func (d *ClickhouseDB) QueryMaxSandwichCheckedSlot() (uint64, error) {
 	row := d.conn.QueryRow(context.Background(), `
 		SELECT ifNull(max(slot), toUInt64(0))
-		FROM solwich.slot_txs
+		FROM slot_txs
 		WHERE sandwichFetched = 1
 	`)
 	var slot uint64
@@ -634,8 +658,8 @@ func (d *ClickhouseDB) QueryMaxSandwichCheckedSlot() (uint64, error) {
 func (d *ClickhouseDB) QueryFirstSlotToCheckInBundle() (uint64, error) {
 	row := d.conn.QueryRow(context.Background(), `
 		SELECT ifNull(min(t.slot), toUInt64(0))
-		FROM solwich.slot_txs t
-		ANY INNER JOIN solwich.slot_bundles b USING (slot)
+		FROM slot_txs t
+		ANY INNER JOIN slot_bundles b USING (slot)
 		WHERE t.txFetched = 1 AND t.sandwichFetched = 1 AND t.sandwichInBundleChecked = 0
 		  AND b.bundleFetched = 1
 	`)
@@ -649,13 +673,13 @@ func (d *ClickhouseDB) QueryFirstSlotToCheckInBundle() (uint64, error) {
 func (d *ClickhouseDB) QuerySlotsToCheckInBundle(limit int, safeLag uint64) ([]uint64, error) {
 	rows, err := d.conn.Query(context.Background(), fmt.Sprintf(`
 		SELECT slot
-		FROM solwich.slot_txs AS t
-		ANY INNER JOIN solwich.slot_bundles AS b USING (slot)
+		FROM slot_txs AS t
+		ANY INNER JOIN slot_bundles AS b USING (slot)
 		WHERE t.txFetched = 1
 		  AND t.sandwichFetched = 1
 		  AND t.sandwichInBundleChecked = 0
 		  AND b.bundleCount > 0
-		  AND t.slot <= (SELECT max(slot) FROM solwich.slot_txs WHERE sandwichFetched = 1) - %d
+		  AND t.slot <= (SELECT max(slot) FROM slot_txs WHERE sandwichFetched = 1) - %d
 		ORDER BY slot ASC
 		LIMIT %d
 	`, safeLag, limit))

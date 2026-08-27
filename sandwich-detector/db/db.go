@@ -6,6 +6,9 @@ import (
 
 type Database interface {
 	Close() error
+	// DatabaseName reports the database the adapter is bound to, so destructive commands can
+	// name it in their confirmation prompt.
+	DatabaseName() string
 	EnsureDatabaseExists() error
 	CreateTables() error
 	DropTables() error
@@ -20,6 +23,7 @@ type Database interface {
 
 	// slot_bundles
 	InsertSlotBundles(statuses []*types.SlotBundlesStatus) error
+	DropJitoBundlesEpochPartition(epoch uint64) error // delete-after-mark: drop one epoch's jito_bundles partition
 	QuerySlotBundleBySlot(slot uint64) (uint64, error)
 	QueryEarliestAndLatestBundleSlot() (uint64, uint64, bool, error)
 
@@ -33,8 +37,7 @@ type Database interface {
 	QuerySlotLeader(slot uint64) (string, error)
 
 	// sandwiches
-	InsertInBlockSandwiches(rows []*types.InBlockSandwich) error
-	InsertCrossBlockSandwiches(rows []*types.CrossBlockSandwich) error
+	InsertSandwiches(rows []*types.CrossBlockSandwich) error
 
 	// sandwich_txs
 	InsertSandwichTxs(sandwichTxs []*types.SandwichTx) error
@@ -43,7 +46,7 @@ type Database interface {
 	QuerySandwichTxsBySlots(slots []uint64) (map[uint64][]string, error)
 
 	// others
-	QueryMaxSandwichCheckedSlot() (uint64, error)          // max(slot) from slot_txs where sandwichFetched = 1
-	QueryFirstSlotToCheckInBundle() (uint64, error)        // First slot in slot_txs where slot_txs.SandwichInBundleChecked = false, slot_txs.SandwichFetched = slot_txs.txFetched = true, and also exists in slot_bundles that slot_bundles.bundleFetched = true
+	QueryMaxSandwichCheckedSlot() (uint64, error)                          // max(slot) from slot_txs where sandwichFetched = 1
+	QueryFirstSlotToCheckInBundle() (uint64, error)                        // First slot in slot_txs where slot_txs.SandwichInBundleChecked = false, slot_txs.SandwichFetched = slot_txs.txFetched = true, and also exists in slot_bundles that slot_bundles.bundleFetched = true
 	QuerySlotsToCheckInBundle(limit int, safeLag uint64) ([]uint64, error) // A multiple slots version of QueryFirstSlotToCheckInBundle
 }

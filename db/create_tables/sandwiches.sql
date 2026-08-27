@@ -2,8 +2,14 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
 (
     `sandwichId` String,     -- Hash of frontTx.signature + backTx.signature
     `crossBlock` Bool,
-    `slot` UInt64,           
-    `timestamp` DateTime, 
+    `crossLeader` Bool DEFAULT false,                       -- front and back under different slot leaders (implies crossBlock)
+    `frontLeader` String DEFAULT '',                        -- leader of the first front-run slot
+    `backLeader` String DEFAULT '',                         -- leader of the last back-run slot
+    `windowStartSlot` UInt64 DEFAULT 0,                     -- detection window bounds
+    `windowEndSlot` UInt64 DEFAULT 0,
+    `rpcSource` LowCardinality(String) DEFAULT 'live',      -- 'live' (live loop) or 'backfill' (backfill run)
+    `slot` UInt64,
+    `timestamp` DateTime,
 
     `tokenA` String,
     `tokenB` String,
@@ -36,5 +42,6 @@ CREATE TABLE IF NOT EXISTS solwich.sandwiches
     `maxSlippageUtilization` Float64 DEFAULT 0  -- Max slippage utilization across all victims (0-1)
 )
 ENGINE = MergeTree
+PARTITION BY intDiv(slot, 432000)   -- one partition per epoch (enables delete-after-mark DROP PARTITION + confines slot-keyed mutations)
 ORDER BY (slot, timestamp, sandwichId)
 SETTINGS index_granularity = 8192;

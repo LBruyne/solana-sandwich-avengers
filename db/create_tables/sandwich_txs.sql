@@ -36,9 +36,13 @@ CREATE TABLE IF NOT EXISTS solwich.sandwich_txs
     `slippageLimitType` String DEFAULT '',        -- "input" (max cost) / "output" (min output) / "" (unavailable)
     `slippageLimitAmount` Float64 DEFAULT 0,      -- decoded limit value, converted to float64 with decimals
     `slippageActualAmount` Float64 DEFAULT 0,     -- actual cost or output from balance deltas
-    `slippageUtilization` Float64 DEFAULT -1,     -- ratio 0-1 (closer to 1 = tighter fit), -1 = no protection, -2 = unsupported, -3 = missing inner
-    `slippageDexName` String DEFAULT ''           -- DEX name (e.g., "pumpfun", "raydium_v4")
+    `slippageUtilization` Float64 DEFAULT -1,     -- ratio 0-1 (closer to 1 = tighter fit); -1 no protection, -2 unsupported, -3 missing inner, -4 ambiguous (multi-swap)
+
+    -- Exchange the sandwiched pool belongs to, set on every leg (front/back/victim/adverse) from the
+    -- front-run's DEX instruction. 100% coverage incl. proprietary AMMs; single DEX field.
+    `poolDex` LowCardinality(String) DEFAULT ''
 )
 ENGINE = MergeTree
+PARTITION BY intDiv(slot, 432000)   -- one partition per epoch (enables delete-after-mark DROP PARTITION + confines slot-keyed mutations)
 ORDER BY (sandwichTimestamp, sandwichId, timestamp, slot, position)
 SETTINGS index_granularity = 8192;

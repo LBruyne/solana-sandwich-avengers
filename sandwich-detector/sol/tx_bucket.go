@@ -2,12 +2,13 @@ package sol
 
 import (
 	"math"
-	"sort"
-	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
+	"sandwich-detector/sol/dex"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
+	"sort"
+	"time"
 
 	MapSet "github.com/deckarep/golang-set/v2"
 )
@@ -21,6 +22,27 @@ var knownAMMPools = NewAMMPoolLRU(config.AMM_POOL_CACHE_SIZE)
 // Used to determine whether an address is an AMM pool by checking if its owner
 // is a known DEX program. Reduces RPC calls across blocks.
 var accountOwnerCache = NewAccountOwnerLRU(config.ACCOUNT_OWNER_CACHE_SIZE)
+
+// sortedBucketKeys returns the bucket keys in a stable order (pool, incomeToken, expenseToken).
+// Detection claims front/back txs greedily, so the order in which buckets are scanned decides
+// which sandwich wins when txs could serve several — iterating the map directly would make results
+// depend on Go's randomized map order and be irreproducible.
+func sortedBucketKeys(buckets map[PoolKey][]PoolEntry) []PoolKey {
+	keys := make([]PoolKey, 0, len(buckets))
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].PoolAddress != keys[j].PoolAddress {
+			return keys[i].PoolAddress < keys[j].PoolAddress
+		}
+		if keys[i].IncomeToken != keys[j].IncomeToken {
+			return keys[i].IncomeToken < keys[j].IncomeToken
+		}
+		return keys[i].ExpenseToken < keys[j].ExpenseToken
+	})
+	return keys
+}
 
 // unionSigners returns the union of all Signers sets from the given entries.
 // Used to build a comprehensive signer set for multi-front/multi-back comparisons.
@@ -57,6 +79,11 @@ type PoolEntry struct {
 	// HasInlineTransfer is true when SourceOwner and SinkOwner differ.
 	HasInlineTransfer bool
 
+	// IsMultiSwap is true when the tx decodes to more than one swap (a multi-hop route or an
+	// atomic arbitrage). Such a tx may still be a victim through its leg on this pool, but it is
+	// never eligible as a front/back leg — attacker legs are always clean single swaps.
+	IsMultiSwap bool
+
 	// Related pool and token info
 	PoolAddress  string
 	IncomeToken  string
@@ -79,11 +106,17 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 			continue
 		}
 
-		// Identify the unique AMM pool among all pool-like participants.
-		pools := tx.RelatedPools.ToSlice()
-		ammCandidates := make([]string, 0, 1)
-		ammAmountByPool := make(map[string]types.PoolAmount)
-		for _, pool := range pools {
+		// Identify every AMM pool leg this tx has. A clean swap has exactly one; a multi-hop route
+		// or an atomic arbitrage has several. The tx is bucketed under EACH valid leg so it can be
+		// a VICTIM through whichever leg trades the sandwiched pair — but a tx with more than one
+		// leg (or >1 decodable swap) is marked IsMultiSwap and may never be a front/back attacker
+		// leg (attacker legs are always clean single swaps).
+		type ammLeg struct {
+			pool string
+			amt  types.PoolAmount
+		}
+		legs := make([]ammLeg, 0, 1)
+		for _, pool := range tx.RelatedPools.ToSlice() {
 			amt, ok := tx.RelatedPoolsInfo[pool]
 			if !ok {
 				continue
@@ -91,45 +124,37 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 			if !identifyAMMPool(tx, pool, amt) {
 				continue
 			}
-			ammCandidates = append(ammCandidates, pool)
-			ammAmountByPool[pool] = amt
-			if len(ammCandidates) > 1 {
-				break
+			if !(amt.IncomeAmt > 0 && amt.ExpenseAmt < 0) {
+				continue
 			}
+			legs = append(legs, ammLeg{pool, amt})
 		}
-
-		// Require exactly one AMM candidate; otherwise this tx is ambiguous.
-		if len(ammCandidates) != 1 {
+		if len(legs) == 0 {
 			continue
 		}
-		ammPool := ammCandidates[0]
-		ammAmt := ammAmountByPool[ammPool]
-		// Validate AMM pool amounts
-		if !(ammAmt.IncomeAmt > 0 && ammAmt.ExpenseAmt < 0) {
-			continue
-		}
-		knownAMMPools.Add(ammPool)
+		isMultiSwap := len(legs) > 1 || countDecodableSwaps(tx) > 1
 
-		// Find source/sink owners by matching token balance changes against AMM amounts. Assume at most one source and one sink owner per transaction, which holds for most cases except some complex multi-hop swaps.
-		sourceOwner, sinkOwner, hasInlineTransfer := inferSwapSourceAndSinkOwner(tx, ammPool, ammAmt)
-
-		// Create bucket entry from AMM pool's perspective
-		key := PoolKey{PoolAddress: ammPool, IncomeToken: ammAmt.IncomeToken, ExpenseToken: ammAmt.ExpenseToken}
-		entry := PoolEntry{
-			TxIdx:             idx,
-			Slot:              tx.Slot,
-			Position:          tx.Position,
-			Signers:           MapSet.NewSet(tx.Signers...),
-			SourceOwner:       sourceOwner,
-			SinkOwner:         sinkOwner,
-			HasInlineTransfer: hasInlineTransfer,
-			PoolAddress:       ammPool,
-			IncomeToken:       ammAmt.IncomeToken,
-			ExpenseToken:      ammAmt.ExpenseToken,
-			IncomeAmt:         ammAmt.IncomeAmt,
-			ExpenseAmt:        ammAmt.ExpenseAmt,
+		for _, leg := range legs {
+			knownAMMPools.Add(leg.pool)
+			// Find source/sink owners by matching token balance changes against the AMM amounts.
+			sourceOwner, sinkOwner, hasInlineTransfer := inferSwapSourceAndSinkOwner(tx, leg.pool, leg.amt)
+			key := PoolKey{PoolAddress: leg.pool, IncomeToken: leg.amt.IncomeToken, ExpenseToken: leg.amt.ExpenseToken}
+			buckets[key] = append(buckets[key], PoolEntry{
+				TxIdx:             idx,
+				Slot:              tx.Slot,
+				Position:          tx.Position,
+				Signers:           MapSet.NewSet(tx.Signers...),
+				SourceOwner:       sourceOwner,
+				SinkOwner:         sinkOwner,
+				HasInlineTransfer: hasInlineTransfer,
+				IsMultiSwap:       isMultiSwap,
+				PoolAddress:       leg.pool,
+				IncomeToken:       leg.amt.IncomeToken,
+				ExpenseToken:      leg.amt.ExpenseToken,
+				IncomeAmt:         leg.amt.IncomeAmt,
+				ExpenseAmt:        leg.amt.ExpenseAmt,
+			})
 		}
-		buckets[key] = append(buckets[key], entry)
 	}
 
 	if crossBlock {
@@ -152,6 +177,46 @@ func filterAndBuildTxBuckets(txs types.Transactions, crossBlock bool) map[PoolKe
 	}
 
 	return buckets
+}
+
+// countDecodableSwaps counts how many of a tx's DEX instructions decode as swaps.
+// A clean single swap yields exactly one; more indicate a multi-hop route or arbitrage.
+func countDecodableSwaps(tx *types.Transaction) int {
+	n := 0
+	for _, di := range tx.DexInstructions {
+		if dex.ExtractSlippage(di.ProgramID, di.Data) != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// frontRunDexProgram returns the program ID of the front-run's single decodable swap instruction,
+// which identifies the sandwiched pool's DEX (the front-run is a clean single swap on that pool).
+// Returns "" when the front-run's DEX has no slippage decoder (humidifi/solfi/proprietary etc.):
+// the sandwiched pool is then undecodable, so a victim's slippage ON THAT POOL is unmeasurable and
+// must not be read off some other decodable pool the victim's route happens to touch.
+func frontRunDexProgram(tx *types.Transaction) string {
+	if tx == nil {
+		return ""
+	}
+	for _, di := range tx.DexInstructions {
+		if dex.ExtractSlippage(di.ProgramID, di.Data) != nil {
+			return di.ProgramID
+		}
+	}
+	return ""
+}
+
+// isIdentifiedPool reports whether an owner is already known to be an AMM pool
+// (explicitly labeled or resolved via the owner cache). Used to keep the swap
+// counterparty from being selected as the swap user.
+func isIdentifiedPool(owner string) bool {
+	if utils.IsLabeledDexPool(owner) || knownAMMPools.Contains(owner) {
+		return true
+	}
+	isAMM, cached := isAMMByOwner(owner)
+	return cached && isAMM
 }
 
 // identifyAMMPool determines whether a single pool-like participant is an AMM pool.
@@ -254,7 +319,7 @@ func pickUnifiedSwapOwner(tx *types.Transaction, ammPool, incomeToken, expenseTo
 	bestScore := math.MaxFloat64
 
 	for owner, tokenChanges := range tx.OwnerBalanceChanges {
-		if owner == ammPool {
+		if owner == ammPool || isIdentifiedPool(owner) {
 			continue
 		}
 
@@ -291,7 +356,7 @@ func pickClosestOwnerByTokenDelta(tx *types.Transaction, excludedOwner string, t
 	bestDiff := math.MaxFloat64
 
 	for owner, tokenChanges := range tx.OwnerBalanceChanges {
-		if owner == excludedOwner {
+		if owner == excludedOwner || isIdentifiedPool(owner) {
 			continue
 		}
 		ataAmounts, ok := tokenChanges[token]
@@ -386,6 +451,19 @@ func prefetchPoolOwners(txs types.Transactions) {
 			knownAMMPools.Add(addr)
 		}
 	}
+
+	// Negative-cache addresses with no on-chain account (closed ATAs, ephemeral accounts):
+	// they cannot be AMM pools, yet they dominate the candidate set — measured ~98% of
+	// prefetch traffic was re-querying the same null addresses every window. An empty owner
+	// makes isAMMByOwner answer (false, cached). Skipped when the batch errored so unqueried
+	// addresses stay eligible for the next window.
+	if err == nil {
+		for addr := range needed {
+			if _, ok := owners[addr]; !ok {
+				accountOwnerCache.Put(addr, "")
+			}
+		}
+	}
 }
 
 // isAMMByOwner checks the accountOwnerCache to determine if an address is an
@@ -398,4 +476,3 @@ func isAMMByOwner(addr string) (bool, bool) {
 	}
 	return utils.IsLabeledDexPrograms(owner), true
 }
-

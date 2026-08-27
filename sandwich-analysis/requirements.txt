@@ -1,10 +1,8 @@
-clickhouse-connect
-ipykernel
-itables
+# The figure and table scripts. They read the intent pipeline's parquet output and, for
+# the few per-leg columns it does not carry, query ClickHouse through
+# `sandwich-intent/utils/db.py` -- so `sandwich-intent/requirements.txt` must be
+# installed too, and `sandwich-intent/.env` must point at the detector's database.
 matplotlib
 numpy
 pandas
 pyarrow
-python-dotenv
-requests
-tqdm

@@ -1,9 +1,9 @@
 package utils
 
 import (
-	"strings"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -35,4 +35,11 @@ func IsLabeledDexPrograms(name string) bool {
 
 func IsLabeledDexPool(name string) bool {
 	return viper.IsSet("labeled_pools." + strings.ToLower(name))
+}
+
+// IsLabeledAggregator reports whether a program is a known swap aggregator/router
+// (Jupiter, OKX, DFlow, ...). Aggregator-routed txs are user swaps, not arbitrage,
+// so their presence is an annotation signal rather than a rejection reason.
+func IsLabeledAggregator(name string) bool {
+	return viper.IsSet("labeled_aggregators." + strings.ToLower(name))
 }
