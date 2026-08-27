@@ -11,10 +11,9 @@ import (
 )
 
 // TestUnifiedFinderDeterminism checks that the unified finder is reproducible: two runs over the
-// same block must return the identical set of sandwichIds. (Parity against the former in-block
-// finder was validated on real slots before it was removed; the map-order nondeterminism that
-// made v1 irreproducible is fixed by sortedBucketKeys, which this guards against regressing.)
-// Gated on a live RPC (archival, since interesting slots age out of the self-hosted node):
+// same block must return the identical set of sandwichIds. Map iteration order used to make the
+// output vary between runs; sortedBucketKeys fixes that, and this test guards the fix.
+// Gated on a live archival RPC, since interesting slots age out of a non-archival node:
 // set PARITY_RPC=<url> and optionally PARITY_SLOT=<slot>.
 func TestUnifiedFinderDeterminism(t *testing.T) {
 	rpc := os.Getenv("PARITY_RPC")

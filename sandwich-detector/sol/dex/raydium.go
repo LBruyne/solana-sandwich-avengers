@@ -18,7 +18,7 @@ var (
 // Raydium CLMM Anchor discriminators
 var (
 	raydiumCLMMSwap   = [8]byte{248, 198, 158, 145, 225, 117, 135, 200} // sha256("global:swap")[:8]
-	raydiumCLMMSwapV2 = [8]byte{43, 4, 237, 11, 26, 201, 30, 98}       // sha256("global:swap_v2")[:8]
+	raydiumCLMMSwapV2 = [8]byte{43, 4, 237, 11, 26, 201, 30, 98}        // sha256("global:swap_v2")[:8]
 )
 
 // decodeRaydiumV4 decodes Raydium Liquidity Pool V4 swap instructions.
@@ -26,10 +26,12 @@ var (
 // Non-Anchor format (17 bytes):
 //
 // swap_base_in  (tag=0x09): [tag][amount_in u64][minimum_amount_out u64]
-//   → limit = minimum_amount_out at offset 9 (OUTPUT-limited)
+//
+//	→ limit = minimum_amount_out at offset 9 (OUTPUT-limited)
 //
 // swap_base_out (tag=0x0B): [tag][max_amount_in u64][amount_out u64]
-//   → limit = max_amount_in at offset 1 (INPUT-limited)
+//
+//	→ limit = max_amount_in at offset 1 (INPUT-limited)
 func decodeRaydiumV4(data []byte) *SlippageInfo {
 	if len(data) < 17 {
 		return nil
@@ -106,10 +108,12 @@ func decodeRaydiumCLMM(data []byte) *SlippageInfo {
 // Anchor format (24 bytes):
 //
 // swap_base_input:  [disc 8][amount_in u64][minimum_amount_out u64]
-//   → limit = minimum_amount_out at offset 16 (OUTPUT-limited)
+//
+//	→ limit = minimum_amount_out at offset 16 (OUTPUT-limited)
 //
 // swap_base_output: [disc 8][max_amount_in u64][amount_out u64]
-//   → limit = max_amount_in at offset 8 (INPUT-limited)
+//
+//	→ limit = max_amount_in at offset 8 (INPUT-limited)
 func decodeRaydiumCPMM(data []byte) *SlippageInfo {
 	if matchDiscriminator(data, raydiumCPMMSwapBaseInput) {
 		limit, ok := readU64LE(data, 16) // minimum_amount_out

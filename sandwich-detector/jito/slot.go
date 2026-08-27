@@ -1,14 +1,14 @@
 package jito
 
 import (
-	"sync"
-	"sync/atomic"
-	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/db"
 	"sandwich-detector/logger"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	MapSet "github.com/deckarep/golang-set/v2"
 )
@@ -220,7 +220,7 @@ func RunJitoCmd(startSlot, endSlot uint64, runFetchBundle bool, runSyncInBundle 
 				// Never drop an epoch fetch hasn't contiguously finished — otherwise a throttled fetch
 				// still writing that epoch's tail would re-insert into a just-dropped partition.
 				if ft := fetchedThrough.Load(); ft > 0 {
-					if maxFetched := epochOf(ft+1); maxFetched >= 1 && epoch > maxFetched-1 {
+					if maxFetched := epochOf(ft + 1); maxFetched >= 1 && epoch > maxFetched-1 {
 						epoch = maxFetched - 1
 					}
 				}

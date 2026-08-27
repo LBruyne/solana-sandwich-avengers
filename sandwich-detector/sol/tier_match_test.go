@@ -1,9 +1,9 @@
 package sol
 
 import (
-	"testing"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
+	"testing"
 
 	MapSet "github.com/deckarep/golang-set/v2"
 )

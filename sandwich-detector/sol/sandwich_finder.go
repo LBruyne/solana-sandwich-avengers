@@ -310,7 +310,7 @@ func (f *SandwichFinder) Evaluate(frontTxEntries []PoolEntry, backTxEntries []Po
 	// Transfer evidence is only meaningful when the signer CHANGES between front and back — it is
 	// the linkage mechanism of wallet-rotating attackers. For same-signer sandwiches an inferred
 	// inline transfer is routing noise (aggregator hop, owner-inference tolerance), and flagging it
-	// overcounts transfer-style evasion: on v1 epoch-955 data, 1,733 of 2,310 hasTransfer
+	// overcounts transfer-style evasion: on an epoch-955 sample, 1,733 of 2,310 hasTransfer
 	// sandwiches (75%) had signerSame=true. Front inline evidence is further restricted to
 	// transfers that actually land in the back side's owner set — the same criterion
 	// sumFrontInlineBridgeAmount applies to bridge amounts.
@@ -589,9 +589,11 @@ func (f *SandwichFinder) RecordSandwich() {
 			BackConsecutive:   isEntriesConsecutive(f.lastBackTxEntries, crossBlock),
 			VictimConsecutive: isEntriesConsecutive(f.lastVictimEntries, crossBlock),
 
-			SignerSame:             signerSame,
-			OwnerSame:              ownerSame,
-			ATASame:                false, // TODO
+			SignerSame: signerSame,
+			OwnerSame:  ownerSame,
+			// Reserved; never populated. The signer- and owner-level links below already
+			// cover the evasion patterns we detect, so no ATA-level comparison is computed.
+			ATASame:                false,
 			HasTransfer:            len(frontTransferTxs)+len(backTransferTxs) > 0,
 			HasFrontInlineTransfer: hasFrontInlineTransfer,
 			HasDirectTransfer:      hasDirectTransfer,
@@ -612,10 +614,10 @@ func (f *SandwichFinder) RecordSandwich() {
 			BackCount:    uint16(len(f.lastBackTxEntries)),
 			VictimCount:  uint16(len(victimTxs)),
 			AdverseCount: uint16(len(adverseTxs)),
-			FrontRun:      frontTxs,
-			BackRun:       backTxs,
-			Victims:       victimTxs,
-			Adverse:       adverseTxs,
+			FrontRun:     frontTxs,
+			BackRun:      backTxs,
+			Victims:      victimTxs,
+			Adverse:      adverseTxs,
 		},
 		Slot:      slot,
 		Timestamp: timestamp,
@@ -701,15 +703,26 @@ func makeSandwichID(frontSig, backSig string) string {
 }
 
 // isSandwichConsecutive reports whether front, victim and back are back-to-back by position
-// (F_last+1 == V_first and V_last+1 == B_first). Meaningful only within a single slot.
+// (F_last+1 == V_first and V_last+1 == B_first). Positions are per-block, so adjacency is only
+// meaningful when the compared legs share a slot: without the slot check a cross-block sandwich
+// whose front sits at position p in one block and whose victim happens to sit at p+1 in a LATER
+// block was reported consecutive. That mislabelled 6,704 of 15,073 consecutive sandwiches (44.5%)
+// in the 946-990 dataset and inflated any bundle-sandwich count derived from the flag.
 func isSandwichConsecutive(frontTxs, victimTxs, backTxs []PoolEntry) bool {
 	if len(frontTxs) == 0 || len(victimTxs) == 0 || len(backTxs) == 0 {
 		return false
 	}
-	if frontTxs[len(frontTxs)-1].Position+1 != victimTxs[0].Position {
+	lastFront := frontTxs[len(frontTxs)-1]
+	firstVictim := victimTxs[0]
+	lastVictim := victimTxs[len(victimTxs)-1]
+	firstBack := backTxs[0]
+	if lastFront.Slot != firstVictim.Slot || lastVictim.Slot != firstBack.Slot {
 		return false
 	}
-	if victimTxs[len(victimTxs)-1].Position+1 != backTxs[0].Position {
+	if lastFront.Position+1 != firstVictim.Position {
+		return false
+	}
+	if lastVictim.Position+1 != firstBack.Position {
 		return false
 	}
 	return true

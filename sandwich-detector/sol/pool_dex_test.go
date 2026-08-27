@@ -1,9 +1,9 @@
 package sol
 
 import (
-	"testing"
 	"sandwich-detector/sol/dex"
 	"sandwich-detector/types"
+	"testing"
 )
 
 func TestClassifySandwichDexFromInstructions(t *testing.T) {

@@ -1,15 +1,15 @@
 package sol
 
 import (
-	"testing"
 	"sandwich-detector/types"
+	"testing"
 
 	MapSet "github.com/deckarep/golang-set/v2"
 )
 
 // Transfer evidence must be gated on a signer CHANGE between front and back: for same-signer
-// sandwiches an inferred inline transfer is routing noise, and v1 flagged it as hasTransfer —
-// 75% of v1's epoch-955 hasTransfer sandwiches had signerSame=true. These tests pin the fixed
+// sandwiches an inferred inline transfer is routing noise: on an epoch-955 sample, 75% of the
+// sandwiches an ungated rule flagged as hasTransfer had signerSame=true. These tests pin the
 // contract: no transfer evidence when signers overlap; when signers differ, front inline
 // evidence is kept only if it lands in the back side's owner set.
 

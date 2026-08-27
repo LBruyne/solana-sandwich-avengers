@@ -2,13 +2,13 @@ package sol
 
 import (
 	"math"
-	"sort"
-	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
 	"sandwich-detector/sol/dex"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
+	"sort"
+	"time"
 
 	MapSet "github.com/deckarep/golang-set/v2"
 )
@@ -476,4 +476,3 @@ func isAMMByOwner(addr string) (bool, bool) {
 	}
 	return utils.IsLabeledDexPrograms(owner), true
 }
-

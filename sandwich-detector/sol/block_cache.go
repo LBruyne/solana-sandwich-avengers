@@ -1,8 +1,8 @@
 package sol
 
 import (
-	"sync"
 	"sandwich-detector/types"
+	"sync"
 )
 
 type BlockCache struct {

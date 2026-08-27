@@ -68,50 +68,80 @@ func fillVictimSlippage(stx *types.SandwichTx, orig *types.Transaction, entry Po
 	// The DEX is recorded once per sandwich in PoolDex (set in makeSandwichTx), not here.
 }
 
-// computeMaxSlippageUtilization summarizes a sandwich by the slippage utilization of its
-// tightest measurable victim.
+// computeMaxSlippageUtilization summarizes a sandwich by the slippage consumption of its tightest
+// victim — but only when EVERY victim is measurable.
 //
-//   - If any victim has a real utilization in [0,1], return the maximum — that victim is the
-//     binding constraint and shows how far the attacker pushed the price.
-//   - Otherwise every victim is unmeasured, so return the reason, kept distinct (v2 no longer
-//     collapses MissingInner into Unsupported): MissingInner(-3) > Ambiguous(-4) >
-//     Unsupported(-2) > NoProtection(-1).
+//   - If any victim is anomalous (a negative sentinel, or a value outside [0, 1]), the whole
+//     sandwich is anomalous and carries no value: return the highest-priority sentinel seen. A
+//     maximum taken over the measurable subset is only a lower bound on the true maximum, so
+//     reporting it would silently understate the sandwich and would be indistinguishable from a
+//     sandwich whose victims were all measured.
+//   - Otherwise return the maximum over the victims — that victim is the binding constraint and
+//     shows how far the attacker pushed the price.
+//
+// A victim that set no real protection is NOT anomalous — we know exactly what happened to it — but
+// it is also not evidence about the attacker, so it is excluded from the maximum rather than
+// competing in it at 0. When EVERY victim is in that state the sandwich carries
+// SlippageAllUnprotected and is not scored at all. See SlippageProtectionFloor in slippage.go.
+//
+// SlippageNoProtection(-1) is legacy, written per leg for a zero limit, and is read here as the 0
+// it stood for, which now means "below the floor" and is excluded.
+//
+// Sentinel priority, most to least specific:
+// MissingInner(-3) > Ambiguous(-4) > Unsupported(-2) > OutOfRange(-5) > AllUnprotected(-6).
+//
+// Downstream analysis should recompute from the two raw amount columns on sandwich_txs rather
+// than reading sandwiches.maxSlippageUtilization, which may carry an older rule on old rows.
 func computeMaxSlippageUtilization(victims []*types.SandwichTx) float64 {
-	maxReal := -1.0
-	sawReal := false
-	var sawMissingInner, sawAmbiguous, sawUnsupported, sawNoProtection bool
+	maxProtected := -1.0
+	sawProtected, sawAny := false, false
+	var sawMissingInner, sawAmbiguous, sawUnsupported, sawOutOfRange bool
 	for _, v := range victims {
 		if v == nil {
 			continue
 		}
-		switch u := v.SlippageUtilization; {
-		case u >= 0:
-			sawReal = true
-			if u > maxReal {
-				maxReal = u
+		sawAny = true
+		u := v.SlippageUtilization
+		if u == dex.SlippageNoProtection {
+			u = 0 // legacy per-leg sentinel for a zero limit, i.e. a consumption of 0
+		}
+		switch {
+		case u >= dex.SlippageProtectionFloor && u <= dex.SlippageMaxAdmissible:
+			sawProtected = true
+			if u > maxProtected {
+				maxProtected = u
 			}
+		case u >= dex.SlippageMinAdmissible && u < dex.SlippageProtectionFloor:
+			// Measured, and measured to be a victim with no tolerance to consume. Not an anomaly,
+			// and not a contribution to the maximum.
 		case u == dex.SlippageMissingInner:
 			sawMissingInner = true
 		case u == dex.SlippageAmbiguous:
 			sawAmbiguous = true
 		case u == dex.SlippageUnsupported:
 			sawUnsupported = true
-		default: // SlippageNoProtection
-			sawNoProtection = true
+		default:
+			// SlippageOutOfRange, plus any non-sentinel value outside [0, 1] (which
+			// ComputeVictimSlippage no longer produces, but a stale/hand-built SandwichTx could).
+			sawOutOfRange = true
 		}
 	}
 	switch {
-	case sawReal:
-		return maxReal
 	case sawMissingInner:
 		return dex.SlippageMissingInner
 	case sawAmbiguous:
 		return dex.SlippageAmbiguous
 	case sawUnsupported:
 		return dex.SlippageUnsupported
-	case sawNoProtection:
-		return dex.SlippageNoProtection
+	case sawOutOfRange:
+		return dex.SlippageOutOfRange
+	case sawProtected:
+		return maxProtected
+	case sawAny:
+		// Every victim measured, none of them protected. Not 0.
+		return dex.SlippageAllUnprotected
 	default:
-		return dex.SlippageNoProtection
+		// No victim legs at all. Unreachable from the finder (a sandwich requires >=1 victim).
+		return dex.SlippageUnsupported
 	}
 }

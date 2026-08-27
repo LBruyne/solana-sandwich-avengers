@@ -2,14 +2,14 @@ package sol
 
 import (
 	"fmt"
-	"sort"
-	"sync"
-	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/db"
 	"sandwich-detector/logger"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
+	"sort"
+	"sync"
+	"time"
 )
 
 var ch db.Database
@@ -62,11 +62,6 @@ func RunSandwichCmd(startSlot uint64) error {
 		blocks := GetBlocks(startSlot, uint64(numToFetch))
 		fetchTime := time.Since(fetchTimeBefore)
 		logger.SolLogger.Info("Fetched slot data (done)", "start", startSlot, "num_fetched", len(blocks), "fetch_time", fetchTime.String())
-
-		// Test print block
-		// for _, b := range blocks {
-		// 	types.PPBlock(b, 5, true)
-		// }
 
 		// Process blocks over sliding double-rotation windows and persist. Live streaming defers
 		// the tail rotation so a sandwich straddling the not-yet-fetched next rotation is caught.
@@ -363,24 +358,8 @@ func StoreSandwichesToDB(ch db.Database, sandwiches []*types.CrossBlockSandwich)
 }
 
 func StoreSlotSandwichStatusToDB(ch db.Database, blks types.Blocks, sandwiches []*types.CrossBlockSandwich) error {
-	// DO NOT store sandwich tx count now!
-	// Map slot to number of sandwich txs
-	// slotToSandwichTxCount := make(map[uint64]uint64)
-	// slotToSandwichCount := make(map[uint64]uint64)
-	// slotToSandwichVictimCount := make(map[uint64]uint64)
-	// In-block sandwiches
-	// for _, s := range inBlockSandwiches {
-	// 	slotToSandwichTxCount[s.Slot] += uint64(len(s.FrontRun) + len(s.BackRun))
-	// 	slotToSandwichCount[s.Slot] += 1
-	// 	slotToSandwichVictimCount[s.Slot] += uint64(len(s.Victims))
-	// }
-	// // Cross-block sandwiches
-	// for _, s := range crossBlockSandwiches {
-	// 	slotToSandwichTxCount[s.Slot] += uint64(len(s.FrontRun) + len(s.BackRun))
-	// 	slotToSandwichCount[s.Slot] += 1
-	// 	slotToSandwichVictimCount[s.Slot] += uint64(len(s.Victims))
-	// }
-
+	// Per-slot sandwich counts are derived from the sandwiches table when needed rather than
+	// denormalised here, so slot_txs stays a pure record of what was fetched.
 	statuses := make([]*types.SlotTxsStatus, 0, len(blks))
 	for _, blk := range blks {
 		statuses = append(statuses, &types.SlotTxsStatus{

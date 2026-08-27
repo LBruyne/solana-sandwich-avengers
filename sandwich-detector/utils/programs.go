@@ -1,9 +1,9 @@
 package utils
 
 import (
-	"strings"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
+	"strings"
 
 	"github.com/spf13/viper"
 )

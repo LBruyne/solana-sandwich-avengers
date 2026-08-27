@@ -38,10 +38,10 @@ const (
 	// parallelized in batches. The bundles.jito.wtf endpoint is behind Cloudflare, which returns 403
 	// on bursts: measured ~16/s clean at 4 workers, ~32/s with occasional 403 at 8, fully blocked at
 	// 16. 8 keeps close to the sandwich backfill; occasional 403s are cleared by per-batch backoff.
-	JITO_FETCH_PARALLEL_NUM = 8
-	JITO_FETCH_BATCH_NUM    = 256
-	JITO_FETCH_MAX_ATTEMPTS = 6                      // per-batch attempts before a slot is deferred to the final retry pass
-	JITO_FETCH_RETRY_BACKOFF = 2 * time.Second       // initial per-batch backoff on 403/transient errors, doubled each attempt
+	JITO_FETCH_PARALLEL_NUM  = 8
+	JITO_FETCH_BATCH_NUM     = 256
+	JITO_FETCH_MAX_ATTEMPTS  = 6               // per-batch attempts before a slot is deferred to the final retry pass
+	JITO_FETCH_RETRY_BACKOFF = 2 * time.Second // initial per-batch backoff on 403/transient errors, doubled each attempt
 
 	SOL_FETCH_SLOT_LEADER_MAX_GAP        = 4000000 // the API can preserve slot-leader data ~0.5 month ago
 	SOL_FETCH_SLOT_LEADER_LIMIT          = 5000
@@ -55,12 +55,10 @@ const (
 	SOL_FETCH_SLOT_DATA_PARALLEL_NUM = 8     // number of parallel requests
 
 	// Backfill fetches bigger batches with more workers than live: a bounded historical range has
-	// no tip-latency constraint, larger batches amortize per-batch fixed costs and actually fill
-	// the window-worker pool (a 32-slot batch spans ~8 rotations → ~8 windows vs ~2 at batch 8),
-	// and the paid archival RPC absorbs the concurrency. Measured on 1,600 archival slots:
-	// 3.2x throughput vs 8/8 with an identical sandwich set.
+	// no tip-latency constraint, and a 32-slot batch spans ~8 rotations, which fills the
+	// window-worker pool.
 	// MUST stay <= CROSS_BLOCK_CACHE_SIZE (64): the sliding-window cache has to span at least one
-	// full batch or cross-batch boundary windows silently stop forming.
+	// full batch, or cross-batch boundary windows stop forming.
 	BACKFILL_FETCH_SLOT_NUM            = 32
 	BACKFILL_FETCH_PARALLEL_NUM        = 16
 	SOL_FETCH_SLOT_DATA_RETRYS         = 3 // number of retries on failure

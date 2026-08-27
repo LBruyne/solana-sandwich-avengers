@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sandwich-detector/config"
 	"sync"
 	"time"
-	"sandwich-detector/config"
 )
 
 const MaxLogSize = 50 * 1024 * 1024 // 100 MB

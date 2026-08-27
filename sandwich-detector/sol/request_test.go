@@ -3,29 +3,29 @@ package sol
 import (
 	"fmt"
 	"os"
-	"testing"
 	"sandwich-detector/logger"
+	"testing"
 
 	"github.com/spf13/viper"
 )
 
 func init() {
 	logger.InitLogs("sol-test")
-	// Default endpoint for tests that resolve pool-owner accounts via getMultipleAccounts
-	// (account owners are current state, not ledger history, so the self-hosted node serves them).
-	// Live RealAPI tests and the fixture tests override this as needed.
-	SolanaRpcURL = "http://64.130.32.137:8899"
+	// Offline fixture tests need no RPC. The few tests that resolve pool-owner accounts via
+	// getMultipleAccounts read SOL_TEST_RPC; account owners are current state rather than ledger
+	// history, so any full node serves them. Live RealAPI tests override this themselves.
+	SolanaRpcURL = os.Getenv("SOL_TEST_RPC")
 }
 
-// solRealRPC returns the RPC endpoint for live tests. Set SOL_REAL_TEST=1 and optionally
-// SOL_REAL_RPC=<url> (defaults to the self-hosted node).
+// solRealRPC returns the RPC endpoint for live tests. Both env vars are required so a live
+// test never silently falls back to some other operator's node.
 func solRealRPC(t *testing.T) string {
 	if os.Getenv("SOL_REAL_TEST") == "" {
-		t.Skip("set SOL_REAL_TEST=1 (and optionally SOL_REAL_RPC) to hit a live RPC")
+		t.Skip("set SOL_REAL_TEST=1 and SOL_REAL_RPC=<url> to hit a live RPC")
 	}
 	url := os.Getenv("SOL_REAL_RPC")
 	if url == "" {
-		url = "http://64.130.32.137:8899"
+		t.Skip("SOL_REAL_TEST=1 but SOL_REAL_RPC is unset")
 	}
 	return url
 }
@@ -135,7 +135,7 @@ func TestRpcHostRedaction(t *testing.T) {
 	cases := map[string]string{
 		"https://solana-mainnet.core.chainstack.com/secret-key": "solana-mainnet.core.chainstack.com",
 		"https://mainnet.helius-rpc.com/?api-key=secret":        "mainnet.helius-rpc.com",
-		"http://64.130.32.137:8899":                             "64.130.32.137:8899",
+		"http://10.0.0.1:8899":                                  "10.0.0.1:8899",
 	}
 	for in, want := range cases {
 		if got := rpcHost(in); got != want {

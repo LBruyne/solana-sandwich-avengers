@@ -8,11 +8,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Bootstrap creates the database and its tables. main installs it; running it from
+// PersistentPreRun rather than from main means `--help` and shell completion work without a
+// reachable ClickHouse, which is the first thing a new user runs.
+var Bootstrap func()
+
 var RootCmd = &cobra.Command{
 	Use:   "sandwich-detector",
 	Short: "Detect, enrich, and persist sandwich attacks on Solana",
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		logger.SetConsoleEnabled(!notToStdout)
+		if Bootstrap != nil {
+			Bootstrap()
+		}
 	},
 }
 
@@ -28,6 +36,7 @@ var notToStdout bool
 var jitoFetchBundleOnly bool
 var jitoSyncInBundle bool
 var jitoFetchAhead bool
+var resetAssumeYes bool
 
 func init() {
 
@@ -110,6 +119,13 @@ func init() {
 		"rps",
 		0,
 		"backfill only: max RPC requests/sec (0 = no throttle, fine for paid RPC like Chainstack; set e.g. 10 for rate-limited tiers like Helius free)",
+	)
+
+	resetCmd.Flags().BoolVar(
+		&resetAssumeYes,
+		"yes",
+		false,
+		"skip the confirmation prompt (for non-interactive use)",
 	)
 
 	RootCmd.AddCommand(&resetCmd, &jitoCmd, &slotCmd, &sandwichCmd)

@@ -4,14 +4,14 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sandwich-detector/config"
+	"sandwich-detector/types"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"sandwich-detector/config"
-	"sandwich-detector/types"
 )
 
 // Env-gated performance benchmark for the detection pipeline. It fetches a real archival

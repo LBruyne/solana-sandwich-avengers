@@ -1,9 +1,9 @@
 package sol
 
 import (
-	"strings"
 	"sandwich-detector/sol/dex"
 	"sandwich-detector/types"
+	"strings"
 
 	"github.com/spf13/viper"
 )

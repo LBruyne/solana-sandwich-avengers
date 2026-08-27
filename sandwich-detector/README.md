@@ -25,8 +25,42 @@ Jito API ──► jito ────────────┴──► jito_bu
 | `jito`     | Jito API + DB      | `jito_bundles`, `slot_bundles`, `sandwich_txs.inBundle`      |
 | `reset`    | (none)             | drops all tables                                             |
 
-The database schema is in [`../db/create_tables/`](../db/create_tables/).
-Tables are created automatically on the first run.
+The database schema is in [`../db/create_tables/`](../db/create_tables/); the
+authoritative copy is `CreateTables` in [`db/clickhouse.go`](db/clickhouse.go).
+Both the database and its tables are created automatically on the first run.
+
+One column is reserved rather than populated: `sandwiches.ataSame` is always
+`false`. The detector links a sandwich's two legs by signer and by token-account
+owner (`signerSame`, `ownerSame`), and computes no ATA-level comparison.
+
+## Quick start
+
+From a clean machine to a running detector:
+
+```bash
+# 0. Prerequisites: Go 1.24 and a running ClickHouse server (see below).
+cd sandwich-detector
+
+# 1. Configuration. Both files are gitignored; fill in your own endpoints and keys.
+cp .env.example .env                 # ClickHouse credentials + RPC API keys
+cp config.example.yaml config.yaml   # RPC and Jito base URLs
+
+# 2. Build.
+./scripts/build.sh                   # produces ./sandwich-detector
+
+# 3. Verify the build without touching the network.
+go test ./...                        # the whole suite is offline
+
+# 4. Run. The database and all tables are created automatically on first start.
+./scripts/leader.sh   400000000      # slot leaders (cheap, run continuously)
+./scripts/sandwich.sh 400000000      # detection (the main worker)
+./scripts/jito.sh     400000000      # Jito enrichment, once detection has output
+```
+
+The binary reads `config.yaml`, `.env` and `programs.yaml` from its **working
+directory**, so run it from `sandwich-detector/` (the `scripts/` wrappers `cd`
+there for you). It exits immediately with an actionable message if either
+config file is missing or ClickHouse is unreachable.
 
 ## Requirements
 
@@ -53,11 +87,12 @@ sudo apt-get update && sudo apt-get install -y clickhouse-server clickhouse-clie
 sudo service clickhouse-server start
 ```
 
-Create the database used by the detector (v2/dev-2 default name `solwich_v2`;
-set via `CLICKHOUSE_DATABASE`). The detector also bootstraps it automatically:
+Create the database used by the detector (default name `solwich`; set via
+`CLICKHOUSE_DATABASE` in `.env`). The detector also bootstraps it automatically
+on startup, so this step is optional:
 
 ```sql
-clickhouse-client -q "CREATE DATABASE solwich_v2"
+clickhouse-client -q "CREATE DATABASE solwich"
 ```
 
 Tables are created by the detector on first run; you do not need to apply
@@ -78,7 +113,7 @@ cp config.example.yaml config.yaml
 CLICKHOUSE_ADDR=localhost:9000
 CLICKHOUSE_HOST=localhost
 CLICKHOUSE_PORT=8123
-CLICKHOUSE_DATABASE=solwich_v2
+CLICKHOUSE_DATABASE=solwich
 CLICKHOUSE_USERNAME=default
 CLICKHOUSE_PASSWORD=
 
@@ -94,15 +129,14 @@ jito:
 sol:
   rpc-chainstack: https://solana-mainnet.core.chainstack.com  # default (live + backfill)
   rpc-helius: https://mainnet.helius-rpc.com                  # backfill fallback
-  rpc: http://64.130.32.137:8899                              # self-hosted, live fallback
+  rpc:                                                        # optional self-hosted node, live fallback
 ```
 
 config.yaml holds **base URLs only** — the API keys live in `.env` (`CHAINSTACK_API_KEY`
 joins `rpc-chainstack` as the URL path; `HELIUS_RPC_API_KEY` joins `rpc-helius` as
 `?api-key=`), so no keyed URL is ever written to config or logs. Resolution order —
 live: Chainstack → self-hosted → Helius; backfill: Chainstack → Helius (the self-hosted
-node keeps only ~6h of ledger and is never used for backfill). Detection throughput is
-bounded by RPC quality.
+node keeps only ~6h of ledger and is never used for backfill).
 
 Detection thresholds, parallelism, and timing intervals are compile-time
 constants in [`config/config.go`](config/config.go); see the [Tuning](#tuning)
@@ -189,12 +223,14 @@ to use them.
 
 ### `reset`
 
-Drops every table the detector creates. Tables are recreated on the next
-run. Destructive; there is no confirmation prompt on the binary itself
-(the wrapper script `scripts/reset.sh` adds one).
+Drops every table the detector creates; they are recreated empty on the next
+run, so this discards every detection result. It asks for confirmation and
+accepts only the database name typed back. Pass `--yes` to skip the prompt in
+scripts.
 
 ```bash
-./sandwich-detector reset
+./sandwich-detector reset          # prompts for the database name
+./sandwich-detector reset --yes    # non-interactive
 ```
 
 ## Recommended startup sequence
@@ -233,25 +269,37 @@ All knobs live in [`config/config.go`](config/config.go). Notable ones:
 | `SANDWICH_BACKRUN_MAX_GAP`                   |     500 | Same, back-run side                              |
 | `JITO_MARK_IN_BUNDLE_SAFE_LAG`               |    2000 | Lag behind sandwich frontier before marking      |
 
-Detection precision is sensitive to the amount-diff threshold and SOL
-tolerance; the defaults are calibrated against the comparison sets in
-`sandwich-intent/`.
+`INBLOCK_SANDWICH_AMOUNT_DIFF_THRESHOLD` and `SANDWICH_AMOUNT_SOL_TOLERANCE`
+are the two that move the detected set most.
 
 ## Tests
 
-Most tests are offline and run without any RPC, using fixtures under
-`sol/testdata/`. Live parity/integration tests are gated behind env vars
-(`PARITY_RPC`, `WINDOW_TEST`, `SOL_REAL_TEST`, `JITO_REAL_TEST`, `PERF_TEST`) and
-auto-skip otherwise.
+The default suite runs with **no network access at all**. Every test that needs
+a live endpoint is gated behind an environment variable and skips when it is
+unset, so `go test ./...` is reproducible on a machine with no RPC credentials.
 
 ```bash
 go test ./...                              # offline suite (live tests auto-skip)
 go test ./sol -run TestSandwichFromJSON -v # deterministic fixture regression test
 ```
 
-`sol/testdata/` contains JSON fixtures (sandwiches and victim swaps) used by
-the deterministic regression tests in `sol/sandbox_test.go`
-(`TestSandwichFromJSON`, `TestVictimSlippage`).
+`sol/testdata/` holds the fixtures: `sandwiches/*.json` and `victims/*.json` drive
+the regression tests in `sol/sandbox_test.go` (`TestSandwichFromJSON`,
+`TestVictimSlippage`), and `account_owners.json` freezes the account -> owner-program
+mappings that a few fixtures would otherwise resolve through `getMultipleAccounts`.
+Delete that file and re-run with `SOL_TEST_RPC=<url>` to regenerate it.
+
+Environment variables that unlock live tests, all optional:
+
+| Variable                    | Unlocks                                              |
+|-----------------------------|------------------------------------------------------|
+| `SOL_TEST_RPC=<url>`        | pool-owner lookups instead of the frozen fixture      |
+| `SOL_REAL_TEST=1` + `SOL_REAL_RPC=<url>` | live Solana RPC tests                    |
+| `PARITY_RPC=<url>` (+ `PARITY_SLOT`)     | finder determinism on a real slot        |
+| `WINDOW_TEST=1` + `PARITY_RPC=<url>`     | end-to-end windowed detection            |
+| `SCAN_RPC=<url>`            | the ad-hoc slot-scan helpers                          |
+| `JITO_REAL_TEST=1`          | live Jito bundles API                                 |
+| `PERF_TEST=1`               | detection throughput benchmark                        |
 
 ## Logs
 

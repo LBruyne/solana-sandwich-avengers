@@ -115,11 +115,11 @@ func setupScan(t *testing.T) {
 	if !viper.IsSet("labeled_dex") {
 		t.Fatalf("programs.yaml loaded but labeled_dex missing")
 	}
-	if rpc := os.Getenv("SCAN_RPC"); rpc != "" {
-		SolanaRpcURL = rpc
-	} else {
-		SolanaRpcURL = "http://64.130.32.137:8899"
+	rpc := os.Getenv("SCAN_RPC")
+	if rpc == "" {
+		t.Skip("set SCAN_RPC=<url> to run the scan helpers against an RPC")
 	}
+	SolanaRpcURL = rpc
 }
 
 // TestScanSlotList fetches an explicit list of slots (JSON array in SCAN_SLOTLIST),
@@ -182,11 +182,12 @@ func TestScanSlotList(t *testing.T) {
 // TestScanAttackers scans a recent slot range on the configured RPC, runs both
 // in-block and cross-block sandwich detection, and writes every detected
 // sandwich as one JSON line to SCAN_OUT. Controlled by env:
-//   SCAN_RPC   (default fast node)
-//   SCAN_START (default current-6000)
-//   SCAN_SLOTS (default 600)
-//   SCAN_BATCH (default 100)
-//   SCAN_OUT   (default ./scan_out.jsonl)
+//
+//	SCAN_RPC   (default fast node)
+//	SCAN_START (default current-6000)
+//	SCAN_SLOTS (default 600)
+//	SCAN_BATCH (default 100)
+//	SCAN_OUT   (default ./scan_out.jsonl)
 func TestScanAttackers(t *testing.T) {
 	if os.Getenv("SCAN_RUN") != "1" {
 		t.Skip("set SCAN_RUN=1 to run the attacker scan")
@@ -211,7 +212,7 @@ func TestScanAttackers(t *testing.T) {
 	}
 	rpc := os.Getenv("SCAN_RPC")
 	if rpc == "" {
-		rpc = "http://64.130.32.137:8899"
+		t.Skip("set SCAN_RPC=<url> to run the scan helpers against an RPC")
 	}
 	SolanaRpcURL = rpc
 

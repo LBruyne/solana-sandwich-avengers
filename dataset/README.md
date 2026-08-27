@@ -1,374 +1,249 @@
 # Solana Sandwich Attacker Dataset
 
-A labelled dataset of sandwich attackers on Solana, derived from on-chain
-data over a 15-epoch measurement window. Each row in `attackers` is one
-attacker entity; `sandwiches` and `sandwich_txs` carry the underlying
-detection at the sandwich and transaction level. The term *attacker*
-denotes a classified entity; *signer* denotes the on-chain signer of a
-specific transaction. They differ for sandwiches whose front-run and
-back-run use distinct keys controlled by the same owner.
+A labelled dataset of intentional sandwich attackers on Solana over epochs 946–990, with
+the sandwiches attributed to each and the transaction legs of each sandwich.
 
-The dataset is the output of the detection and classification pipeline in
-this repository: [`sandwich-detector/`](../sandwich-detector/) emits the
-raw heuristic detections; [`sandwich-intent/`](../sandwich-intent/) filters them to
-intentional attackers using win-rate, slippage-consumption, and front-gap
-signals plus Jito bundle co-occurrence. See the paper for the full method.
+*Attacker* is a classified entity; *signer* is the on-chain signer of one transaction. They
+differ for sandwiches whose front-run and back-run use distinct keys under one owner.
+
+Produced by the pipeline in this repository: [`sandwich-detector/`](../sandwich-detector/)
+emits the shape-level detections, [`sandwich-intent/`](../sandwich-intent/) classifies
+entities, and [`build_dataset.py`](build_dataset.py) merges the two into the files here.
 
 ## Files
 
 ```
-attackers_<start>_<end>.parquet      # 380 rows; one entity per row
-sandwiches_<start>_<end>.parquet     # 64,206 rows; one sandwich per row
-sandwich_txs_<start>_<end>.parquet   # 590,441 rows; one front/back/victim/adverse tx per row
-attackers_<start>_<end>.csv          # CSV files are example slices — see below
-sandwiches_<start>_<end>.csv
-sandwich_txs_<start>_<end>.csv
+attackers_946_990.parquet             322 rows
+attackers_946_990.csv                 322 rows
+sandwiches_946_990.parquet            286,219 rows
+sandwiches_946_990.csv                the CSV attacker slice
+sandwich_txs_946_990_<a>_<b>.parquet  5,297,560 rows over 6 contiguous epoch parts
+sandwich_txs_csv_946_990_<a>_<b>.csv  213,244 rows over 3 parts; the CSV slice, own legs only
 aux/
-    validators.csv                    # Solana validator metadata snapshot (StakeWiz)
-    token_prices.csv                  # tokenA → USD price snapshot (Moralis)
-    sandwiched_me_epoch_946.csv       # third-party sandwich list, epoch 946 (sandwiched.me)
-build_dataset.py                      # rebuild script
+    validators.csv                    Solana validator metadata (StakeWiz)
+    token_prices.csv                  token → USD price snapshot (Moralis)
+    sandwiched_me_epoch_946.csv       third-party sandwich list, epoch 946
+build_dataset.py
+requirements.txt
 ```
 
-The `<start>_<end>` suffix is the inclusive epoch range of the release.
-The published release is `946_960`.
+### Parquet vs CSV
 
-### Parquet vs. CSV
+**Parquet is the full dataset.** `attackers` and `sandwiches` are one file each;
+`sandwich_txs` is split into contiguous epoch parts so no file passes GitHub's 100 MB
+limit. The parts concatenate back to the whole table:
 
-The **Parquet files are the canonical dataset** and contain every row.
+```python
+import glob, pandas as pd
+txs = pd.concat(pd.read_parquet(p) for p in sorted(glob.glob("sandwich_txs_946_990_*.parquet")))
+```
 
-The **CSV files are example slices**, not a full mirror. They contain
-the union of two top-3 % cohorts:
+**CSV is a slice**, except for `attackers`, which is complete in both formats. The slice is
+the top 20 attackers by `usd_profit_net` together with every attacker the paper names —
+27 attackers, 106,473 sandwiches.
 
-- the top 3 % of attackers by **`usd_total_profit`** (12 attackers), and
-- the top 3 % of attackers by **`sandwich_count`** (12 attackers).
+`sandwich_txs_csv_*` narrows further, to those attackers' own `frontRun` and `backRun`
+legs — 213,244 rows. Their victim and adverse legs are in the parquet parts only: a CSV row
+costs about five times a parquet row, and the full slice runs to 775 MB.
 
-In the published `946_960` release these two cohorts overlap on 9
-attackers, giving 15 unique attackers. The CSVs include those 15
-attackers along with all of their sandwiches and transactions.
+CSV parts are packed to their own epoch boundaries, not the parquet ones, for the same
+reason. To widen or narrow the slice, change `--csv-top-n` or `PAPER_ATTACKERS` in
+[`build_dataset.py`](build_dataset.py) and re-run.
 
-This selection covers both the most profitable bots and the highest-
-volume bots in a single readable file. For any analysis beyond a quick
-look, use the Parquet files.
-
-If you need the full data in CSV form, edit `CSV_EXAMPLE_FRACTION` (or
-the slicing logic) in [`build_dataset.py`](build_dataset.py) and re-run
-it locally.
-
-## Data window
+## Window
 
 | | Start | End |
 |---|---:|---:|
-| Epoch | 946 | 960 |
-| Slot  | 408,672,000 | 415,151,999 |
+| Epoch | 946 | 990 |
+| Slot  | 408,672,000 | 428,111,999 |
 
-Approximately 15 × 432,000 = 6,480,000 theoretical slots; observed slot
-coverage exceeds 99 % over the window. Actual UTC date range depends on
-chain timing; consult `slot_leaders` in the source database for exact
-boundaries.
+45 epochs, 19,440,000 theoretical slots.
 
 ## Schema
 
 ### `attackers`
 
-One row per attacker entity. For 379 of 380 rows the entity is a single
-on-chain key. For one entity (`A8zEst…`, the only one classified in the
-`diff-signer` track), `attacker` is the union-find root over a set of
-on-chain keys that operate a shared owner / PDA.
+One row per attacker entity, ranked by `usd_profit_net`.
 
-| Column                 | Type        | Description |
-|------------------------|-------------|-------------|
-| `attacker`             | str         | Attacker identifier (on-chain key, or merged entity root for diff-signer). |
-| `categories`           | list[str]   | Multi-label tags ⊆ `{standard, multi-split, diff-signer, jito}`. See [Categories](#categories). |
-| `sandwich_count`       | int         | Total sandwiches attributed to this entity in the window. |
-| `profitable_count`     | int         | Sandwiches with `profit > 0`. |
-| `win_rate`             | float       | `profitable_count / sandwich_count`. |
-| `usd_total_profit`     | float       | Sum of `usd_profit` over all sandwiches; tokens without a price snapshot contribute 0. |
-| `usd_avg_profit`       | float       | Mean `usd_profit`. |
-| `sol_total_profit`     | float       | Sum of `profit` restricted to `token_a == "SOL"`, in SOL. |
-| `sol_avg_profit`       | float       | Mean `profit` over SOL-base sandwiches; NaN if none. |
-| `jito_count`           | int         | Sandwiches whose front + victim(s) + back share a single Jito bundle. |
-| `jito_rate`            | float       | `jito_count / sandwich_count`. |
-| `mean_slippage`        | float       | Mean of sandwich-level `slippage_consumption` over valid samples; NaN if none. |
-| `median_proximity`     | float       | Median `fg` (front-run-to-first-victim distance, in tx count). |
-| `fg1_ratio`            | float       | Fraction of sandwiches with `fg == 1`. |
-| `fg100_ratio`          | float       | Fraction of sandwiches with `fg <= 100`. |
-| `in_block_count`       | int         | Sandwiches with `cross_block == False`. |
-| `cross_block_count`    | int         | Sandwiches spanning multiple slots. |
-| `multi_split_count`    | int         | Sandwiches with multiple front-run or back-run legs. |
-| `n_signing_keys`       | int         | Number of on-chain keys merged into this entity (≥ 2 only for the diff-signer entity; 1 otherwise). |
+| Column | Type | Description |
+|---|---|---|
+| `attacker` | str | Attacker identifier: an on-chain key, or the union-find root over the keys of a `diff-signer-owner` entity. |
+| `bot_type` | str | Which track admitted the attacker: `Jito Bot`, `Signal Bot`, or both, comma-joined. |
+| `categories` | str | Comma-joined subset of `{standard, multi-split, diff-signer-owner, diff-signer-transfer}`. |
+| `sandwich_count` | int | Sandwiches attributed to this entity. |
+| `usd_profit_net` | float | Sum of `sandwiches.usd_profit_net`. |
+| `usd_avg_profit` | float | `usd_profit_net / sandwich_count`. |
+| `sol_profit_net` | float | Net profit over `token_a == "SOL"` sandwiches, in $SOL. |
+| `fee_sol_total` | float | $SOL this entity spent on its own front-run and back-run fees. |
+| `win_rate` | float | Share of priceable sandwiches with `usd_profit_net > 0`. |
+| `sol_win_rate` | float | The same rate over `token_a == "SOL"` sandwiches, where no price table is involved. |
+| `mean_slippage_consumption` | float | Mean of `sandwiches.slippage_consumption` over the entity's scored sandwiches. |
+| `slippage_coverage` | float | Share of the entity's sandwiches that produced a slippage value. |
+| `front_gap_median` | float | Median `front_gap`. |
+| `front_gap_eq1_ratio` | float | Share of sandwiches with `front_gap <= 1`. |
+| `in_block_count` | int | Sandwiches with `cross_block == False`. |
+| `cross_block_count` | int | Sandwiches spanning more than one slot. |
+| `cross_leader_count` | int | Sandwiches spanning more than one leader rotation. |
+| `multi_split_count` | int | Sandwiches with a split front-run or back-run. |
+| `jito_bundle_count` | int | Sandwiches whose front, victims and back share one Jito bundle. |
+| `first_slot`, `last_slot` | int | First and last slot the entity is seen at. |
+| `expert_verdict` | str | `yes`, `ambiguous`, or `not_audited`. Entities labelled `no` are not in the dataset. |
+| `n_signing_keys` | int | On-chain keys merged into this entity; > 1 only for `diff-signer-owner`. |
 
-#### Categories
+`categories` is a multi-label field, not a partition: an entity carries a label if at least
+one of its sandwiches has that shape.
 
-`categories` is a multi-label set, not a partition. An attacker carries
-a tag if at least one of their sandwiches matches that tag.
-
-- **`standard`** — at least one sandwich with a single signer for the
-  whole sandwich, single front-run, single back-run.
-- **`multi-split`** — at least one sandwich whose front-run and/or
-  back-run is split across multiple transactions by the same attacker.
-- **`diff-signer`** — at least one sandwich where front-run and back-run
-  use different on-chain keys but share the same owner / PDA. Only the
-  union-find merged entity (`A8zEst…`) carries this tag in the published
-  release.
-- **`jito`** — at least one sandwich was a Jito same-bundle sandwich
-  (front-run, all victims, and back-run all share a single `bundleId`).
-  Orthogonal to the structural tags above.
-
-The `diff-signer-transfer` category that the watcher detects (signer
-rotation via on-chain transfers) is intentionally excluded from this
-dataset; in the measurement window it produced no entity that survived
-the intent classifier (see paper §5b).
+- `standard` — one signer for the whole sandwich, single front-run, single back-run.
+- `multi-split` — front-run and/or back-run split across several transactions.
+- `diff-signer-owner` — front-run and back-run under different keys sharing a token-B owner.
+- `diff-signer-transfer` — front-run and back-run share neither signer nor owner, linked by
+  an inline transfer. The attacker is named by the front-run's fee payer.
 
 ### `sandwiches`
 
-One row per attributed sandwich. The `attacker` column is the foreign key
-into `attackers`.
+One row per attributed sandwich. `attacker` joins to `attackers.attacker`.
 
-| Column                 | Type        | Description |
-|------------------------|-------------|-------------|
-| `sandwich_id`          | str         | Stable identifier from the detection layer. |
-| `attacker`             | str         | Attacker entity (matches `attackers.attacker`). |
-| `slot`                 | uint64      | Slot of the sandwich. For cross-block sandwiches, the slot of the first front-run. |
-| `token_a`              | str         | The asset the attacker holds (the "target"). `"SOL"` denotes native SOL or wSOL, merged. |
-| `token_b`              | str         | The asset the attacker swaps to and back from. |
-| `profit`               | float       | Net `tokenA` gain across the sandwich. |
-| `usd_profit`           | float       | `profit` × token_a USD price (snapshot in `aux/token_prices.csv`). 0 for tokens not in the snapshot. |
-| `is_profitable`        | bool        | `profit > 0`. |
-| `victim_count`         | uint16      | Number of victim transactions. |
-| `adverse_count`        | uint16      | Number of adverse transactions (pool-direction matches back-run). |
-| `cross_block`          | bool        | True if front-run and back-run are in different slots. |
-| `multi_split`          | bool        | True if `front_count > 1` or `back_count > 1`. |
-| `front_count`          | uint16      | Number of front-run transactions. |
-| `back_count`           | uint16      | Number of back-run transactions. |
-| `slippage_consumption` | float       | Sandwich-level fraction of victim slippage absorbed; valid in `[0, 1]`, NaN otherwise. See [Slippage](#slippage). |
-| `jito_bundle`          | bool        | All of front-run, victim(s), and back-run share one Jito bundle. |
-| `fg`                   | int64       | Front-gap: tx-count distance from last front-run to first victim. |
-| `bg`                   | int64       | Back-gap: tx-count distance from last victim to first back-run. |
-| `front_sig`            | list[str]   | Signatures of all front-run transactions in this sandwich. |
-| `victim_sig`           | list[str]   | Signatures of all victim transactions. |
-| `back_sig`             | list[str]   | Signatures of all back-run transactions. |
+| Column | Type | Description |
+|---|---|---|
+| `sandwich_id` | str | Identifier from the detection layer; joins to `sandwich_txs.sandwich_id`. |
+| `attacker` | str | Attacker entity. |
+| `slot` | int64 | Slot of the first front-run leg. |
+| `timestamp` | datetime | Block time of that slot, UTC. |
+| `token_a` | str | The asset the attacker holds. `"SOL"` covers native SOL and wSOL. |
+| `token_b` | str | The asset the attacker swaps into and back out of. |
+| `profit_token_a` | float | `backRun.toTotal - frontRun.fromTotal`, in token A. |
+| `fee_sol` | float | $SOL the attacker paid on its own front-run and back-run legs. |
+| `usd_profit_net` | float | `profit_token_a` priced in USD, minus `fee_sol` priced in USD. NaN when `token_a` is absent from `aux/token_prices.csv`. |
+| `is_profitable` | bool | `usd_profit_net > 0`. |
+| `victim_count` | int32 | Victim transactions between the legs. |
+| `adverse_count` | int32 | Transactions between the legs that traded against the attacker. |
+| `front_count`, `back_count` | int32 | Legs on each side. |
+| `cross_block` | bool | The legs span more than one slot. |
+| `cross_leader` | bool | The legs span more than one leader rotation. Implies `cross_block`. |
+| `multi_split` | bool | `front_count > 1` or `back_count > 1`. |
+| `front_gap` | int64 | Transactions between the first front-run leg and the first victim. |
+| `back_gap` | int64 | Transactions between the last victim and the first back-run leg. |
+| `slippage_consumption` | float | Fraction of victim slippage tolerance the attack consumed, in `[0, 1]`. NaN unless `slippage_state == "scored"`. |
+| `slippage_state` | str | `scored`, `anomalous`, or `unprotected`. |
+| `slippage_reason` | str | Why a sandwich is not scored: `no_protection`, `empty_type`, `limit_nonpositive`, `no_victim`, and so on. |
+| `jito_bundle` | bool | Front, victims and back share one Jito bundle, with the same signer and positive profit. |
+| `pool_dex` | str | Venue of the front-run leg, e.g. `pumpfun`, `raydium_v4`, `meteora_dlmm`. |
+| `category` | str | Structural category of this sandwich. |
+
+Gaps are transaction counts along the slot axis, spanning block boundaries via each slot's
+transaction count, so a cross-block gap includes the intervening blocks in full.
+
+`slippage_consumption` is the maximum over the sandwich's victims at or above a 0.01
+protection floor. `anomalous` means at least one victim's consumption could not be read;
+`unprotected` means every victim's decoded limit was below the floor. Both are NaN, never 0.
 
 ### `sandwich_txs`
 
-One row per non-transfer transaction inside an attributed sandwich. Joins
-on `sandwich_id`. Excludes `transfer` rows (intermediate token-bridge
-transfers, retained only in the upstream watcher database).
+One row per transaction leg of an attributed sandwich. Joins on `sandwich_id`.
 
-| Column                 | Type        | Description |
-|------------------------|-------------|-------------|
-| `sandwich_id`          | str         | Foreign key to `sandwiches.sandwich_id`. |
-| `sandwich_attacker`    | str         | Foreign key to `attackers.attacker` (the entity owning the sandwich). |
-| `type`                 | str         | One of `frontRun`, `backRun`, `victim`, `adverse`. |
-| `slot`                 | uint64      | Slot of this transaction. |
-| `position`             | int32       | Position of the transaction within the slot. |
-| `signature`            | str         | Transaction signature. |
-| `tx_signer`            | str         | First signer of the transaction. Equal to `sandwich_attacker` for non-`diff-signer` sandwiches. |
-| `from_token`           | str         | Source token. |
-| `to_token`             | str         | Destination token. |
-| `from_amount`          | float       | Source amount in token units. |
-| `to_amount`            | float       | Destination amount in token units. |
-| `in_bundle`            | bool        | True if this single transaction landed inside a Jito bundle. |
-| `fee`                  | uint64      | Transaction fee in lamports. |
-| `programs`             | list[str]   | Program IDs invoked by the transaction. |
-| `slippage_consumption` | float       | Victim slippage utilization. Non-NaN only for `type == "victim"`. See [Slippage](#slippage). |
+| Column | Type | Description |
+|---|---|---|
+| `sandwich_id` | str | Foreign key to `sandwiches.sandwich_id`. |
+| `type` | str | `frontRun`, `backRun`, `victim`, or `adverse`. |
+| `slot` | int64 | Slot of this transaction. |
+| `position` | int32 | Position within the slot. |
+| `signature` | str | Transaction signature. |
+| `tx_signer` | str | First signer. |
+| `from_token`, `to_token` | str | Swap direction. |
+| `from_amount`, `to_amount` | float | Swap amounts in token units. |
+| `fee` | uint64 | Transaction fee in lamports. |
+| `in_bundle` | bool | This transaction landed inside a Jito bundle. |
+| `programs` | list[str] | Program IDs the transaction invoked. |
+| `slippage_limit_type` | str | `output` for a minimum-out bound, `input` for a maximum-in bound. Empty for non-victims. |
+| `slippage_limit_amount` | float | The bound the victim set. NaN for non-victims. |
+| `slippage_actual_amount` | float | What the victim actually received or paid. NaN for non-victims. |
 
-#### Slippage
-
-For victims, the upstream detector decodes the swap instruction to extract
-the user's slippage limit (`min_amount_out` for output-bound swaps,
-`max_amount_in` for input-bound), compares it to the actual execution,
-and reports a fraction in `[0, 1]` indicating how close execution came to
-the limit. Three sentinels are also possible:
-
-| Code | Meaning |
-|------|---------|
-| `-1` | The swap defines no slippage protection (limit is 0 or absent). |
-| `-2` | The DEX is recognized but slippage decoding is not implemented. |
-| `-3` | The DEX is recognized and decoding is implemented, but inner instruction data needed to compute the actual amount is missing. |
-
-`sandwich_txs.slippage_consumption` carries these raw values for victim
-rows.
-
-`sandwiches.slippage_consumption` is the sandwich-level summary computed
-as follows: if any victim has code `-2` or `-3`, the sandwich is NaN;
-otherwise the sandwich value is the maximum over its victims, where the
-maximum is again replaced by NaN if all victims report `-1`. The result
-is therefore either NaN or a value in `[0, 1]`. About 30 % of sandwiches
-in the window carry a numeric value; the rest are NaN, predominantly
-because at least one victim DEX is not yet decoded.
+Victim slippage consumption is `limit / actual` for an `output` bound and `actual / limit`
+for an `input` bound. The raw amounts are published rather than the ratio so the rule can be
+re-derived.
 
 ### `aux/validators.csv`
 
-Snapshot of Solana validator metadata from the StakeWiz API at the time
-the dataset was built. Columns include `identity`, `vote_identity`,
-`name`, `activated_stake`, `stake_weight`, `commission`, `is_jito`,
-`ip_country`, etc. Joined to sandwich data via the slot leader of each
-sandwich's slot (see `slot_leaders` in the source ClickHouse database).
+StakeWiz validator metadata: `identity`, `vote_identity`, `name`, `activated_stake`,
+`stake_ratio`, `commission`, `is_jito`, `ip_city`, `ip_country`, `ip_asn`, `ip_org` and
+more. Join on `identity` to the leader of a slot; `slot_leaders` in the detector database
+carries the schedule.
 
 ### `aux/token_prices.csv`
 
-Snapshot of `(tokenA, USD price, SOL price)` for all `tokenA` values
-encountered in the merged sandwich set, queried from the Moralis Solana
-API. `usd_profit` and the `usd_*` columns in `attackers` are computed
-against this snapshot. Tokens not present in the snapshot contribute 0.
+`token, sandwich_count, usd_price, symbol, name, decimals` for the 100 most frequent
+`token_a` values plus SOL, from the Moralis Solana API. Every USD figure in this dataset and
+in the paper is computed against this file. A token absent from it has no price, and the USD
+columns derived from it are NaN.
 
 ### `aux/sandwiched_me_epoch_946.csv`
 
-The full set of sandwiches that the third-party site
-[sandwiched.me](https://sandwiched.me) flagged for epoch 946. Used in the
-paper for an external recall comparison. Columns:
-`slot, front_sig, front_signer, front_sell_amount, front_buy_amount, back_sig, back_signer, back_sell_amount, back_buy_amount`.
+Every sandwich [sandwiched.me](https://sandwiched.me) flagged for epoch 946, used as an
+external recall comparison. Columns: `slot, front_sig, front_signer, front_sell_amount,
+front_buy_amount, back_sig, back_signer, back_sell_amount, back_buy_amount`.
 
-## Provenance
-
-```
-Solana RPC blocks  ─►  sandwich-detector  ─►  ClickHouse
-                            (Go)               (sandwiches, sandwich_txs,
-                                                jito_bundles, slot_leaders, …)
-                                            │
-                                            ▼
-ClickHouse  ─►  sandwich-intent phase 1  ─►  per-sandwich features (per category)
-                sandwich-intent phase 3  ─►  bot_attackers + bot_sandwiches per category
-                                            │
-                                            ▼
-                                       build_dataset.py
-                                            │
-                                            ▼
-                                       this dataset
-```
-
-- The **detector** ([sandwich-detector/](../sandwich-detector/)) runs
-  three subcommands (`leader`, `sandwich`, `jito`) that ingest blocks,
-  apply in-block and cross-block sandwich heuristics, and mark Jito
-  bundle membership. Detection thresholds are documented in
-  `sandwich-detector/config/config.go` and tabled in its README.
-- The **sandwich-intent** ([sandwich-intent/](../sandwich-intent/)) reads the detector
-  output from ClickHouse, computes signer-level features per structural
-  category (`standard`, `multi_split`, `diff_signer_owner`), and applies
-  a three-track classifier: deterministic Jito-bundle proof, a
-  behavioural signal-based filter (CNT ≥ 10, win-rate ≥ 0.8,
-  mean slippage ≥ 0.75, P(fg ≤ 100) ≥ 0.6, USD ≥ \$10), and a
-  multi-split one-shot extension (CNT ≤ 5, win-rate ≥ 0.8, USD ≥ \$100).
-- **build_dataset.py** then merges per-category outputs across attackers,
-  recomputes per-attacker aggregates from the unified sandwich set,
-  pulls tx-level rows from ClickHouse, and writes the files in this
-  directory.
-
-## Build / reproduce
+## Rebuild
 
 ```bash
 pip install -r dataset/requirements.txt
-```
-
-The build script needs only a small subset of `sandwich-intent`'s
-dependencies (pandas, pyarrow, clickhouse-connect, python-dotenv); the
-deps are listed in `dataset/requirements.txt`. ClickHouse credentials
-are read from `sandwich-intent/.env`, so that file must be present.
-
-### Merge from existing sandwich-intent outputs (no ClickHouse rebuild)
-
-```bash
 python dataset/build_dataset.py
 ```
 
-Requires `sandwich-intent/data/3_attacker_filter/<category>/bot_*.parquet` to
-exist for the target epoch range. ClickHouse is still queried for the
-tx-level rows; pass `--no-tx-detail` to skip.
+Reads `sandwich-intent/data/3_attacker_filter/<category>/<database>/<variant>/` for the
+target range, so phases 1 and 3 must have been run first — see
+[`sandwich-intent/README.md`](../sandwich-intent/README.md). ClickHouse credentials come
+from `sandwich-intent/.env`.
 
-### Full rebuild (also re-runs sandwich-intent phases 1 and 3)
+| Flag | Default | Effect |
+|---|---|---|
+| `--database` | `solwich_v2` | Detector database |
+| `--start-epoch` `--end-epoch` | 946, 990 | Inclusive epoch range; also the filename suffix |
+| `--cross-leader` | `include` | Which phase-3 population to read |
+| `--csv-top-n` | 20 | Attackers by profit in the CSV slice, before the union with `PAPER_ATTACKERS` |
+| `--max-part-mb` | 90 | Upper bound on one `sandwich_txs` parquet part |
+| `--max-csv-part-mb` | 45 | Upper bound on one `sandwich_txs` CSV part |
+| `--no-tx-detail` | off | Skip `sandwich_txs` and the ClickHouse query |
+| `--copy-aux` | off | Refresh `aux/token_prices.csv` from the pipeline |
 
-```bash
-python dataset/build_dataset.py --rebuild
-```
-
-Re-runs sandwich-intent phase 1 and phase 3 for each of the three structural
-categories before merging. Requires a populated ClickHouse instance
-serving the underlying detector tables. Total wall time is on the order
-of an hour for a 15-epoch window.
-
-### Custom range
-
-```bash
-python dataset/build_dataset.py --start-epoch 946 --end-epoch 960
-```
-
-The output filenames carry the range as a suffix
-(`attackers_946_960.parquet`, …).
-
-### Refresh aux files
-
-```bash
-python dataset/build_dataset.py --copy-aux
-```
-
-Copies the latest validators / token-prices / sandwiched.me snapshots
-from `sandwich-intent/data/` into `dataset/aux/`.
+`aux/validators.csv` and `aux/sandwiched_me_epoch_946.csv` are not regenerated by the
+script; they are point-in-time crawls written by `sandwich-intent/0_crawl_stakewiz.py` and
+`0_crawl_sandwiched_me.py`.
 
 ## Usage
 
 ```python
-import pandas as pd
+import glob, pandas as pd
 
-attackers  = pd.read_parquet("dataset/attackers_946_960.parquet")
-sandwiches = pd.read_parquet("dataset/sandwiches_946_960.parquet")
+attackers  = pd.read_parquet("dataset/attackers_946_990.parquet")
+sandwiches = pd.read_parquet("dataset/sandwiches_946_990.parquet")
 
-# Top 10 attackers by USD profit
-print(attackers.sort_values("usd_total_profit", ascending=False).head(10))
+attackers.head(10)
 
-# All sandwiches by attackers tagged with both "standard" and "jito"
-mask = attackers["categories"].apply(lambda s: {"standard", "jito"} <= set(s))
-target = set(attackers.loc[mask, "attacker"])
-print(sandwiches[sandwiches["attacker"].isin(target)])
+# every sandwich by an attacker that used Jito bundles
+jito = set(attackers.loc[attackers["jito_bundle_count"] > 0, "attacker"])
+sandwiches[sandwiches["attacker"].isin(jito)]
 
-# Slippage statistics over sandwiches with a numeric value
-slip = sandwiches["slippage_consumption"].dropna()
-print(slip.describe())
+# slippage consumption over the scored sandwiches
+sandwiches.loc[sandwiches["slippage_state"] == "scored", "slippage_consumption"].describe()
 
-# Joining victim transactions to their sandwich:
-txs = pd.read_parquet("dataset/sandwich_txs_946_960.parquet")
-victims = txs[txs["type"] == "victim"]
-joined = victims.merge(sandwiches[["sandwich_id", "attacker"]],
-                       on="sandwich_id", how="left")
+# victim legs joined to their sandwich
+txs = pd.concat(pd.read_parquet(p)
+                for p in sorted(glob.glob("dataset/sandwich_txs_946_990_*.parquet")))
+victims = txs[txs["type"] == "victim"].merge(
+    sandwiches[["sandwich_id", "attacker", "slot"]], on="sandwich_id", how="left")
 ```
 
-## Limitations
+## Scope
 
-- **Window**: 15 epochs (≈ 6 days of mainnet activity). Detection rates
-  and classifier behaviour outside this window may differ.
-- **Slot coverage**: ≈ 99.9 %; gaps are dominated by RPC unavailability,
-  not by selection bias.
-- **Token prices** are a one-time snapshot, not a per-slot price series.
-  USD aggregates are biased on tokens whose price changed materially
-  during the window. Tokens absent from the snapshot contribute 0 USD.
-- **Slippage decoding** covers the major Solana DEXes (Raydium, Whirlpool,
-  Meteora, Pump.fun, PancakeSwap). Sandwiches whose victims trade on
-  unsupported DEXes carry NaN at the sandwich level.
-- **`diff-signer` coverage**: only one entity in the published window
-  passes the classifier. The `diff-signer-transfer` category is excluded
-  from this dataset entirely (see paper §5b for the empirical
-  justification).
-- **Cross-category attackers**: in this window 4 attackers placed
-  sandwiches in both the `standard` and `multi-split` structural pools.
-  They appear as a single row in `attackers` with the merged set in
-  `categories`; their per-attacker aggregates are recomputed over the
-  union.
-- **Detector recall**: the upstream watcher uses signer-coherent
-  amount-similarity heuristics (Δ ≤ 10 %, SOL fee tolerance 0.1 SOL).
-  External comparison against sandwiched.me on epoch 946 (see
-  `aux/sandwiched_me_epoch_946.csv` and the paper) shows ≈ 95 % of
-  sandwiched.me's sandwiches recovered.
+- Token prices are one snapshot, not a per-slot series. A token absent from the snapshot
+  has NaN in every USD column derived from it, not 0.
+- Slippage decoding covers Raydium, Whirlpool, Meteora, Pump.fun and PancakeSwap. A victim
+  on another venue, or one whose bound sits in an outer aggregator route, is `unprotected`
+  or `anomalous` rather than scored.
+- Entities the blinded expert panel labelled `no` are excluded. Entities labelled
+  `ambiguous` are included and carry that value in `expert_verdict`.
 
 ## License and citation
 
-The dataset is released under the same license as the parent repository
-(see `../LICENSE`).
-
-If you use this dataset, please cite the accompanying paper. A BibTeX
-entry will be added once the paper is published.
-
-## Versioning
-
-Each release is tagged by its epoch range, embedded in the filenames.
-Older releases are kept on the project's release page rather than in the
-working tree of this directory.
+Released under the parent repository's license (see [`../LICENSE`](../LICENSE)). If you use
+this dataset, please cite the accompanying paper.

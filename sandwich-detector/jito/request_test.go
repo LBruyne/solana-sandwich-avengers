@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"testing"
 	"sandwich-detector/logger"
+	"testing"
 )
 
 func init() {

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 
@@ -15,12 +17,16 @@ func initConfig() {
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(config.ConfigPath)
 
+	// Fail fast: continuing with an empty config only turns a missing file into a confusing
+	// RPC or ClickHouse error several layers down.
 	if err := viper.MergeInConfig(); err != nil {
-		logger.GlobalLogger.Error("Error reading config.yaml file, if you don't have config.yaml file, please create one from config.example.yaml", "err", err)
+		logger.GlobalLogger.Error("Cannot read config.yaml -- copy config.example.yaml to config.yaml and fill in the endpoints", "err", err)
+		os.Exit(1)
 	}
 
 	if err := godotenv.Load(config.ConfigPath + ".env"); err != nil {
-		logger.GlobalLogger.Error("Error reading .env file, if you don't have .env file, please create one from .env.example", "err", err)
+		logger.GlobalLogger.Error("Cannot read .env -- copy .env.example to .env and fill in the credentials", "err", err)
+		os.Exit(1)
 	}
 
 	viper.AutomaticEnv()
@@ -33,18 +39,19 @@ func initDB() {
 	logger.GlobalLogger.Info("Try to ensure database and tables exist")
 
 	if err := ch.EnsureDatabaseExists(); err != nil {
-		logger.GlobalLogger.Error("Failed to ensure database", "err", err)
-		return
+		logger.GlobalLogger.Error("Failed to create the database -- check CLICKHOUSE_* in .env and that the server is reachable", "err", err)
+		os.Exit(1)
 	}
 
 	if err := ch.CreateTables(); err != nil {
 		logger.GlobalLogger.Error("Failed to create tables", "err", err)
+		os.Exit(1)
 	}
 }
 
 func main() {
 	initConfig()
-	initDB()
+	cmd.Bootstrap = initDB
 	if err := cmd.RootCmd.Execute(); err != nil {
 		logger.GlobalLogger.Error("Error executing command", "err", err)
 	}

@@ -6,6 +6,7 @@ sol:
   rpc-chainstack: https://solana-mainnet.core.chainstack.com
   # Helius archival fallback — key in .env (HELIUS_RPC_API_KEY).
   rpc-helius: https://mainnet.helius-rpc.com
-  # Self-hosted node — live fallback only (a non-archival node keeps just a few hours of ledger,
-  # so it cannot backfill old ranges). We use http://64.130.32.137:8899.
+  # Optional self-hosted node — live fallback only. A non-archival node keeps just a few hours
+  # of ledger, so it cannot serve backfill; leave blank if you do not run one.
+  # Example: http://<host>:8899
   rpc:

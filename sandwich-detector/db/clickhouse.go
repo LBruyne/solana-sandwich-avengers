@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
-	"time"
 	"sandwich-detector/logger"
 	"sandwich-detector/types"
+	"strings"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -49,6 +49,10 @@ func NewClickhouse() Database {
 // Database interface implementation
 func (d *ClickhouseDB) Close() error {
 	return d.conn.Close()
+}
+
+func (d *ClickhouseDB) DatabaseName() string {
+	return d.db
 }
 
 func (d *ClickhouseDB) EnsureDatabaseExists() error {
@@ -226,7 +230,7 @@ func (d *ClickhouseDB) CreateTables() error {
 		if err := d.conn.Exec(context.Background(), q); err != nil {
 			return err
 		}
-		logger.GlobalLogger.Info("Check or create table in DB", "query", q)
+		logger.GlobalLogger.Debug("Check or create table in DB", "query", q)
 	}
 
 	// Keep an existing v2 table in sync when new columns are added to the CREATE above.

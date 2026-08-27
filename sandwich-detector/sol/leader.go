@@ -2,11 +2,11 @@ package sol
 
 import (
 	"fmt"
-	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/db"
 	"sandwich-detector/logger"
 	"sandwich-detector/utils"
+	"time"
 )
 
 func RunSlotLeaderCmd(startSlot uint64) error {

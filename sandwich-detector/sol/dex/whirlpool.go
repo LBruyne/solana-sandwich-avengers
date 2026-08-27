@@ -3,17 +3,18 @@ package dex
 // Orca Whirlpool Anchor discriminators
 // swap and swap_v2 share the same discriminators as Raydium CLMM (sha256("global:swap/swap_v2")[:8])
 // Layout (42 bytes):
-//   [0:8]   discriminator
-//   [8:16]  amount (u64)
-//   [16:24] other_amount_threshold (u64) - slippage limit
-//   [24:40] sqrt_price_limit (u128)
-//   [40]    amount_specified_is_input (bool)
-//   [41]    a_to_b (bool)
+//
+//	[0:8]   discriminator
+//	[8:16]  amount (u64)
+//	[16:24] other_amount_threshold (u64) - slippage limit
+//	[24:40] sqrt_price_limit (u128)
+//	[40]    amount_specified_is_input (bool)
+//	[41]    a_to_b (bool)
 var (
-	whirlpoolSwap          = [8]byte{248, 198, 158, 145, 225, 117, 135, 200} // sha256("global:swap")[:8]
-	whirlpoolSwapV2        = [8]byte{43, 4, 237, 11, 26, 201, 30, 98}       // sha256("global:swap_v2")[:8]
-	whirlpoolTwoHopSwap    = [8]byte{195, 96, 237, 108, 68, 162, 219, 230}   // sha256("global:two_hop_swap")[:8]
-	whirlpoolTwoHopSwapV2  = [8]byte{186, 143, 209, 29, 254, 2, 194, 117}    // sha256("global:two_hop_swap_v2")[:8]
+	whirlpoolSwap         = [8]byte{248, 198, 158, 145, 225, 117, 135, 200} // sha256("global:swap")[:8]
+	whirlpoolSwapV2       = [8]byte{43, 4, 237, 11, 26, 201, 30, 98}        // sha256("global:swap_v2")[:8]
+	whirlpoolTwoHopSwap   = [8]byte{195, 96, 237, 108, 68, 162, 219, 230}   // sha256("global:two_hop_swap")[:8]
+	whirlpoolTwoHopSwapV2 = [8]byte{186, 143, 209, 29, 254, 2, 194, 117}    // sha256("global:two_hop_swap_v2")[:8]
 )
 
 // Orca Token Swap V1/V2 instruction tag

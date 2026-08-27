@@ -8,8 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"time"
 	"sandwich-detector/config"
+	"time"
 )
 
 func GetUrlResponse(url string, params map[string]string, result any, logger *slog.Logger) error {

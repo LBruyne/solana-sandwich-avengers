@@ -1,9 +1,12 @@
 """
-Crawl current token prices from Moralis API for top tokenB in our database.
-Saves to data/token_prices/prices.csv
+Build the token price table used by every USD figure downstream.
+
+Needs MORALIS_API_KEY in `sandwich-intent/.env` (see .env.example); a free
+Moralis project key is enough.
 
 Usage:
-    python 0_crawl_token_price.py [--top-n 100]
+    python3 0_crawl_token_price.py --database solwich
+    python3 0_crawl_token_price.py --database solwich --top-n 5000   # cheap partial run
 """
 
 import argparse
@@ -13,143 +16,177 @@ import time
 import pandas as pd
 import requests
 
-from utils.db import get_client
+from utils.db import get_client, require_env
 
-API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjJhYTc1MGZlLWY0YTMtNGNkOC1iOTdkLWE2YzE5ZmMyNmE4OSIsIm9yZ0lkIjoiNTA5NTI2IiwidXNlcklkIjoiNTI0MjQ2IiwidHlwZUlkIjoiMmQ1M2E0M2YtMzExOC00Y2IxLWJiN2ItN2YyZTMyOWQ3MmQ3IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NzYxNTA3MzEsImV4cCI6NDkzMTkxMDczMX0.AGEZYIgBc_q9O1maVv0siYOrZm2HnNFflcPJdpGjQSI"
-BASE_URL = "https://solana-gateway.moralis.io/token/mainnet"
-OUT_DIR = "data/token_prices"
+BATCH_URL = "https://solana-gateway.moralis.io/token/mainnet/prices"
+BATCH_MAX = 100
 
-# Watcher stores native SOL as the literal string "SOL" in sandwiches.tokenA,
-# but Moralis only accepts mint addresses. Rewrite "SOL" to the wrapped-SOL
-# mint on the way to the API while keeping the stored CSV key as "SOL" so
-# downstream load_token_prices() continues to look it up by that key.
+# The detector stores native SOL as the literal string "SOL" in sandwiches.tokenA; the wrapped mint
+# is the same asset and carries the same price.
 SOL_WRAPPED_MINT = "So11111111111111111111111111111111111111112"
 
-
-def _api_address_for(token):
-    """Map the DB/CSV key to the address Moralis expects."""
-    return SOL_WRAPPED_MINT if token == "SOL" else token
+DEFAULT_OUT = "data/token_prices/prices.csv"
+COLUMNS = ["token", "sandwich_count", "usd_price", "symbol", "name", "decimals"]
 
 
-def get_top_tokens(client, top_n):
-    """Get top tokenA by occurrence in sandwiches (profit is in tokenA units)."""
-    df = client.query_df(f"""
-        SELECT tokenA as token, count() as total_cnt FROM sandwiches
-        WHERE signerSame = true AND hasTransfer = false
-          AND multiFrontRun = false AND multiBackRun = false
-        GROUP BY tokenA ORDER BY total_cnt DESC LIMIT {top_n}
+def parse_args():
+    p = argparse.ArgumentParser(description="Crawl token prices")
+    p.add_argument("--database", type=str, default=None,
+                   help="ClickHouse database to rank tokens by")
+    p.add_argument("--top-n", type=int, default=100,
+                   help="Only fetch the N most frequent tokens (0 = every token)")
+    p.add_argument("--sol-price", type=float, default=80.0,
+                   help="Fixed USD price for SOL and wrapped SOL")
+    p.add_argument("--out", type=str, default=DEFAULT_OUT)
+    p.add_argument("--rps", type=float, default=3.0, help="Batch requests per second")
+    p.add_argument("--retry-empty", action="store_true",
+                   help="Re-query tokens already on file without a price")
+    return p.parse_args()
+
+
+def get_tokens(client, top_n):
+    """Every tokenA seen, most frequent first. The ranking drives fetch order, nothing else."""
+    limit = f"LIMIT {top_n}" if top_n > 0 else ""
+    return client.query_df(f"""
+        SELECT tokenA AS token, count() AS total_cnt FROM sandwiches
+        GROUP BY tokenA ORDER BY total_cnt DESC {limit}
     """)
-    return df
 
 
-def fetch_price(token_address):
-    """Fetch current price from Moralis."""
-    url = f"{BASE_URL}/{_api_address_for(token_address)}/price"
-    headers = {"X-API-Key": API_KEY}
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "usd_price": data.get("usdPrice", None),
-                "symbol": data.get("symbol", ""),
-                "name": data.get("name", ""),
-                "decimals": data.get("nativePrice", {}).get("decimals", None),
-            }
-        elif resp.status_code == 404:
-            return {"usd_price": None, "symbol": "", "name": "", "decimals": None}
-        else:
-            print(f"    HTTP {resp.status_code}: {resp.text[:100]}")
-            return None
-    except Exception as e:
-        print(f"    Error: {e}")
+def fetch_batch(session, api_key, addresses):
+    """Address -> price record for whichever addresses Moralis can price; others are absent.
+
+    Returns None if the request itself failed. That is not the same as "no price": recording a
+    failed batch as unpriced would permanently mark 100 tokens as unquotable on the strength of one
+    transient 500, and they would never be retried.
+    """
+    for attempt in range(5):
+        try:
+            r = session.post(BATCH_URL,
+                             headers={"X-API-Key": api_key,
+                                      "Content-Type": "application/json"},
+                             json={"addresses": addresses}, timeout=60)
+        except requests.RequestException:
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 200:
+            out = {}
+            for row in r.json():
+                addr = row.get("tokenAddress")
+                if addr and row.get("usdPrice") is not None:
+                    out[addr] = {
+                        "usd_price": row.get("usdPrice"),
+                        "symbol": row.get("tokenSymbol") or row.get("symbol") or "",
+                        "name": row.get("tokenName") or row.get("name") or "",
+                        "decimals": row.get("tokenDecimals") or row.get("decimals"),
+                    }
+            return out
+        if r.status_code in (429, 503):
+            time.sleep(5 * (attempt + 1))
+            continue
+        print(f"    HTTP {r.status_code}: {r.text[:120]}")
         return None
+    return None
+
+
+def load_existing(path):
+    """Whatever the table already holds. A freshly quoted price replaces the row it lands on."""
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=COLUMNS)
+    df = pd.read_csv(path)
+    for c in COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+    df["usd_price"] = pd.to_numeric(df["usd_price"], errors="coerce")
+    return df[COLUMNS]
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--top-n", type=int, default=100)
-    args = p.parse_args()
+    args = parse_args()
+    # Before anything else: a missing key must not surface after the ranking query.
+    api_key = require_env("MORALIS_API_KEY",
+                          "a free Moralis project key is what prices the tokens")
+    client = get_client(args.database)
+    db = args.database or os.getenv("CLICKHOUSE_DATABASE", "solwich")
+    out_path = args.out
+    if os.path.dirname(out_path):
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    tokens = get_tokens(client, args.top_n)
+    counts = {str(t): int(c) for t, c in zip(tokens["token"], tokens["total_cnt"])}
+    total_sw = int(tokens["total_cnt"].sum())
+    print(f"Database : {db}")
+    print(f"Tokens   : {len(tokens):,} distinct tokenA over {total_sw:,} sandwiches")
 
-    client = get_client()
-    tokens = get_top_tokens(client, args.top_n)
-    print(f"Top {len(tokens)} tokens to fetch prices for")
-
-    # Load existing prices to avoid re-fetching. Rows whose price is NaN are
-    # NOT treated as "already fetched" so they can be retried on next run,
-    # which is how the SOL row (previously stored with a NaN price because the
-    # old crawler passed the "SOL" symbol to Moralis instead of the wrapped
-    # mint) will get a real value on the next crawl.
-    out_path = f"{OUT_DIR}/prices.csv"
-    if os.path.exists(out_path):
-        existing = pd.read_csv(out_path)
-        existing_tokens = set(existing.loc[existing["usd_price"].notna(), "token"])
-        print(f"Existing prices: {len(existing)} "
-              f"({existing['usd_price'].notna().sum()} valid; "
-              f"{existing['usd_price'].isna().sum()} NaN will be retried)")
+    existing = load_existing(out_path)
+    if args.retry_empty:
+        skip = set(existing.loc[existing["usd_price"].notna(), "token"].astype(str))
     else:
-        existing = pd.DataFrame()
-        existing_tokens = set()
+        skip = set(existing["token"].astype(str))
+    print(f"On file  : {len(existing):,} rows ({int(existing['usd_price'].notna().sum()):,} priced)")
 
-    # Only fetch tokens we don't have yet
-    to_fetch = tokens[~tokens["token"].isin(existing_tokens)]
-    print(f"New tokens to fetch: {len(to_fetch)}")
+    pending = [t for t in tokens["token"].astype(str)
+               if t not in skip and t not in ("SOL", SOL_WRAPPED_MINT)]
+    nbatch = (len(pending) + BATCH_MAX - 1) // BATCH_MAX
+    print(f"To fetch : {len(pending):,}  ({nbatch:,} batches at {args.rps} req/s, "
+          f"~{nbatch / args.rps / 60:.0f} min)")
 
-    results = []
-    for i, row in to_fetch.iterrows():
-        token = row["token"]
-        cnt = int(row["total_cnt"])
-        price_data = fetch_price(token)
-
-        if price_data is None:
-            time.sleep(1)
-            price_data = fetch_price(token)
-
-        if price_data:
-            results.append({
-                "token": token,
-                "sandwich_count": cnt,
-                "usd_price": price_data["usd_price"],
-                "symbol": price_data["symbol"],
-                "name": price_data["name"],
-                "decimals": price_data["decimals"],
-            })
-            status = f"${price_data['usd_price']:.6f}" if price_data["usd_price"] else "N/A"
-            fetched = len(results)
-            if fetched % 50 == 0 or fetched <= 5:
-                print(f"  [{fetched}/{len(to_fetch)}] {price_data.get('symbol', '?'):>8s} {status}")
+    session = requests.Session()
+    fetched, found, failed = {}, 0, 0
+    interval = 1.0 / args.rps
+    t_next = time.monotonic()
+    for i in range(0, len(pending), BATCH_MAX):
+        chunk = pending[i:i + BATCH_MAX]
+        wait = t_next - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        t_next = time.monotonic() + interval
+        got = fetch_batch(session, api_key, chunk)
+        if got is None:
+            failed += len(chunk)          # left pending, not recorded as unpriced
         else:
-            results.append({
-                "token": token,
-                "sandwich_count": cnt,
-                "usd_price": None,
-                "symbol": "",
-                "name": "",
-                "decimals": None,
-            })
+            found += len(got)
+            for t in chunk:
+                fetched[t] = got.get(t)
+        done = i + len(chunk)
+        if done % (BATCH_MAX * 50) == 0 or done >= len(pending):
+            print(f"    {done:,}/{len(pending):,} queried, {found:,} priced"
+                  + (f", {failed:,} in failed batches (left pending)" if failed else ""),
+                  flush=True)
 
-        time.sleep(0.05)
+    new_df = pd.DataFrame(
+        [{"token": t,
+          "sandwich_count": counts.get(t),
+          "usd_price": (v or {}).get("usd_price"),
+          "symbol": (v or {}).get("symbol", ""),
+          "name": (v or {}).get("name", ""),
+          "decimals": (v or {}).get("decimals")}
+         for t, v in fetched.items()],
+        columns=COLUMNS)
 
-    new_df = pd.DataFrame(results)
-    # Merge with existing
-    if len(existing) > 0:
-        # Update counts for existing tokens
-        token_counts = dict(zip(tokens["token"], tokens["total_cnt"]))
-        existing["sandwich_count"] = existing["token"].map(token_counts).fillna(existing["sandwich_count"])
-        df = pd.concat([existing, new_df], ignore_index=True).drop_duplicates(subset=["token"], keep="last")
-    else:
-        df = new_df
-    df.to_csv(out_path, index=False)
-    print(f"\nSaved to {out_path} ({len(df)} tokens)")
+    df = pd.concat([existing, new_df], ignore_index=True)
+    df = df.drop_duplicates(subset=["token"], keep="last")
 
-    # Summary
-    valid = df[df["usd_price"].notna()]
-    print(f"Valid prices: {len(valid)}/{len(df)}")
-    print(f"\nTop 10 by price:")
-    for _, row in valid.nlargest(10, "usd_price").iterrows():
-        print(f"  {row['symbol']:>8s} ${row['usd_price']:>12.4f}  (cnt={row['sandwich_count']:,})")
+    for tok in ("SOL", SOL_WRAPPED_MINT):
+        df = df[df["token"] != tok]
+        df = pd.concat([df, pd.DataFrame([{
+            "token": tok, "sandwich_count": counts.get(tok), "usd_price": args.sol_price,
+            "symbol": "SOL", "name": "Solana", "decimals": 9}])], ignore_index=True)
+
+    df["sandwich_count"] = df["token"].astype(str).map(counts).fillna(df["sandwich_count"])
+    df["usd_price"] = pd.to_numeric(df["usd_price"], errors="coerce")
+    df = df.sort_values("sandwich_count", ascending=False, na_position="last")
+    df[COLUMNS].to_csv(out_path, index=False)
+
+    priced = df[df["usd_price"].notna()]
+    covered = float(priced["sandwich_count"].fillna(0).sum())
+    print(f"\nSaved {len(df):,} rows to {out_path}")
+    print(f"  priced            : {len(priced):,}")
+    print(f"  sandwich coverage : {covered:,.0f} / {total_sw:,} = {covered / total_sw * 100:.2f}%")
+    print(f"  SOL pinned at     : ${args.sol_price}")
+    if failed:
+        print(f"  WARNING: {failed:,} tokens were in batches that errored and remain unfetched. "
+              f"Re-run to pick them up.")
 
 
 if __name__ == "__main__":

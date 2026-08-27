@@ -78,6 +78,6 @@ func TestProcessWindowsIntegration(t *testing.T) {
 	t.Logf("blocks=%d sandwiches=%d (inBlock=%d sameLeaderCross=%d crossLeader=%d) dups=%d",
 		len(blocks), len(sandwiches), inBlock, sameLeaderCross, crossLeader, dups)
 	if len(sandwiches) == 0 {
-		t.Fatalf("no sandwiches detected in a range the v1 DB says has ~95")
+		t.Fatalf("no sandwiches detected over %d blocks; expected a non-empty result", len(blocks))
 	}
 }

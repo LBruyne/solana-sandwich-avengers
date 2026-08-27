@@ -26,7 +26,7 @@ type SandwichTxTokenInfo struct {
 	SlippageLimitType    string  `ch:"slippageLimitType"`    // "input" (max cost) / "output" (min output) / "" (unavailable)
 	SlippageLimitAmount  float64 `ch:"slippageLimitAmount"`  // decoded limit value, converted to float64 with decimals
 	SlippageActualAmount float64 `ch:"slippageActualAmount"` // actual cost or output from balance deltas
-	SlippageUtilization  float64 `ch:"slippageUtilization"`  // ratio 0-1 (closer to 1 = tighter fit), -1 = unavailable
+	SlippageUtilization  float64 `ch:"slippageUtilization"`  // ratio in [0,1] (1 = squeezed to the victim's own floor, 0 = it set no real bound); negative = anomaly: -2 unsupported, -3 missing inner, -4 ambiguous, -5 decode contradicts the swap. -1 is legacy: rows written before 2026-08 used it for "no protection", which is now the real value 0
 
 	// PoolDex classifies the exchange the tx's pool belongs to, resolved from the front-run's DEX
 	// instruction — set for every leg (front/back/victim/adverse) regardless of slippage
@@ -74,14 +74,16 @@ type Sandwich struct {
 	HasBackInlineTransfer  bool `ch:"hasBackInlineTransfer"`  // back tx contains inline transfer (source != sink within same tx)
 
 	OwnerSame bool `ch:"ownerSame"` // whether front-run and back-run have the same owner, i.e., the owner of ATA that holds the toToken in front-run and the fromToken in back-run
-	ATASame   bool `ch:"ataSame"`   // whether front-run and back-run have the same ATA that holds the toToken in front-run and the fromToken in back-run
+	// ATASame is reserved and always false: the detector links legs by signer and by
+	// token-account owner (SignerSame / OwnerSame), not at the ATA level.
+	ATASame bool `ch:"ataSame"`
 
 	Perfect       bool    `ch:"perfect"`       // whether the sandwich is perfect, i.e., the amount diff of tokeb Bis exactly the same
 	RelativeDiffB float64 `ch:"relativeDiffB"` // The relative amount diff = |backTxs.fromTotalAmount - frontTxs.toTotalAmount| / max(frontTxs.toTotalAmount, backTxs.fromTotalAmount).
 	ProfitA       float64 `ch:"profitA"`       // The profit of the sandwich = backTx.toToTalAmount - frontTx.fromTotalAmount
 
 	IntentScore            float64 `ch:"intentScore"`            // Intent score for sandwich attack (0-1, higher = more likely intentional)
-	MaxSlippageUtilization float64 `ch:"maxSlippageUtilization"` // Max slippage utilization across all victims (0-1), 0 if unavailable
+	MaxSlippageUtilization float64 `ch:"maxSlippageUtilization"` // Max slippage utilization across all victims, in [0,1]; a negative sentinel if ANY victim is anomalous (see computeMaxSlippageUtilization)
 
 	AdverseCount uint16        `ch:"adverseCount"`
 	FrontCount   uint16        `ch:"frontCount"`

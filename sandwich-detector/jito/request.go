@@ -2,11 +2,11 @@ package jito
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 	"sandwich-detector/config"
 	"sandwich-detector/logger"
 	"sandwich-detector/utils"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/viper"
 )

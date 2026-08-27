@@ -1,13 +1,13 @@
 package jito
 
 import (
-	"sort"
-	"time"
 	"sandwich-detector/config"
 	"sandwich-detector/db"
 	"sandwich-detector/logger"
 	"sandwich-detector/types"
 	"sandwich-detector/utils"
+	"sort"
+	"time"
 )
 
 // RunJitoCmd2 fetches recent Jito bundles in a loop and stores them in the database.
